@@ -459,6 +459,17 @@ class ExplodingCourier:
 check("and even an unexpected error does not stop the tick",
       pb.poll_approvals(dcfg, st_d, ExplodingCourier()) == [])
 
+# what arrives beats what the portal claims
+_human_ok = [{"id": "9", "content": "hello", "author": {"id": "111", "bot": False}}]
+_human_blank = [{"id": "9", "content": "", "author": {"id": "111", "bot": False}}]
+_bots_only = [{"id": "9", "content": "alert", "author": {"id": "5", "bot": True}}]
+check("words getting through is proof the intent is on",
+      FakeDiscord(dcfg, pages=[_human_ok]).content_evidence() == (1, 0))
+check("people's messages arriving blank is proof it is off",
+      FakeDiscord(dcfg, pages=[_human_blank]).content_evidence() == (1, 1))
+check("a channel with only our own posts proves nothing either way",
+      FakeDiscord(dcfg, pages=[_bots_only]).content_evidence() == (0, 0))
+
 check("the content intent is read off the application flags",
       FakeDiscord(dcfg, me={"flags": 1 << 18}).content_intent()
       and not FakeDiscord(dcfg, me={"flags": 0}).content_intent())

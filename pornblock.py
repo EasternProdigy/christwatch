@@ -49,7 +49,7 @@ import urllib.request
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-VERSION = "1.1.2"
+VERSION = "1.1.3"
 HOMEPAGE = "https://github.com/EasternProdigy/christwatch"
 PROG = "pornblock"
 
@@ -1252,6 +1252,25 @@ class DiscordCourier:
         app = self._call("GET", "/applications/@me")
         flags = int(app.get("flags") or 0)
         return bool(flags & ((1 << 18) | (1 << 19)))
+
+    def content_evidence(self) -> tuple:
+        """
+        (messages by people, how many of those were blank).
+
+        The flag on the application is what the portal *says*. This is what
+        actually arrives, which is the thing that matters: if a person's words
+        come through, the intent is on whatever any flag claims.
+        """
+        msgs = self._call("GET", "/channels/%s/messages?limit=50"
+                          % self._channel())
+        seen = blank = 0
+        for m in msgs or []:
+            if (m.get("author") or {}).get("bot"):
+                continue
+            seen += 1
+            if not (m.get("content") or "").strip():
+                blank += 1
+        return seen, blank
 
 
 def courier(cfg: dict):
@@ -3424,17 +3443,31 @@ def cmd_check_discord(args) -> int:
     except MailError as exc:
         print("Bot and channel failed: %s" % exc)
         return 1
-    try:
-        if dc.content_intent():
-            print("Reading replies: ok, the bot may read what people type")
-        else:
-            print("Reading replies: NOT YET - open your application on "
-                  "discord.com/developers, go to Bot, and switch on the "
-                  "MESSAGE CONTENT INTENT. Without it every message arrives "
-                  "blank and no approval can ever be seen.")
-            ok = False
-    except MailError as exc:
-        print("Reading replies: could not tell (%s)" % exc)
+    seen = blank = 0
+    with contextlib.suppress(MailError):
+        seen, blank = dc.content_evidence()
+    flagged = None
+    with contextlib.suppress(MailError):
+        flagged = dc.content_intent()
+
+    if seen and blank < seen:
+        print("Reading replies: ok, the bot really can read what people type")
+    elif seen and blank == seen:
+        print("Reading replies: NO - %d message(s) from people in that channel "
+              "and every one of them arrived blank. Open your application on "
+              "discord.com/developers, go to Bot, switch on MESSAGE CONTENT "
+              "INTENT and press Save Changes at the bottom." % seen)
+        ok = False
+    elif flagged:
+        print("Reading replies: looks fine. Nobody has said anything in that "
+              "channel yet, so the only proof is the switch, and it is on.")
+    else:
+        print("Reading replies: cannot tell yet. Nobody has typed in that "
+              "channel, and the Message Content switch does not look switched "
+              "on. If you already did it, go back and press Save Changes at "
+              "the bottom of the Bot page - then say anything in the channel "
+              "and press this again.")
+        ok = False
     return 0 if ok else 1
 
 
@@ -3590,16 +3623,27 @@ def cmd_test_email(args) -> int:
         except MailError as exc:
             print(red("     FAILED: %s" % exc))
             ok = False
-        try:
-            if dc.content_intent():
-                print(green("     the bot may read what people type"))
-            else:
-                print(red("     MESSAGE CONTENT INTENT IS OFF - approvals can "
-                          "never be seen. Switch it on at discord.com/developers "
-                          "under your application, Bot."))
-                ok = False
-        except MailError as exc:
-            print(yellow("     could not check the content intent: %s" % exc))
+        seen = blank = 0
+        with contextlib.suppress(MailError):
+            seen, blank = dc.content_evidence()
+        flagged = None
+        with contextlib.suppress(MailError):
+            flagged = dc.content_intent()
+        if seen and blank < seen:
+            print(green("     the bot really can read what people type"))
+        elif seen and blank == seen:
+            print(red("     every message from a person arrives blank - "
+                      "MESSAGE CONTENT INTENT is off. Switch it on under your "
+                      "application, Bot, and press Save Changes."))
+            ok = False
+        elif flagged:
+            print(yellow("     nobody has said anything there yet, but the "
+                         "Message Content switch is on"))
+        else:
+            print(red("     nobody has typed there and the Message Content "
+                      "switch does not look on. Check it, press Save Changes, "
+                      "then say something in the channel and run this again."))
+            ok = False
         save_state(st)
         print(green("\n  Discord looks good.\n") if ok
               else red("\n  Discord is NOT working yet - fix it before installing.\n"))
