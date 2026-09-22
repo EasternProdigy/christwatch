@@ -47,6 +47,24 @@ jobs:
       - name: Build the phone app
         working-directory: android
         run: gradle --no-daemon assembleRelease
+      - name: Check the APK declares what it should
+        run: |
+          set -e
+          apk=android/app/build/outputs/apk/release/app-release.apk
+          bt=$(ls -d "$ANDROID_SDK_ROOT"/build-tools/* | sort -V | tail -1)
+          "$bt/aapt2" dump badging "$apk" > /tmp/badging.txt
+          "$bt/aapt2" dump xmltree --file AndroidManifest.xml "$apk" > /tmp/tree.txt
+          grep -q "package: name='io.christwatch.phone'" /tmp/badging.txt
+          grep -q "launchable-activity: name='io.christwatch.phone.MainActivity'" /tmp/badging.txt
+          grep -q "uses-permission: name='android.permission.INTERNET'" /tmp/badging.txt
+          grep -q "uses-permission: name='android.permission.RECEIVE_BOOT_COMPLETED'" /tmp/badging.txt
+          # the pairing link has to be something the phone will hand to us
+          grep -q '"christwatch"' /tmp/tree.txt
+          grep -q 'BOOT_COMPLETED' /tmp/tree.txt
+          # it must not have quietly acquired anything alarming
+          ! grep -qE "uses-permission: name='android.permission.(ACCESS_FINE_LOCATION|READ_CONTACTS|CAMERA|RECORD_AUDIO|QUERY_ALL_PACKAGES|READ_SMS)'" /tmp/badging.txt
+          echo "manifest checks passed"
+          grep "uses-permission" /tmp/badging.txt
       - name: Name it after the version
         run: |
           set -e
