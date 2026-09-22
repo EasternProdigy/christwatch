@@ -1117,9 +1117,9 @@ def phone_state():
 ST = phone_state()
 MOVES = pb.poll_phones(PH_CFG, ST, PhoneDiscord(PH_CFG))
 check("a first report is recorded, quietly",
-      ST["phones"]["aa11bb22"]["state"] == "on" and not MOVES)
+      ST["phones"]["aa11bb22/owner"]["state"] == "on" and not MOVES)
 check("the iPhone is not expected to report",
-      not ST["phones"].get("cc33dd44", {}).get("state"))
+      not pb.phone_seen(ST, "cc33dd44"))
 
 class OffDiscord(PhoneDiscord):
     MESSAGES = [{"id": "903", "webhook_id": "5", "author": {"bot": True},
@@ -1145,7 +1145,9 @@ class QuietDiscord(PhoneDiscord):
         return "1"
 
 ST2 = phone_state()
-ST2["phones"]["aa11bb22"] = {"last_seen": pb.now() - 40 * 3600, "state": "on"}
+ST2["phones"]["aa11bb22/owner"] = {"device": "aa11bb22", "profile": "owner",
+                                   "last_seen": pb.now() - 40 * 3600,
+                                   "state": "on"}
 QUIET = QuietDiscord(PH_CFG)
 pb.courier = lambda _cfg: QUIET
 MOVES = pb.poll_phones(PH_CFG, ST2, QUIET)
@@ -1158,6 +1160,42 @@ check("but it is only said once",
       not pb.poll_phones(PH_CFG, ST2, QUIET2)
       and not getattr(QUIET2, "said", []))
 pb.courier = _real_phone_courier
+
+# -- two profiles on one phone --------------------------------------------
+# GrapheneOS people run a second profile. The app goes in both, they read
+# the same setting, and they report separately - which is the only way the
+# laptop can tell that it was removed from one of them.
+class TwoProfiles(PhoneDiscord):
+    MESSAGES = [
+        {"id": "910", "webhook_id": "5", "author": {"bot": True},
+         "content": "`CW1 {\"d\":\"aa11bb22\",\"u\":0,\"s\":\"on\",\"at\":3}`"},
+        {"id": "911", "webhook_id": "5", "author": {"bot": True},
+         "content": "`CW1 {\"d\":\"aa11bb22\",\"u\":10,\"s\":\"on\",\"at\":3}`"},
+    ]
+    def post(self, text, ping_ids=()):
+        self.said = getattr(self, "said", []) + [text]
+        return "1"
+
+STP = phone_state()
+TWO = TwoProfiles(PH_CFG)
+pb.courier = lambda _cfg: TWO
+pb.poll_phones(PH_CFG, STP, TWO)
+pb.courier = _real_phone_courier
+check("both profiles on one phone are tracked apart",
+      sorted(STP["phones"]) == ["aa11bb22/owner", "aa11bb22/second profile"])
+TWOROWS = pb.phone_table(PH_CFG, STP)
+check("and both are shown by name",
+      any("(owner)" in n for n, _k, _o, _d in TWOROWS)
+      and any("(second profile)" in n for n, _k, _o, _d in TWOROWS))
+
+STP["phones"]["aa11bb22/second profile"]["last_seen"] = pb.now() - 50 * 3600
+GONE = QuietDiscord(PH_CFG)
+pb.courier = lambda _cfg: GONE
+MOVES = pb.poll_phones(PH_CFG, STP, GONE)
+pb.courier = _real_phone_courier
+check("the app vanishing from one profile is caught while the other is fine",
+      any("second profile" in m and "silent" in m for m in MOVES)
+      and not any("owner" in m for m in MOVES))
 
 ST3 = phone_state()
 STRANGER = QuietDiscord(PH_CFG)

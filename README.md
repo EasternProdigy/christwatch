@@ -367,9 +367,18 @@ It posts when the setting changes, and once a day when it has not, so
 laptop notices within `phone.silence_hours` (36 by default) and tells your
 friends that the phone has gone quiet.
 
-Install it in **each profile** you use. Both copies watch the same setting,
-which means removing it from one still leaves the other reporting - and the
-one you removed goes quiet, which is heard.
+Install it in **each profile** you use, from the same page and the same
+pairing link - you do not add the phone twice. Each profile reports for
+itself, so they show up separately:
+
+```
+[ ok ] Pixel (owner)             android  filtering, last heard 34m ago
+[FAIL] Pixel (second profile)    android  silent for 2d 4h
+```
+
+They all read the same setting, which is the point: the second row is there
+to notice the app disappearing from one profile while the other carries on
+saying "still on".
 
 The setting itself, if you would rather type it:
 Settings → Network & internet → Private DNS → *Private DNS provider

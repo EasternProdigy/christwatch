@@ -1525,6 +1525,28 @@ def new_device_id() -> str:
     return os.urandom(4).hex()
 
 
+def profile_label(profile) -> str:
+    """
+    Android numbers its profiles. 0 is the one the phone starts in.
+
+    Pair once and install the app in each profile you use: they all read the
+    same setting, but they report separately, so taking the app off one of
+    them is still heard.
+    """
+    text = str(profile if profile is not None else "0")
+    if text in ("0", "None", ""):
+        return "owner"
+    if text == "10":
+        return "second profile"
+    return "profile " + text
+
+
+def phone_seen(st: dict, dev: str) -> list:
+    """Every (key, row) this device has reported from, one per profile."""
+    return [(k, v) for k, v in (st.get("phones") or {}).items()
+            if isinstance(v, dict) and v.get("device") == dev]
+
+
 def find_device(cfg: dict, needle: str) -> str:
     """A device by its id or by the name you gave it. Empty if no match."""
     needle = (needle or "").strip().lower()
@@ -1938,17 +1960,24 @@ def poll_phones(cfg: dict, st: dict, post) -> list:
         dev = str(rep.get("d") or "")
         if dev not in known:
             continue
-        row = seen.setdefault(dev, {})
+        # Each profile the app runs in reports for itself, so a phone can
+        # have more than one row. They read the same setting, which is the
+        # point: the second row is there to notice the app disappearing
+        # from one profile while the other carries on saying "still on".
+        prof = profile_label(rep.get("u"))
+        key = "%s/%s" % (dev, prof)
+        row = seen.setdefault(key, {})
         was = row.get("state")
         row.update({
+            "device": dev,
             "last_seen": now(),
             "reported_at": float(rep.get("at") or now()),
             "state": str(rep.get("s") or "?"),
             "dns": str(rep.get("dns") or ""),
-            "profile": rep.get("u"),
+            "profile": prof,
             "silent": False,
         })
-        name = known[dev].get("name") or dev
+        name = "%s (%s)" % (known[dev].get("name") or dev, prof)
         if row["state"] == was:
             continue
         if row["state"] != "on":
@@ -1973,19 +2002,20 @@ def poll_phones(cfg: dict, st: dict, post) -> list:
     for dev, meta in known.items():
         if (meta.get("kind") or "android") != "android":
             continue          # an iPhone has nothing to report from
-        row = seen.setdefault(dev, {})
-        last = float(row.get("last_seen") or meta.get("added") or 0)
-        if not last or now() - last <= limit or row.get("silent"):
-            continue
-        row["silent"] = True
-        name = meta.get("name") or dev
-        moves.append("%s: silent" % name)
-        alert(cfg, st, "phone_silent_" + dev,
-              "%s has gone quiet" % name,
-              "%s has not checked in for %s. The app is normally heard from "
-              "once a day, so this usually means it was uninstalled or the "
-              "phone was told to stop running it.\n"
-              % (name, human_delta(now() - last)))
+        for key, row in phone_seen(st, dev):
+            last = float(row.get("last_seen") or 0)
+            if not last or now() - last <= limit or row.get("silent"):
+                continue
+            row["silent"] = True
+            name = "%s (%s)" % (meta.get("name") or dev,
+                                row.get("profile") or "owner")
+            moves.append("%s: silent" % name)
+            alert(cfg, st, "phone_silent_" + key,
+                  "%s has gone quiet" % name,
+                  "%s has not checked in for %s. The app is normally heard "
+                  "from once a day, so this usually means it was uninstalled "
+                  "or the phone was told to stop running it.\n"
+                  % (name, human_delta(now() - last)))
     return moves
 
 
@@ -1993,19 +2023,17 @@ def poll_phones(cfg: dict, st: dict, post) -> list:
 def phone_table(cfg: dict, st: dict) -> list:
     """One row per phone: (name, kind, ok, what to say about it)."""
     rows = []
-    seen = st.get("phones") or {}
     limit = max(1.0, float((cfg.get("phone") or {}).get("silence_hours") or 36))
     for dev, meta in sorted(phone_devices(cfg).items(),
                             key=lambda kv: kv[1].get("added") or 0):
         kind = meta.get("kind") or "android"
         name = meta.get("name") or dev
-        row = seen.get(dev) or {}
         if kind != "android":
             rows.append((name, kind, True,
                          "profile installed by hand, nothing to report from"))
             continue
-        last = float(row.get("last_seen") or 0)
-        if not last:
+        mine = sorted(phone_seen(st, dev), key=lambda kv: kv[0])
+        if not mine:
             # Enrolling a phone and walking over to it takes a few minutes,
             # and the app checks in hourly. Calling that a failure straight
             # away would teach you to ignore the word.
@@ -2014,15 +2042,22 @@ def phone_table(cfg: dict, st: dict) -> list:
                          "waiting for its first check-in" if waiting
                          else "never checked in"))
             continue
-        ago = human_delta(now() - last)
-        if now() - last > limit * 3600:
-            rows.append((name, kind, False, "silent for %s" % ago))
-        elif row.get("state") == "on":
-            rows.append((name, kind, True, "filtering, last heard %s ago" % ago))
-        else:
-            rows.append((name, kind, False,
-                         "filtering is %s (%s ago)"
-                         % (row.get("state") or "?", ago)))
+        for _key, row in mine:
+            # One row per profile the app runs in, because that is the level
+            # at which it can be removed.
+            label = ("%s (%s)" % (name, row.get("profile"))
+                     if len(mine) > 1 or row.get("profile") != "owner" else name)
+            last = float(row.get("last_seen") or 0)
+            ago = human_delta(now() - last)
+            if now() - last > limit * 3600:
+                rows.append((label, kind, False, "silent for %s" % ago))
+            elif row.get("state") == "on":
+                rows.append((label, kind, True,
+                             "filtering, last heard %s ago" % ago))
+            else:
+                rows.append((label, kind, False,
+                             "filtering is %s (%s ago)"
+                             % (row.get("state") or "?", ago)))
     return rows
 
 
