@@ -339,6 +339,111 @@ pb.write_public_status(cfg, st)
 check("snapshot is world readable",
       oct(os.stat(pb.P(pb.PUBLIC_STATUS)).st_mode)[-3:] == "644")
 
+print("\n== an old setup keeps working ==")
+
+# frozen on purpose: this is a settings file written by the first release,
+# before Discord, before approver names, before any of it. If a future change
+# ever stops this loading, someone out there has to set up from scratch, and
+# the update that did it must never be installed.
+OLD_CONFIG = {
+    "version": 1,
+    "app_name": "ChristWatch",
+    "owner_name": "Bill",
+    "owner_email": "bill@example.com",
+    "approvers": ["a@example.com", "b@example.com", "c@example.com"],
+    "approvals_required": 2,
+    "cooloff_hours": 24.0,
+    "unlock_minutes": 60,
+    "require_passphrase": True,
+    "passphrase_recovery": True,
+    "filter": "cloudflare_family",
+    "email": {"address": "bot@example.com", "display_name": "ChristWatch",
+              "smtp_host": "smtp.example.com", "smtp_port": 587,
+              "smtp_security": "starttls", "smtp_user": "bot@example.com",
+              "imap_host": "imap.example.com", "imap_port": 993,
+              "imap_security": "ssl", "imap_user": "bot@example.com"},
+}
+OLD_RECORD = {                       # and the record that went with it
+    "owner_email": "bill@example.com",
+    "approvers": ["a@example.com", "b@example.com", "c@example.com"],
+    "approvals_required": 2, "cooloff_hours": 24.0, "unlock_minutes": 60,
+    "filter": "cloudflare_family", "require_passphrase": True,
+    "passphrase_recovery": True, "passphrase_set": True,
+    "recorded_at": pb.now() - 86400,
+}
+
+pb.save_secrets({"smtp_password": "x", "imap_password": "x",
+                 "partner_passphrase": pb.hash_passphrase("friend-secret")})
+pb.write_managed(pb.CONFIG_PATH, pb.dump_json(OLD_CONFIG), 0o600,
+                 immutable=False, backup=False)
+pb.save_record(OLD_RECORD)
+old_cfg = pb.load_config()
+check("a settings file from the first release still loads", bool(old_cfg))
+check("and is understood as email, because that is all there was",
+      old_cfg["transport"] == "email" and not pb.is_discord(old_cfg))
+check("keys added since then arrive with defaults",
+      old_cfg["discord"]["channel_id"] == ""
+      and old_cfg["tracking"]["enabled"] is True
+      and old_cfg["approver_names"] == {})
+check("it still validates", pb.validate_config(old_cfg) == [])
+old_st = pb.deep_merge(pb.DEFAULT_STATE, {})
+got, notes = pb.reconcile_record(old_cfg, old_st)
+check("and an old install record reverts nothing",
+      not [n for n in notes if "revert" in n], repr(notes))
+check("the arrangement is intact after all that",
+      sorted(got["approvers"]) == ["a@example.com", "b@example.com",
+                                   "c@example.com"]
+      and got["approvals_required"] == 2 and got["cooloff_hours"] == 24.0)
+doc = pb.public_status_doc(got, old_st)
+check("and the app can still be told about it",
+      doc["configured"] and doc["transport"] == "email"
+      and len(doc["approvers"]) == 3)
+
+check("a file from a newer version is left alone, not downgraded",
+      pb.migrate_config({"version": 99, "approvers": []})["version"] == 99)
+check("migrating twice changes nothing the second time",
+      pb.migrate_config(pb.migrate_config(dict(OLD_CONFIG)))["version"]
+      == pb.CONFIG_SCHEMA)
+
+print("\n== an update may not cost you your setup ==")
+_now = {"configured": True, "mode": "LOCKED", "transport": "discord",
+        "approvers": ["111", "222"], "approvals_required": 2,
+        "cooloff_hours": 24.0, "unlock_minutes": 60, "channel_id": "999",
+        "passphrase_set": True, "filter": "cloudflare_family", "armed": True}
+check("an update that changes nothing about you is fine",
+      pb.arrangement_diff(pb.arrangement(_now), pb.arrangement(dict(_now))) == "")
+check("a new version that lost your approvers is caught",
+      "approvers" in pb.arrangement_diff(
+          pb.arrangement(_now), pb.arrangement(dict(_now, approvers=[]))))
+check("so is one that quietly shortened the wait",
+      "cooloff_hours" in pb.arrangement_diff(
+          pb.arrangement(_now), pb.arrangement(dict(_now, cooloff_hours=1))))
+check("so is one that came up unconfigured",
+      bool(pb.arrangement_diff(pb.arrangement(_now),
+                               pb.arrangement({"configured": False}))))
+check("so is one that switched the blocker off",
+      "armed" in pb.arrangement_diff(
+          pb.arrangement(_now), pb.arrangement(dict(_now, armed=False))))
+check("and one that cannot say anything at all is caught",
+      bool(pb.arrangement_diff(pb.arrangement(_now), {})))
+check("the order approvers are listed in does not count as a change",
+      pb.arrangement_diff(pb.arrangement(_now),
+                          pb.arrangement(dict(_now, approvers=["222", "111"]))) == "")
+
+pb.save_config(cfg)
+pb.save_record(pb.record_from_config(cfg))
+
+print("\n== reading resolvectl ==")
+check("a DNS-over-TLS server is still that address",
+      pb.bare_ip("1.1.1.3#family.cloudflare-dns.com") == "1.1.1.3")
+check("so is a link-local one", pb.bare_ip("fe80::1%wlp1s0") == "fe80::1")
+check("a plain address is left alone", pb.bare_ip("1.0.0.3") == "1.0.0.3")
+check("and nothing is nothing", pb.bare_ip("") == "" and pb.bare_ip(None) == "")
+_f = pb.FILTERS["cloudflare_family"]
+check("the filter's own servers read as the filter's own servers",
+      all(pb.bare_ip(ip) in {i.lower() for i in _f["ipv4"] + _f["ipv6"]}
+          for ip in _f["ipv4"] + _f["ipv6"]))
+
 print("\n== discord transport (no network) ==")
 
 

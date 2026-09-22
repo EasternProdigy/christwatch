@@ -456,6 +456,43 @@ sudo pornblock update           # fetch, vet, install, restart
 Set `auto_apply: false` if you would rather approve each one; the app then
 shows a banner with an **Install** button instead.
 
+### Your setup is not part of the update
+
+Updates replace two files: `/usr/local/bin/pornblock` and `pornblock-gui`.
+Everything that makes this *yours* lives somewhere else and is never touched:
+
+| | |
+|---|---|
+| `/etc/pornblock/config.json` | approvers, timings, channel, filter |
+| `/etc/pornblock/secrets.json` | bot token, passphrase hash |
+| `/etc/pornblock/install-record.json` | the pinned arrangement |
+| `/var/lib/pornblock/` | state, blocklist, what it has recorded |
+
+A new version that adds a setting gets a default for it, so an old settings
+file keeps working - there is a config from the first release frozen into the
+test suite, and any change that stops it loading fails the build. A change
+that needs more than a default gets a migration step, and a settings file
+written by a *newer* version is left alone rather than rewritten backwards,
+because that case is a rollback.
+
+And then there is the check that does not rely on any of that being right.
+Before an update is accepted, the machine writes down what it knows about
+your arrangement - who your approvers are, how long the wait is, which
+channel, whether it is armed, whether it is locked - and asks the new version
+the same questions. If a single answer differs, the update is thrown away,
+the previous version is put back, and everyone is told what it would have
+changed:
+
+```
+  1.3.0 was NOT installed. You are still on 1.2.1, with everything as it was.
+  rolled back 1.3.0: it would have changed your setup: configured was True
+  and is now False; approvers was ['111...', '222...'] and is now None
+```
+
+That is not a hypothetical - it is rehearsed in the test suite and against a
+real machine, with a build that passes every test and then looks for its
+settings in the wrong place.
+
 **What happens before new code is allowed to run as root:**
 
 1. It is fetched from the **pinned** repo and branch. Repointing `repo` or

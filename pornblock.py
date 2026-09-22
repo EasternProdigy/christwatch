@@ -49,7 +49,7 @@ import urllib.request
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-VERSION = "1.2.1"
+VERSION = "1.3.0"
 HOMEPAGE = "https://github.com/EasternProdigy/christwatch"
 PROG = "pornblock"
 
@@ -636,11 +636,38 @@ def verify_passphrase(rec: dict | None, phrase: str) -> bool:
     return hmac.compare_digest(dk.hex(), rec.get("hash", ""))
 
 
+CONFIG_SCHEMA = 2
+
+
+def migrate_config(raw: dict) -> dict:
+    """
+    Bring an older settings file forward.
+
+    Most changes need nothing here: a new key with a sensible default is
+    filled in by deep_merge, which is why upgrades have never asked anyone to
+    set up again. This is for the rest - a key that changed meaning, or one
+    whose old absence meant something.
+
+    A file from a NEWER version is left exactly as it is. That case is a
+    rollback, and quietly rewriting it to an older shape would turn one bad
+    update into a lost setup.
+    """
+    v = int(raw.get("version") or 1)
+    if v > CONFIG_SCHEMA:
+        return raw
+    if v < 2:
+        # 1 -> 2: how friends are reached became a choice. Everything that
+        # existed before the choice existed was email.
+        raw.setdefault("transport", "email")
+    raw["version"] = CONFIG_SCHEMA
+    return raw
+
+
 def load_config(with_secrets: bool = True) -> dict:
     raw = load_json(CONFIG_PATH, None)
     if raw is None:
         return None
-    cfg = deep_merge(DEFAULT_CONFIG, raw)
+    cfg = deep_merge(DEFAULT_CONFIG, migrate_config(raw))
     if with_secrets:
         sec = load_secrets()
         cfg["email"]["smtp_password"] = sec.get("smtp_password") or ""
@@ -1590,6 +1617,17 @@ def _links() -> list:
     return names
 
 
+def bare_ip(server: str) -> str:
+    """
+    Just the address out of what resolvectl prints.
+
+    DNS-over-TLS servers come back as 1.1.1.3#family.cloudflare-dns.com, and
+    link-local ones as fe80::1%wlp1s0. Comparing those against a list of plain
+    addresses says "wrong resolver" about a resolver that is perfectly right.
+    """
+    return (server or "").split("#", 1)[0].split("%", 1)[0].strip().lower()
+
+
 def _links_with_foreign_dns(cfg: dict) -> list:
     """Links whose per-link resolvers are not our filter."""
     f = FILTERS[cfg["filter"]]
@@ -1606,7 +1644,7 @@ def _links_with_foreign_dns(cfg: dict) -> list:
         if iface == "lo":
             continue
         for srv in servers:
-            if srv.split("%")[0].lower() not in allowed:
+            if bare_ip(srv) not in allowed:
                 bad.append(iface)
                 break
     return bad
@@ -3239,14 +3277,14 @@ def health(cfg: dict, st: dict) -> list:
             r = run(["resolvectl", "status"], timeout=20)
             m = re.search(r"Current DNS Server:\s*(\S+)", r.out or "")
             cur = m.group(1) if m else "?"
-            allowed = set(FILTERS[cfg["filter"]]["ipv4"] +
-                          FILTERS[cfg["filter"]]["ipv6"])
+            allowed = {ip.lower() for ip in FILTERS[cfg["filter"]]["ipv4"] +
+                       FILTERS[cfg["filter"]]["ipv6"]}
             detail += ", now using %s" % cur
             stray = _links_with_foreign_dns(cfg)
             if stray:
                 ok = False
                 detail += ", STRAY on " + ",".join(stray)
-            elif cur not in allowed and cur != "?":
+            elif cur != "?" and bare_ip(cur) not in allowed:
                 ok = False
         add("systemd-resolved DoT", ok, detail)
     if enf.get("nftables", True):
@@ -4685,6 +4723,41 @@ def current_source_sha() -> str:
     return r.out.strip() if r.ok else ""
 
 
+ARRANGEMENT_KEYS = ("configured", "mode", "transport", "approvers",
+                    "approvals_required", "cooloff_hours", "unlock_minutes",
+                    "channel_id", "passphrase_set", "filter", "armed")
+
+
+def arrangement(doc: dict) -> dict:
+    """
+    The part of the snapshot that is your setup rather than the program.
+
+    An update is allowed to change how anything looks or works. It is not
+    allowed to change who can let you out, how long you wait, or whether this
+    machine is still switched on, and it is certainly not allowed to lose
+    them. This is what gets compared before and after.
+    """
+    out = {}
+    for k in ARRANGEMENT_KEYS:
+        v = doc.get(k)
+        out[k] = sorted(str(a).lower() for a in v) if isinstance(v, list) else v
+    return out
+
+
+def arrangement_diff(before: dict, after: dict) -> str:
+    """Empty when the setup came through the update intact."""
+    if not before:
+        return ""
+    if not after:
+        return "the new version could not describe its own state"
+    bad = []
+    for k in ARRANGEMENT_KEYS:
+        if before.get(k) != after.get(k):
+            bad.append("%s was %r and is now %r"
+                       % (k, before.get(k), after.get(k)))
+    return "; ".join(bad)
+
+
 def apply_update(cfg: dict, st: dict, dest: str, sha: str, subject: str,
                  newver: str) -> list:
     done = []
@@ -4705,6 +4778,7 @@ def apply_update(cfg: dict, st: dict, dest: str, sha: str, subject: str,
     # The self-test proved the code is sane in a sandbox. This proves it can
     # actually run on THIS machine before we hand the daemon over to it.
     if previous is not None:
+        before = arrangement(public_status_doc(cfg, st)) if cfg else {}
         broken = ""
         for probe in (["--version"], ["status", "--json"]):
             r = run([P(BIN_PATH)] + probe, timeout=180)
@@ -4712,21 +4786,33 @@ def apply_update(cfg: dict, st: dict, dest: str, sha: str, subject: str,
                 broken = "%s exited %d: %s" % (" ".join(probe), r.rc,
                                                (r.err or r.out).strip()[:200])
                 break
+        if not broken and before:
+            # it runs; now make sure it still knows who you are
+            after = {}
+            with contextlib.suppress(ValueError, TypeError):
+                after = arrangement(json.loads(
+                    run([P(BIN_PATH), "status", "--json"], timeout=180).out or "{}"))
+            drift = arrangement_diff(before, after)
+            if drift:
+                broken = "it would have changed your setup: %s" % drift
         if broken:
             write_managed(SELF_COPY, previous, 0o600, imm, backup=False)
             write_managed(BIN_PATH, previous, 0o755, imm, backup=False)
             st.setdefault("update", {})["rolled_back"] = "%s (%s)" % (newver, broken)
             st["update"]["last_error"] = "rolled back %s: %s" % (newver, broken)
-            history(st, "rolled back %s - it would not run: %s" % (newver, broken))
+            why = ("it would have changed your setup" if "setup" in broken
+                   else "it would not run")
+            history(st, "rolled back %s - %s: %s" % (newver, why, broken))
             alert(cfg, st, "update_rolled_back",
                   "An update was rolled back",
                   "%s pulled version %s onto %s. It passed the self-test but "
-                  "would not run here:\n\n  %s\n\nThe previous version has "
-                  "been put back and blocking is unaffected.\n"
+                  "did not survive contact with this machine:\n\n  %s\n\n"
+                  "The previous version has been put back. Blocking, your "
+                  "approvers and the timer are all unaffected.\n"
                   % (cfg.get("app_name") or PROG, newver, socket.gethostname(),
                      broken), force=True)
             save_state(st)
-            return ["rolled back %s - it would not run here" % newver]
+            return ["rolled back %s - %s here" % (newver, why)]
     done.append("core updated to %s" % newver)
 
     gui_path = os.path.join(dest, "pornblock_gui.py")
@@ -4955,13 +5041,20 @@ def cmd_update(args) -> int:
         return 0
 
     print("  self-test passed; installing...")
-    for line in apply_update(cfg, st, avail["path"], avail["sha"],
-                             avail.get("subject", ""), avail["version"]):
-        print(green("  " + line))
+    lines = apply_update(cfg, st, avail["path"], avail["sha"],
+                         avail.get("subject", ""), avail["version"])
+    rolled = any("rolled back" in ln for ln in lines)
+    for line in lines:
+        print((red if rolled else green)("  " + line))
     write_public_status(cfg, st)
     save_state(st)
     systemctl("restart", "pornblock.service")
-    print(green("\n  Updated to %s. Your approvers were emailed.\n"
+    if rolled:
+        print(red("\n  %s was NOT installed. You are still on %s, with "
+                  "everything as it was.\n" % (avail["version"], VERSION)))
+        print(dim("  %s\n" % (st.get("update") or {}).get("last_error", "")))
+        return 1
+    print(green("\n  Updated to %s. Your approvers were told.\n"
                 % avail["version"]))
     return 0
 
