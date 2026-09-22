@@ -3,9 +3,10 @@
 A self-hosted, accountability-gated porn blocker for Fedora/systemd Linux,
 with a desktop app.
 
-Blocking is the easy half. Making *unblocking* hard is the product. To turn it
-off you need **three things at once**: a 24-hour cool-off, your friends'
-approval by email, and a passphrase only they know.
+Plenty of things block porn. What this one is for is the other side: turning
+it back off takes **three things at once** - a 24-hour cool-off, your friends'
+approval by email, and a passphrase only they know - so it can't happen in the
+moment, or quietly.
 
 ```
 LOCKED  --ask to unlock-->  PENDING  --24h timer            --.

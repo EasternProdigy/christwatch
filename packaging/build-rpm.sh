@@ -16,7 +16,8 @@ mkdir -p "$TOP"/{SOURCES,SPECS,BUILD,BUILDROOT,RPMS,SRPMS}
 
 STAGE="$TOP/$NAME-$VER"
 mkdir -p "$STAGE"
-cp pornblock.py pornblock_gui.py selftest.py guitest.py README.md LICENSE "$STAGE/"
+cp pornblock.py pornblock_gui.py selftest.py guitest.py christwatch.svg \
+   README.md LICENSE "$STAGE/"
 tar -czf "$TOP/SOURCES/$NAME-$VER.tar.gz" -C "$TOP" "$NAME-$VER"
 
 sed "s/^Version:.*/Version:        $VER/" packaging/christwatch.spec \

@@ -31,9 +31,23 @@ def P(path):
     return os.path.join(PREFIX, path.lstrip("/")) if PREFIX else path
 
 
+ICON_FILE = P("/usr/share/icons/hicolor/scalable/apps/christwatch.svg")
 STATUS_PATH = P("/run/pornblock/status.json")
 SOURCE_HINT = P("/run/pornblock/source-hint.json")
 CORE_BIN = "/usr/local/bin/pornblock"
+
+def app_icon():
+    """The installed shield-and-cross, or None when running uninstalled."""
+    here = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "christwatch.svg")
+    for path in (ICON_FILE, here):
+        if os.path.exists(path):
+            try:
+                return Gdk.Texture.new_from_filename(path)
+            except GLib.Error:
+                pass
+    return None
+
 
 PROVIDERS = {
     "gmail.com": ("smtp.gmail.com", 587, "starttls", "imap.gmail.com", 993, "ssl"),
@@ -199,23 +213,35 @@ class SetupView(Gtk.Box):
     def _p_welcome(self):
         b = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
         sp = Adw.StatusPage(
-            icon_name="security-high-symbolic",
             title="ChristWatch",
-            description="Blocking porn is the easy half. This sets up the hard "
-                        "half: turning it back off needs a 24-hour wait AND "
-                        "your friends' permission.")
+            description="This blocks porn on this computer. Turning it back "
+                        "off takes a day of waiting and a yes from your "
+                        "friends, so it can't happen in the moment.")
+        icon = app_icon()
+        if icon is not None:
+            sp.set_paintable(icon)
+        else:
+            sp.set_icon_name("security-high-symbolic")
         sp.set_vexpand(False)
         b.append(sp)
-        g = Adw.PreferencesGroup(title="What you will need")
-        g.add(row("Two or three friends", "Their email addresses. They get every "
-                  "alert and they vote on every unlock.", "system-users-symbolic"))
-        g.add(row("A spare mailbox", "A dedicated account with an app password. "
-                  "It sends the alerts and reads the APPROVE replies.",
-                  "mail-unread-symbolic"))
-        g.add(row("One of those friends, next to you", "There is a step near the "
-                  "end where they take the keyboard and type two secrets you "
-                  "should not know.", "dialog-password-symbolic"))
+        g = Adw.PreferencesGroup(title="Before you start",
+                                 description="Ten minutes or so.")
+        g.add(row("A couple of friends", "Their email addresses. They hear "
+                  "about it when you ask to unlock, and they are the ones who "
+                  "decide.", "system-users-symbolic"))
+        g.add(row("A spare email account", "Not your normal one. It sends the "
+                  "messages and reads the replies, and you will need an app "
+                  "password for it.", "mail-unread-symbolic"))
+        g.add(row("One friend sitting with you", "Near the end they type two "
+                  "things you are not meant to know.",
+                  "dialog-password-symbolic"))
         b.append(g)
+        note = Gtk.Label(
+            wrap=True, xalign=0,
+            label="Nothing on this computer changes until the last step.")
+        note.add_css_class("dim-label")
+        note.add_css_class("caption")
+        b.append(note)
         return "welcome", b
 
     def _p_you(self):

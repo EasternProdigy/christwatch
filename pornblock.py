@@ -47,7 +47,7 @@ import urllib.request
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 PROG = "pornblock"
 
 # --------------------------------------------------------------------------
@@ -1750,8 +1750,13 @@ def icon_svg() -> str:
         '  <path d="M64 15 L107 30 V65 c0 26-19 44-43 50 C40 109 21 91 21 65 '
         'V30 Z" fill="none" stroke="#ffffff" stroke-opacity=".35" '
         'stroke-width="2"/>\n'
-        '  <path d="M56 33 H72 V56 H95 V72 H72 V104 H56 V72 H33 V56 H56 Z" '
-        'fill="#ffffff" fill-opacity=".95"/>\n'
+        # the eight-pointed Orthodox cross: titulus, the main bar, and the
+        # slanted footrest, raised on the side of the thief who repented
+        '  <path fill="#ffffff" fill-opacity=".95" d="'
+        'M59 24 H69 V107 H59 Z '
+        'M46 34 H82 V42 H46 Z '
+        'M34 56 H94 V66 H34 Z '
+        'M42 80 L86 93 V101 L42 88 Z"/>\n'
         '</svg>\n')
 
 

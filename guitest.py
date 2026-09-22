@@ -20,7 +20,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("Gdk", "4.0")
-from gi.repository import Gdk, GLib, Gtk  # noqa: E402
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pornblock_gui as G  # noqa: E402
@@ -28,7 +28,12 @@ import pornblock_gui as G  # noqa: E402
 FAILED = []
 
 
+RAN = 0
+
+
 def check(name, cond, detail=""):
+    global RAN
+    RAN += 1
     print(("  ok   " if cond else "  FAIL ") + name +
           (("  -- " + str(detail)) if detail and not cond else ""))
     if not cond:
@@ -104,6 +109,22 @@ def run(app):
         for i in range(len(sv.page_names)):
             sv.show_page(i)
         check("all %d pages build" % len(sv.page_names), True)
+        tex = G.app_icon()
+        check("the shield-and-cross icon loads", tex is not None
+              and tex.get_width() > 0)
+        def find(widget, cls):
+            if isinstance(widget, cls):
+                return widget
+            kid = widget.get_first_child()
+            while kid is not None:
+                hit = find(kid, cls)
+                if hit is not None:
+                    return hit
+                kid = kid.get_next_sibling()
+            return None
+        sp = find(sv.stack.get_child_by_name("welcome"), Adw.StatusPage)
+        check("the welcome page shows it rather than a themed icon",
+              sp is not None and sp.get_paintable() is not None)
         check("empty name is rejected", bool(sv.validate(1)))
         sv.e_name.set_text("Bill")
         sv.e_email.set_text("bill@example.com")
@@ -234,9 +255,17 @@ def run(app):
 
 
 app = G.App()
+# without this a ChristWatch window already open on this desktop owns the bus
+# name, our process becomes a remote instance, activate never fires here and
+# the run "passes" having tested nothing
+app.set_application_id(G.APP_ID + ".selftest")
+app.set_flags(Gio.ApplicationFlags.NON_UNIQUE)
 app.connect("activate", run)
 app.run([])
 print("\n%d checks failed" % len(FAILED))
 for f in FAILED:
     print("  - " + f)
+if RAN < 30:
+    print("ONLY %d checks ran -- the suite did not execute" % RAN)
+    sys.exit(1)
 sys.exit(1 if FAILED else 0)

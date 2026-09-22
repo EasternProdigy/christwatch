@@ -303,6 +303,12 @@ try:
 except Exception as exc:
     ok_svg = False
 check("icon parses as XML", ok_svg)
+# four white subpaths: staff, titulus, main bar, slanted footrest
+cross = re.search(r'fill="#ffffff"[^>]*d="([^"]+)"', svg)
+bars = cross.group(1).count("M") if cross else 0
+check("icon draws the eight-pointed Orthodox cross", bars == 4, bars)
+check("the footrest is slanted, raised on the left",
+      bool(cross) and "M42 80 L86 93" in cross.group(1))
 
 print("\n== update source handling ==")
 check("github url -> codeload tarball",
@@ -466,6 +472,12 @@ if _present("install.sh"):
           arms.group(0) if arms else "")
 else:
     print("  --   install.sh not in this copy")
+
+if _present("christwatch.svg"):
+    on_disk = open(os.path.join(HERE, "christwatch.svg"), encoding="utf-8").read()
+    check("the repo copy of the icon matches the installed one", on_disk == svg)
+else:
+    print("  --   christwatch.svg not in this copy")
 
 if _present("Install ChristWatch.desktop"):
     if shutil.which("desktop-file-validate"):

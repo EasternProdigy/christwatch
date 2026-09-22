@@ -1,5 +1,5 @@
 Name:           christwatch
-Version:        1.0.0
+Version:        1.0.1
 Release:        1%{?dist}
 Summary:        Accountability-gated content blocker
 
@@ -43,7 +43,7 @@ Use "pornblock uninstall", which only works inside a granted unlock window.
 %install
 install -d -m 0755 %{buildroot}%{_datadir}/%{name}
 install -m 0755 pornblock.py pornblock_gui.py %{buildroot}%{_datadir}/%{name}/
-install -m 0644 selftest.py guitest.py README.md LICENSE \
+install -m 0644 selftest.py guitest.py christwatch.svg README.md LICENSE \
     %{buildroot}%{_datadir}/%{name}/
 
 %check
@@ -67,5 +67,8 @@ cd %{_builddir}/%{name}-%{version} && python3 selftest.py
 %{_datadir}/%{name}/
 
 %changelog
+* Mon Sep 21 2026 William Mezitis <wmezitis@gmail.com> - 1.0.1-1
+- Orthodox cross on the app icon; plainer wording on the first setup page.
+
 * Mon Sep 21 2026 William Mezitis <wmezitis@gmail.com> - 1.0.0-1
 - First packaged release.
