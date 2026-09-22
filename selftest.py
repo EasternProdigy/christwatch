@@ -233,6 +233,26 @@ req = {"approvals": {"a@example.com": 1, "b@example.com": 1}, "passphrase_ok": F
 check("quorum alone does not satisfy it", pb.passphrase_gate(cfg, st, req) == (True, False))
 req["approvals"]["c@example.com"] = 1
 check("unanimity substitutes for it", pb.passphrase_gate(cfg, st, req) == (True, True))
+# two friends, both required: the quorum that unlocks is already unanimous,
+# so the recovery rule hands over the passphrase gate at the same moment
+two = pb.deep_merge(cfg, {"approvers": ["a@example.com", "b@example.com"],
+                          "approvals_required": 2})
+two["_secrets"] = cfg["_secrets"]
+check("two-of-two makes the passphrase gate inert", pb.passphrase_is_inert(two))
+check("and the gate really does fall open on quorum",
+      pb.passphrase_gate(two, st, {"approvals": {"a@example.com": 1,
+                                                 "b@example.com": 1},
+                                   "passphrase_ok": False}) == (True, True))
+two_off = pb.deep_merge(two, {"passphrase_recovery": False})
+two_off["_secrets"] = cfg["_secrets"]
+check("turning the recovery rule off restores it",
+      not pb.passphrase_is_inert(two_off))
+three = pb.deep_merge(cfg, {"approvals_required": 2})
+three["_secrets"] = cfg["_secrets"]
+check("two of three is not inert", not pb.passphrase_is_inert(three))
+check("the snapshot tells the GUI about it",
+      pb.public_status_doc(two, st)["passphrase_inert"] is True)
+
 cfg_norec = pb.deep_merge(cfg, {"passphrase_recovery": False})
 cfg_norec["_secrets"] = cfg["_secrets"]
 check("recovery off means unanimity is not enough",

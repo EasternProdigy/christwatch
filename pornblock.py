@@ -47,7 +47,7 @@ import urllib.request
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 PROG = "pornblock"
 
 # --------------------------------------------------------------------------
@@ -1972,6 +1972,23 @@ def request_email(cfg: dict, st: dict) -> tuple:
     return subject, text, html
 
 
+def passphrase_is_inert(cfg: dict) -> bool:
+    """
+    True when the recovery rule makes the passphrase gate meaningless.
+
+    If unanimous approval can stand in for the passphrase, and your quorum is
+    already everybody, then the moment enough friends approve the passphrase
+    is satisfied too. Two friends with "both must agree" lands exactly here.
+    The way out is a third approver, or turning the recovery rule off.
+    """
+    if not cfg.get("passphrase_recovery", True):
+        return False
+    if not cfg.get("require_passphrase", True):
+        return False
+    people = len(cfg.get("approvers") or [])
+    return bool(people) and int(cfg.get("approvals_required") or 1) >= people
+
+
 def passphrase_gate(cfg: dict, st: dict, req: dict) -> tuple:
     """
     Returns (required, satisfied) for the partner passphrase.
@@ -2551,6 +2568,7 @@ def public_status_doc(cfg: dict, st: dict) -> dict:
         "passphrase_locked_until": float((st.get("passphrase") or {}).get("locked_until") or 0),
         "passphrase_fails": int((st.get("passphrase") or {}).get("fails") or 0),
         "recovery_enabled": bool(cfg.get("passphrase_recovery", True)),
+        "passphrase_inert": passphrase_is_inert(cfg),
         "queued_emails": len(st.get("outbox") or []),
         "armed": bool(os.path.exists(P(UNIT_SERVICE)) and
                       (SANDBOX or systemctl("is-enabled", "pornblock.service")
@@ -3126,6 +3144,10 @@ def cmd_status(args) -> int:
     print("  cool-off           : %s hours" % cfg["cooloff_hours"])
     print("  unlock window      : %s minutes" % cfg["unlock_minutes"])
     print("  resolver           : %s" % FILTERS[cfg["filter"]]["label"])
+    if passphrase_is_inert(cfg):
+        print("  " + yellow("note") + "               : every quorum here is unanimous, so the")
+        print("  " + dim("                     passphrase gate is satisfied automatically."))
+        print("  " + dim("                     Add an approver, or turn the recovery rule off."))
 
     if mode == "PENDING":
         req = st["request"]

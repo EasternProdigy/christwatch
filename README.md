@@ -230,6 +230,12 @@ forgets then leaves this machine locked for good.
 remembers that a passphrase exists, so the gate stays shut and nothing you
 type can satisfy it - unanimity becomes the only route. That is deliberate.
 
+> **Two friends, both required?** Then your quorum *is* unanimity, and the
+> recovery rule hands the passphrase over the moment they both approve - so
+> it is not really a third gate. `status` says so, and the wizard warns you
+> while it is still one click to change. Three approvers with a quorum of
+> two, or `passphrase_recovery: false`, gives you the third gate back.
+
 ---
 
 ## Tuning

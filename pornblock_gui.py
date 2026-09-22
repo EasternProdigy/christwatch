@@ -70,7 +70,20 @@ FILTERS = [
 ]
 
 CSS = """
-.hero { padding: 26px 18px; }
+.hero { padding: 30px 18px 26px 18px; }
+.hero.state-locked {
+  background-image: linear-gradient(to bottom,
+      alpha(@success_bg_color, 0.22), alpha(@success_bg_color, 0.04));
+}
+.hero.state-pending {
+  background-image: linear-gradient(to bottom,
+      alpha(@warning_bg_color, 0.22), alpha(@warning_bg_color, 0.04));
+}
+.hero.state-unlocked {
+  background-image: linear-gradient(to bottom,
+      alpha(@error_bg_color, 0.24), alpha(@error_bg_color, 0.05));
+}
+.hero .title-1 { font-weight: 800; letter-spacing: -0.5px; }
 .dim { opacity: 0.65; }
 .logview { font-family: monospace; font-size: 12px; }
 """
@@ -413,6 +426,7 @@ class SetupView(Gtk.Box):
         self.p_phrase2 = Adw.PasswordEntryRow(title="Partner passphrase again")
         for w in (self.p_mailpass, self.p_phrase1, self.p_phrase2):
             g.add(w)
+        self.p_phrase1.connect("changed", lambda *_: self.check_inert())
         b.append(g)
 
         note = Gtk.Label(
@@ -433,9 +447,35 @@ class SetupView(Gtk.Box):
             title="Unanimous approval can substitute for it",
             subtitle="All approvers saying yes unlocks without the passphrase")
         self.sw_recovery.set_active(True)
+        self.sw_recovery.connect("notify::active", lambda *_: self.check_inert())
         g2.add(self.sw_recovery)
         b.append(g2)
+        self.l_inert = Gtk.Label(wrap=True, xalign=0, visible=False)
+        self.l_inert.add_css_class("warning")
+        self.l_inert.add_css_class("caption")
+        b.append(self.l_inert)
         return "friend", b
+
+    def check_inert(self):
+        """
+        Two friends with 'both must agree' makes the passphrase gate pointless:
+        the quorum that unlocks is already unanimous, so the recovery rule
+        satisfies the passphrase at the same moment. Say so here, where it is
+        still one click to fix.
+        """
+        people = len(self.approvers())
+        need = int(self.s_threshold.get_value())
+        inert = (self.sw_recovery.get_active() and people and need >= people
+                 and bool(self.p_phrase1.get_text()))
+        self.l_inert.set_visible(bool(inert))
+        if inert:
+            self.l_inert.set_label(
+                "Heads up: you are asking for %d of %d, which is everyone. "
+                "Because unanimous approval can stand in for the passphrase, "
+                "your friends approving would satisfy it too - so it would "
+                "never really be a third gate. Add another approver, lower "
+                "the number needed, or turn the switch above off."
+                % (need, people))
 
     def _p_install(self):
         b = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
@@ -461,6 +501,8 @@ class SetupView(Gtk.Box):
 
     def show_page(self, idx):
         self.page = idx
+        if self.page_names[idx] == "friend":
+            self.check_inert()
         self.stack.set_visible_child_name(self.page_names[idx])
         self.progress.set_fraction(idx / float(len(self.page_names) - 1))
         self.back_btn.set_sensitive(idx > 0)
@@ -692,9 +734,9 @@ class Dashboard(Gtk.Box):
                       margin_start=14, margin_end=14)
 
         # -- hero -----------------------------------------------------
-        hero = card()
+        hero = self.hero = card()
         self.i_mode = Gtk.Image.new_from_icon_name("security-high-symbolic")
-        self.i_mode.set_pixel_size(56)
+        self.i_mode.set_pixel_size(64)
         self.l_mode = Gtk.Label()
         self.l_mode.add_css_class("title-1")
         self.l_sub = Gtk.Label(wrap=True, justify=Gtk.Justification.CENTER)
@@ -826,6 +868,9 @@ class Dashboard(Gtk.Box):
             for c in ("success", "warning", "error"):
                 w.remove_css_class(c)
             w.add_css_class(style)
+        for c in ("state-locked", "state-pending", "state-unlocked"):
+            self.hero.remove_css_class(c)
+        self.hero.add_css_class("state-" + mode.lower())
         self.l_mode.set_label(title)
         self.l_sub.set_label(sub)
         self.b_request.set_visible(mode == "LOCKED")
@@ -874,8 +919,12 @@ class Dashboard(Gtk.Box):
             p_ok = bool(self.doc.get("passphrase_satisfied"))
             self.r_pass.set_visible(p_req)
             if p_req:
-                self.r_pass.set_subtitle("entered" if p_ok
-                                         else "ask your friend for it")
+                if p_ok and self.doc.get("passphrase_inert"):
+                    self.r_pass.set_subtitle("satisfied automatically - every "
+                                             "quorum here is unanimous")
+                else:
+                    self.r_pass.set_subtitle("entered" if p_ok
+                                             else "ask your friend for it")
                 self._mark(self.s_pass, p_ok)
                 self.b_phrase.set_visible(not p_ok)
             self.l_code.set_label(req.get("token") or "-")
@@ -1377,7 +1426,6 @@ class MainWindow(Adw.ApplicationWindow):
         if doc and doc.get("configured") and not doc.get("armed"):
             if self.current != "arm":
                 sp = Adw.StatusPage(
-                    icon_name="security-medium-symbolic",
                     title="Set up, but not switched on",
                     description="Your approvers, the mailbox and the secrets "
                                 "are saved. Nothing is being blocked yet and "
@@ -1386,6 +1434,11 @@ class MainWindow(Adw.ApplicationWindow):
                                 "watchdog and the daily report to your "
                                 "friends. Switching it back off needs the "
                                 "cool-off, their approval and the passphrase.")
+                icon = app_icon()
+                if icon is not None:
+                    sp.set_paintable(icon)
+                else:
+                    sp.set_icon_name("security-medium-symbolic")
                 b = Gtk.Button(label="Activate protection", halign=Gtk.Align.CENTER)
                 b.add_css_class("pill")
                 b.add_css_class("suggested-action")

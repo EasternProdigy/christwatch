@@ -149,6 +149,22 @@ def run(app):
         sv.p_phrase1.set_text("short")
         sv.p_phrase2.set_text("short")
         check("short passphrase rejected", bool(sv.validate(5)))
+        sv.p_phrase1.set_text("secret-phrase")
+        sv.p_phrase2.set_text("secret-phrase")
+        sv.s_threshold.set_value(3)          # 3 of 3 with recovery on
+        sv.check_inert()
+        check("wizard warns when the passphrase gate would be inert",
+              sv.l_inert.get_visible())
+        sv.s_threshold.set_value(2)          # 2 of 3
+        sv.check_inert()
+        check("and drops the warning once a quorum is short of everyone",
+              not sv.l_inert.get_visible())
+        sv.s_threshold.set_value(3)
+        sv.sw_recovery.set_active(False)
+        check("turning the recovery rule off clears it too",
+              not sv.l_inert.get_visible())
+        sv.sw_recovery.set_active(True)
+        sv.s_threshold.set_value(2)
         sv.p_phrase1.set_text("")
         sv.p_phrase2.set_text("")
         check("blank passphrase is allowed (set it later)", sv.validate(5) is None)

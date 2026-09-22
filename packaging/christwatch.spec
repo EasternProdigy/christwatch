@@ -1,5 +1,5 @@
 Name:           christwatch
-Version:        1.0.1
+Version:        1.0.2
 Release:        1%{?dist}
 Summary:        Accountability-gated content blocker
 
@@ -67,6 +67,10 @@ cd %{_builddir}/%{name}-%{version} && python3 selftest.py
 %{_datadir}/%{name}/
 
 %changelog
+* Mon Sep 21 2026 William Mezitis <wmezitis@gmail.com> - 1.0.2-1
+- Warn when a unanimous quorum makes the passphrase gate inert.
+- Dashboard hero carries the lock state as colour.
+
 * Mon Sep 21 2026 William Mezitis <wmezitis@gmail.com> - 1.0.1-1
 - Orthodox cross on the app icon; plainer wording on the first setup page.
 
