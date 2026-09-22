@@ -78,8 +78,15 @@ def doc(mode, avail=False):
 
 
 class Stub:
-    def toast(self, *a):
-        pass
+    def __init__(self):
+        self.toasts = []
+        self.refreshed = 0
+
+    def toast(self, text="", *a):
+        self.toasts.append(text)
+
+    def refresh(self):
+        self.refreshed += 1
 
 
 def run(app):
@@ -388,6 +395,63 @@ def run(app):
         d.update(off)
         check("panel hides when tracking is off", not d.g_today.get_visible())
         check("no stale rows left behind", len(d._kids["today"]) == 0)
+
+        print("\n== phones ==")
+        phdoc = doc("LOCKED")
+        phdoc["health"] += [
+            {"name": "phone: Pixel", "ok": True,
+             "detail": "filtering, last heard 12m ago"},
+            {"name": "phone: iPhone", "ok": False, "detail": "silent for 2d"},
+        ]
+        d.update(phdoc)
+        check("phones appear on the dashboard", len(d._kids["phones"]) == 2)
+        check("a phone in trouble is not buried",
+              any("silent" in (w.get_subtitle() or "")
+                  for w in d._kids["phones"]))
+        for _ in range(3):
+            d.update(phdoc)
+        check("refreshing does not pile phones up", len(d._kids["phones"]) == 2)
+        d.update(doc("LOCKED"))
+        check("with no phones the panel says so",
+              not d._kids["phones"]
+              and "set one up" in (d.g_phones.get_description() or ""))
+
+        st = Stub()
+        ph = G.PhonesDialog(st)
+        check("the phone panel builds", ph.stack.get_child_by_name("list")
+              is not None and ph.stack.get_child_by_name("serve") is not None)
+        ph._loaded(True, json.dumps({
+            "hostname": "family.cloudflare-dns.com",
+            "devices": [{"name": "Pixel", "kind": "android", "ok": True,
+                         "detail": "filtering"},
+                        {"name": "iPhone", "kind": "ios", "ok": True,
+                         "detail": "profile installed by hand"}]}))
+        check("it lists the phones you paired", len(ph._rows) == 2)
+        check("it shows the hostname to type",
+              ph.l_host.get_label() == "family.cloudflare-dns.com")
+        ph._loaded(True, json.dumps({"hostname": "x", "devices": []}))
+        check("and clears them again", len(ph._rows) == 0)
+
+        ph.kind.set_selected(0)
+        check("Android is not asked for a removal password",
+              not ph.g_pass.get_visible())
+        ph.kind.set_selected(1)
+        check("an iPhone is", ph.g_pass.get_visible()
+              and "friend" in ph.l_kind.get_label())
+
+        ph.e_name.set_text("")
+        ph._begin()
+        check("a phone with no name is refused",
+              ph.stack.get_visible_child_name() != "serve"
+              and any("name" in t for t in st.toasts))
+        ph.e_name.set_text("Pixel")
+        ph.e_pass.set_text("one")
+        ph.e_pass2.set_text("two")
+        ph._begin()
+        check("mismatched removal passwords are caught",
+              ph.stack.get_visible_child_name() != "serve"
+              and any("match" in t for t in st.toasts))
+        ph._stop()
 
         print("\n== dashboard (continued) ==")
         d.update(doc("UNLOCKED"))

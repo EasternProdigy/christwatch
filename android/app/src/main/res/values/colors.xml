@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="midnight">#0E1524</color>
+    <color name="gold">#D8A84E</color>
+    <color name="good">#2E9E5B</color>
+    <color name="bad">#C0392B</color>
+</resources>

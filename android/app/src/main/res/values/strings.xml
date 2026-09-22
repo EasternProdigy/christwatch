@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ChristWatch</string>
+    <string name="pair">Pair</string>
+    <string name="dns">Open Private DNS settings</string>
+    <string name="copy">Copy the hostname</string>
+    <string name="report">Send a report now</string>
+    <string name="forget">Unpair this phone</string>
+    <string name="hint">Paste your pairing link</string>
+</resources>

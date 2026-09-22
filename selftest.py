@@ -2,6 +2,7 @@
 """Offline checks for pornblock. Runs entirely inside a throwaway sandbox."""
 
 import base64
+import http.server
 import inspect
 import json
 import datetime as dt
@@ -18,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pornblock as pb  # noqa: E402
 
 FAILED = []
+HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def check(name, cond, detail=""):
@@ -993,8 +995,280 @@ check("public summary has the aggregates",
 check("public summary does NOT leak the browsing list",
       "domains" not in pub and "example.com" not in json.dumps(pub))
 
+print("\n== phones ==")
+
+PH_CFG = pb.deep_merge(base_cfg(), {
+    "transport": "discord",
+    "discord": {"channel_id": "123456789012345678", "bot_token": "t",
+                "channel_name": "accountability"},
+    "approvers": ["779187277308887060", "1252356701877829733"],
+    "phone": {"devices": {
+        "aa11bb22": {"name": "Pixel", "kind": "android", "added": pb.now() - 10},
+        "cc33dd44": {"name": "iPhone", "kind": "ios", "added": pb.now() - 10},
+    }},
+})
+
+# -- the pairing link ------------------------------------------------------
+LINK = pb.pair_link(PH_CFG, "https://discord.com/api/webhooks/1/abc",
+                    "aa11bb22", "Pixel", "#accountability")
+BACK = pb.read_pair_link(LINK)
+check("a pairing link is a tappable christwatch:// url",
+      LINK.startswith("christwatch://pair#"))
+check("the link survives the round trip",
+      BACK.get("id") == "aa11bb22" and BACK.get("name") == "Pixel"
+      and BACK.get("hook").endswith("/abc"))
+check("the link carries the hostname the phone must be set to",
+      BACK.get("dns") == pb.FILTERS[PH_CFG["filter"]]["dot_name"])
+check("the link never carries the bot token",
+      "t" != BACK.get("hook") and "token" not in json.dumps(BACK).lower())
+check("junk is rejected rather than half-read",
+      pb.read_pair_link("christwatch://pair#not-base64!!") == {}
+      and pb.read_pair_link("") == {})
+
+# The phone app parses this link in Kotlin. Nothing compiles both sides
+# together, so the agreement between them is checked here instead: every key
+# the laptop writes has to be a key the app reads.
+KOT = os.path.join(HERE, "android/app/src/main/java/io/christwatch/phone/Core.kt")
+if os.path.exists(KOT):
+    core_kt = open(KOT, encoding="utf-8").read()
+    for key in ("hook", "name", "dns", "home"):
+        check("the phone app reads the %r field" % key,
+              'optString("%s")' % key in core_kt)
+    check("the phone app agrees on the scheme",
+          'removePrefix("christwatch://pair")' in core_kt)
+    check("the phone app agrees on the marker",
+          'MARKER = "%s"' % pb.PHONE_MARKER in core_kt)
+    check("the phone app reads the same setting names",
+          '"private_dns_mode"' in core_kt and '"private_dns_specifier"' in core_kt)
+    check("the phone app decodes base64 the same way",
+          "URL_SAFE" in core_kt and "NO_PADDING" in core_kt)
+else:
+    print("  --   android/ not in this copy")
+
+# -- the iPhone profile ----------------------------------------------------
+import plistlib
+PROF = plistlib.loads(pb.mobileconfig(PH_CFG, "iPhone", "hunter2"))
+DNSP = [x for x in PROF["PayloadContent"]
+        if x["PayloadType"] == "com.apple.dnsSettings.managed"][0]
+check("the profile sets DNS for the whole phone",
+      DNSP["DNSSettings"]["ServerURL"] == pb.FILTERS[PH_CFG["filter"]]["doh_url"])
+check("the profile asks iOS to forbid switching it off",
+      DNSP.get("ProhibitDisablement") is True)
+check("a removal password locks the profile down",
+      PROF["PayloadRemovalDisallowed"] is True
+      and any(x["PayloadType"] == "com.apple.profileRemovalPassword"
+              and x["RemovalPassword"] == "hunter2"
+              for x in PROF["PayloadContent"]))
+OPEN = plistlib.loads(pb.mobileconfig(PH_CFG, "iPhone", ""))
+check("without a password the profile says so honestly",
+      OPEN["PayloadRemovalDisallowed"] is False
+      and not any(x["PayloadType"] == "com.apple.profileRemovalPassword"
+                  for x in OPEN["PayloadContent"]))
+check("each profile is its own document to iOS",
+      PROF["PayloadUUID"] != OPEN["PayloadUUID"])
+
+# -- finding a phone by what you call it -----------------------------------
+check("a phone is found by name", pb.find_device(PH_CFG, "Pixel") == "aa11bb22")
+check("a phone is found by name whatever the case",
+      pb.find_device(PH_CFG, "pIxEl") == "aa11bb22")
+check("a phone is found by id", pb.find_device(PH_CFG, "cc33dd44") == "cc33dd44")
+check("a name nobody used finds nothing", pb.find_device(PH_CFG, "nokia") == "")
+
+# -- reading what the phones said -----------------------------------------
+class PhoneDiscord(pb.DiscordCourier):
+    """A channel with one phone report, one person talking and one bot."""
+    MESSAGES = [
+        {"id": "900", "webhook_id": "5", "author": {"bot": True},
+         "content": "\U0001F4F1 Pixel · profile 0 — still on\n"
+                    "`CW1 {\"d\":\"aa11bb22\",\"n\":\"Pixel\",\"u\":0,"
+                    "\"s\":\"on\",\"dns\":\"family.cloudflare-dns.com\","
+                    "\"at\":1}`"},
+        {"id": "901", "author": {"bot": False, "id": "779187277308887060"},
+         "content": "nice"},
+        {"id": "902", "author": {"bot": True, "id": "1"},
+         "content": "CW1 {\"d\":\"aa11bb22\",\"s\":\"off\"}"},
+    ]
+
+    def _call(self, method, path, body=None, timeout=25, retries=1):
+        if "/messages?" in path:
+            return list(self.MESSAGES) if "after=0" in path or True else []
+        raise AssertionError("unexpected call " + path)
+
+REPORTS = PhoneDiscord(PH_CFG).reports(0)
+check("a phone's report is read out of the channel",
+      len(REPORTS) == 1 and REPORTS[0]["d"] == "aa11bb22"
+      and REPORTS[0]["s"] == "on")
+check("a person typing the marker cannot fake a phone",
+      all(r.get("s") != "off" for r in REPORTS))
+
+class DeadPhoneDiscord(pb.DiscordCourier):
+    def _call(self, *a, **k):
+        raise pb.MailError("Discord is down")
+
+check("a Discord outage does not raise out of reports()",
+      DeadPhoneDiscord(PH_CFG).reports(0) == [])
+
+# -- acting on it ----------------------------------------------------------
+def phone_state():
+    st = pb.deep_merge(pb.DEFAULT_STATE, {})
+    st["mode"] = "LOCKED"
+    return st
+
+ST = phone_state()
+MOVES = pb.poll_phones(PH_CFG, ST, PhoneDiscord(PH_CFG))
+check("a first report is recorded, quietly",
+      ST["phones"]["aa11bb22"]["state"] == "on" and not MOVES)
+check("the iPhone is not expected to report",
+      not ST["phones"].get("cc33dd44", {}).get("state"))
+
+class OffDiscord(PhoneDiscord):
+    MESSAGES = [{"id": "903", "webhook_id": "5", "author": {"bot": True},
+                 "content": "`CW1 {\"d\":\"aa11bb22\",\"s\":\"off\",\"at\":2}`"}]
+    def post(self, text, ping_ids=()):
+        self.said = getattr(self, "said", []) + [text]
+        return "1"
+
+OFF = OffDiscord(PH_CFG)
+_real_phone_courier = pb.courier
+pb.courier = lambda _cfg: OFF
+MOVES = pb.poll_phones(PH_CFG, ST, OFF)
+pb.courier = _real_phone_courier
+check("a phone that stopped filtering is news",
+      any("filtering off" in m for m in MOVES))
+check("and the channel is told about it",
+      any("stopped filtering" in t for t in getattr(OFF, "said", [])))
+
+class QuietDiscord(PhoneDiscord):
+    MESSAGES = []
+    def post(self, text, ping_ids=()):
+        self.said = getattr(self, "said", []) + [text]
+        return "1"
+
+ST2 = phone_state()
+ST2["phones"]["aa11bb22"] = {"last_seen": pb.now() - 40 * 3600, "state": "on"}
+QUIET = QuietDiscord(PH_CFG)
+pb.courier = lambda _cfg: QUIET
+MOVES = pb.poll_phones(PH_CFG, ST2, QUIET)
+check("a phone that went quiet is treated as an answer",
+      any("silent" in m for m in MOVES)
+      and any("gone quiet" in t for t in getattr(QUIET, "said", [])))
+QUIET2 = QuietDiscord(PH_CFG)
+pb.courier = lambda _cfg: QUIET2
+check("but it is only said once",
+      not pb.poll_phones(PH_CFG, ST2, QUIET2)
+      and not getattr(QUIET2, "said", []))
+pb.courier = _real_phone_courier
+
+ST3 = phone_state()
+STRANGER = QuietDiscord(PH_CFG)
+pb.courier = lambda _cfg: STRANGER
+STRANGER.MESSAGES = [{"id": "904", "webhook_id": "5", "author": {"bot": True},
+                      "content": "`CW1 {\"d\":\"ffffffff\",\"s\":\"off\"}`"}]
+pb.poll_phones(PH_CFG, ST3, STRANGER)
+pb.courier = _real_phone_courier
+check("a report from a phone you never paired is ignored",
+      "ffffffff" not in ST3["phones"] and not getattr(STRANGER, "said", []))
+
+check("with no phones paired nothing is polled",
+      pb.poll_phones(base_cfg(), phone_state(), QuietDiscord(PH_CFG)) == [])
+
+# -- how it reads in status ------------------------------------------------
+ROWS = dict((n, (ok, d)) for n, k, ok, d in pb.phone_table(PH_CFG, ST))
+check("a filtering phone reads as fine", ROWS["Pixel"][0] is False
+      or "filtering" in ROWS["Pixel"][1])
+FRESH = pb.deep_merge(PH_CFG, {"phone": {"devices": {
+    "ee55ff66": {"name": "New", "kind": "android", "added": pb.now()}}}})
+FRESHROWS = dict((n, (ok, d)) for n, k, ok, d in
+                 pb.phone_table(FRESH, phone_state()))
+check("a phone paired a minute ago is not called a failure",
+      FRESHROWS["New"][0] is True and "waiting" in FRESHROWS["New"][1])
+STALE = pb.deep_merge(PH_CFG, {"phone": {"devices": {
+    "ee55ff66": {"name": "New", "kind": "android",
+                 "added": pb.now() - 100 * 3600}}}})
+STALEROWS = dict((n, (ok, d)) for n, k, ok, d in
+                 pb.phone_table(STALE, phone_state()))
+check("a phone that never checked in eventually is",
+      STALEROWS["New"][0] is False)
+
+# -- the page you open on the phone ---------------------------------------
+import http.client
+import threading
+
+pb.PhoneHandler.files = {"/ChristWatch.mobileconfig":
+                         (pb.mobileconfig(PH_CFG, "iPhone", ""),
+                          pb.MOBILECONFIG_TYPE)}
+pb.PhoneHandler.page = b"<html>hello</html>"
+pb.PhoneHandler.token = "s3cr3t"
+SRV = http.server.ThreadingHTTPServer(("127.0.0.1", 0), pb.PhoneHandler)
+threading.Thread(target=SRV.serve_forever, daemon=True).start()
+PORT = SRV.server_address[1]
+
+
+def fetch(path):
+    c = http.client.HTTPConnection("127.0.0.1", PORT, timeout=5)
+    c.request("GET", path)
+    r = c.getresponse()
+    body = r.read()
+    c.close()
+    return r.status, body, r.getheader("Content-Type")
+
+check("the page is there for whoever has the address",
+      fetch("/s3cr3t/")[0] == 200)
+ST_, BODY, CT = fetch("/s3cr3t/ChristWatch.mobileconfig")
+check("iOS is handed the profile as a profile",
+      ST_ == 200 and CT == pb.MOBILECONFIG_TYPE and b"PayloadType" in BODY)
+check("guessing the address gets you nothing",
+      fetch("/wrong/")[0] == 404 and fetch("/")[0] == 404
+      and fetch("/s3cr3t/../etc/passwd")[0] == 404)
+SRV.shutdown()
+SRV.server_close()
+
+# -- opening a port must not narrow the firewall ---------------------------
+# Fedora Workstation already allows 1025-65535. Removing "our" port out of
+# that range afterwards would split it and leave the port shut for good.
+class FakeRun:
+    def __init__(self, answer):
+        self.answer = answer
+        self.calls = []
+
+    def __call__(self, argv, **kw):
+        self.calls.append(" ".join(argv))
+        out = self.answer if any("--query-port" in a for a in argv) else ""
+        return type("R", (), {"ok": True, "out": out, "err": "", "rc": 0})()
+
+_real_run, _real_sandbox, _real_which = pb.run, pb.SANDBOX, pb.shutil.which
+pb.SANDBOX = False
+pb.shutil.which = lambda _n: "/usr/bin/firewall-cmd"
+
+pb.run = FakeRun("yes")
+with pb.port_open(8723) as got:
+    pass
+check("a port the zone already allows is left alone",
+      got is True and not any("--add-port" in c for c in pb.run.calls)
+      and not any("--remove-port" in c for c in pb.run.calls))
+
+pb.run = FakeRun("no")
+with pb.port_open(8723):
+    pass
+check("a port that was shut is opened and shut again",
+      any("--add-port=8723/tcp" in c for c in pb.run.calls)
+      and any("--remove-port=8723/tcp" in c for c in pb.run.calls))
+check("and nothing is written to the permanent config",
+      not any("--permanent" in c for c in pb.run.calls))
+pb.run, pb.SANDBOX, pb.shutil.which = _real_run, _real_sandbox, _real_which
+
+
+# -- your phones are part of your setup, not of the program ----------------
+DOC = pb.public_status_doc(PH_CFG, phone_state())
+check("paired phones are in the snapshot",
+      "android:Pixel" in DOC["phones"] and "ios:iPhone" in DOC["phones"])
+LOST = dict(DOC)
+LOST["phones"] = ["android:Pixel"]
+check("an update that lost a phone would be refused",
+      "phones" in pb.arrangement_diff(pb.arrangement(DOC), pb.arrangement(LOST)))
+
+
 print("\n== packaging (skipped when not shipped in the tarball) ==")
-HERE = os.path.dirname(os.path.abspath(__file__))
 import subprocess  # noqa: E402
 
 def _present(name):
