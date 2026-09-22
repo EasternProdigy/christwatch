@@ -5,8 +5,12 @@ with a desktop app.
 
 Plenty of things block porn. What this one is for is the other side: turning
 it back off takes **three things at once** - a 24-hour cool-off, your friends'
-approval by email, and a passphrase only they know - so it can't happen in the
-moment, or quietly.
+approval, and a passphrase only they know - so it can't happen in the moment,
+or quietly.
+
+Your friends can be reached **in a Discord channel** or **by email**. Discord
+is the default: no new mailbox, no app password, and approving happens in
+front of everyone, which is most of the point.
 
 ```
 LOCKED  --ask to unlock-->  PENDING  --24h timer            --.
@@ -110,6 +114,48 @@ sudo pornblock test-email   # prove SMTP+IMAP work BEFORE you rely on them
 sudo pornblock install      # units, enable, lock down
 sudo pornblock status
 ```
+
+### Discord (the default)
+
+One bot, made once, in whatever server you and your friends already use:
+
+1. **discord.com/developers** -> New Application -> name it.
+2. **Bot** -> Reset Token -> copy the token. That is the long string, not the
+   application id.
+3. Still on Bot: switch on **MESSAGE CONTENT INTENT**. Without it the bot sees
+   every message as blank and no approval can ever land. `check-discord` and
+   `test-email` both tell you if it is off.
+4. **Installation** -> add it to your server with *View Channel*, *Send
+   Messages* and *Read Message History*.
+5. In Discord: Settings -> Advanced -> **Developer Mode**, then right-click
+   the channel -> **Copy Channel ID**.
+
+Then press **Ask them to check in** in the wizard. It posts one message in the
+channel, and everyone who answers becomes an approver - nobody has to copy an
+18-digit user id.
+
+```bash
+# what that button runs, if you prefer a terminal
+echo '{"discord":{"bot_token":"...","channel_id":"..."}}' | pornblock check-discord
+echo '{"discord":{"bot_token":"...","channel_id":"..."}}' | pornblock discord-checkin --wait 120
+```
+
+Requests, approvals, denials, tamper alerts and the nightly report all go to
+that one channel, and approvals are read back out of it: your friends type
+`APPROVE <code>` where everyone can see. DMs to the bot are ignored on
+purpose.
+
+**Why this is stronger than email.** An email approval is matched on a `From:`
+header, which anyone can forge from any SMTP server. A Discord message carries
+a user id you cannot spoof without owning your friend's account. The bot token
+is not the weak point either: it lets this machine post and read in the
+channel, but it can never approve anything.
+
+**What the record pins.** Moving the alerts to a channel your friends are not
+in is the same as switching them off, so the install record pins both the
+transport and the channel id. Changing either reverts and tells everybody.
+
+### Email
 
 Setup asks for a **dedicated mailbox** with an **app password**. Pick the
 provider from a list and the server settings fill themselves in - they stay
@@ -500,8 +546,21 @@ generalises; `/etc/hosts` is belt-and-braces.
 24-hour delay and nothing else. Pick people who will actually ask why.
 
 **Approval email is identified by the `From:` header** and nothing stronger.
-No DKIM check, no signatures. Run `test-email` regularly: a silently broken
-mailbox means alerts nobody ever receives.
+No DKIM check, no signatures - anyone who can reach an SMTP server can forge
+an approval from your friend's address. This is the main reason Discord is the
+default: a message there carries a user id you cannot spoof. Either way, run
+`test-email` regularly, because a silently broken channel means alerts nobody
+ever receives.
+
+**On Discord, you can read the bot token** - it lives on a machine you are
+root on. It cannot approve anything, but it can post as the bot, so someone
+determined could write a convincing-looking fake alert in the channel. It also
+means you could revoke the token and go quiet; the machine would stay locked
+and your friends would stop hearing from it, which is its own kind of tell.
+
+**Discord itself is a dependency.** If it is down, or the bot is kicked, no
+approval can arrive. The machine stays locked and keeps enforcing - the safe
+failure - but the honest unlock path is closed until it comes back.
 
 **The GUI runs as you.**  Secrets typed into the wizard are piped over stdin
 rather than written to disk, but a process you own can be attached to by a

@@ -365,6 +365,11 @@ class FakeDiscord(pb.DiscordCourier):
         return {}
 
 
+class DeadDiscord(FakeDiscord):
+    def _call(self, *a, **k):
+        raise pb.MailError("Discord is down")
+
+
 dcfg = {"transport": "discord",
         "approvers": ["111111111111111111", "222222222222222222"],
         "approver_names": {"111111111111111111": "marcus",
@@ -437,6 +442,22 @@ st_d["request"]["approvals"] = {}
 check("a stranger in the channel cannot approve",
       pb.poll_approvals(dcfg, st_d, FakeDiscord(dcfg, pages=[strangers])) == [])
 
+# a dead channel must leave the machine locked and enforcing, never wedge the
+# daemon: reading approvals is the one call that talks to the network on every
+# single tick
+st_d["request"]["approvals"] = {}
+check("a transport that cannot be reached returns nothing, quietly",
+      pb.poll_approvals(dcfg, st_d, DeadDiscord(dcfg)) == [])
+
+
+class ExplodingCourier:
+    def scan(self, *a):
+        raise RuntimeError("kaboom")
+
+
+check("and even an unexpected error does not stop the tick",
+      pb.poll_approvals(dcfg, st_d, ExplodingCourier()) == [])
+
 check("the content intent is read off the application flags",
       FakeDiscord(dcfg, me={"flags": 1 << 18}).content_intent()
       and not FakeDiscord(dcfg, me={"flags": 0}).content_intent())
@@ -454,11 +475,6 @@ check("alerts go to the channel, not to a mailbox", len(_spy.sent) == 1)
 pb.alert(dcfg, _st, "digest", "Daily report", "body", force=True, ping=False)
 check("the nightly report does not ping anyone at 8pm",
       "<@" not in _spy.sent[1][1]["content"])
-
-
-class DeadDiscord(FakeDiscord):
-    def _call(self, *a, **k):
-        raise pb.MailError("Discord is down")
 
 
 dead = DeadDiscord(dcfg)

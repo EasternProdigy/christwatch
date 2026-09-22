@@ -47,7 +47,7 @@ import urllib.request
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-VERSION = "1.0.3"
+VERSION = "1.1.0"
 HOMEPAGE = "https://github.com/EasternProdigy/christwatch"
 PROG = "pornblock"
 
@@ -1157,8 +1157,21 @@ class DiscordCourier:
     # -- incoming ---------------------------------------------------------
 
     def scan(self, st: dict, since_epoch: float) -> list:
-        """(author id, "", message text, message id) for everything humans
-        have said in the channel since `since_epoch`."""
+        """
+        (author id, "", message text, message id) for everything humans have
+        said in the channel since `since_epoch`.
+
+        Never raises. A Discord outage, a revoked token or a channel someone
+        deleted must leave the machine locked and enforcing, not wedge the
+        daemon - the blocker staying on is always the safe failure.
+        """
+        try:
+            return self._scan(st, since_epoch)
+        except MailError as exc:
+            log("discord read failed: %s" % exc)
+            return []
+
+    def _scan(self, st: dict, since_epoch: float) -> list:
         cid = self._channel()
         after = snowflake_at(since_epoch)
         out, blank = [], 0
@@ -2383,7 +2396,12 @@ def poll_approvals(cfg: dict, st: dict, post) -> list:
         return []
     events = []
     approvers = {a.strip().lower() for a in cfg.get("approvers") or []}
-    for sender, subject, body, _uid in post.scan(st, req["requested_at"]):
+    try:
+        incoming = post.scan(st, req["requested_at"])
+    except Exception as exc:              # a dead channel is not a crash
+        log("could not read approvals: %r" % exc)
+        return []
+    for sender, subject, body, _uid in incoming:
         if sender not in approvers:
             continue
         verdict = classify_reply(subject, body, req["token"])
@@ -3302,12 +3320,12 @@ def cmd_setup(args) -> int:
     partner passcode : %s
 
   Next:
-    1. %s test-email      <- prove email works BEFORE you rely on it
+    1. %s test-email      <- prove %s works BEFORE you rely on it
     2. %s install         <- write units, enable, lock it down
-""" % (bold("Summary"), ", ".join(cfg["approvers"]), cfg["approvals_required"],
+""" % (bold("Summary"), people_list(cfg), cfg["approvals_required"],
        cfg["cooloff_hours"], cfg["unlock_minutes"], FILTERS[cfg["filter"]]["label"],
        "set by your friend" if sec.get("partner_passphrase") else "NOT SET",
-       PROG, PROG))
+       PROG, "the channel" if is_discord(cfg) else "email", PROG))
 
     if getattr(args, "install", False):
         print(bold("  continuing straight into install...\n"))
@@ -3751,7 +3769,9 @@ def cmd_status(args) -> int:
         print("  granted            : %s" % stamp(unl["granted_at"]))
         print("  re-locks at        : %s" % stamp(unl["expires_at"]))
         print("  window remaining   : %s" % red(human_delta(unl["expires_at"] - now())))
-        print("  approved by        : %s" % ", ".join(unl.get("approved_by") or []))
+        print("  approved by        : %s"
+              % ", ".join(display_name(cfg, a)
+                          for a in unl.get("approved_by") or []))
 
     print("  " + "-" * 68)
     print("  enforcement")

@@ -49,6 +49,24 @@ def app_icon():
     return None
 
 
+FRIEND_INTRO_EMAIL = (
+    "These two secrets are the ones you are not supposed to know.\n\n"
+    "\u2022  The mailbox password. Without it you cannot read the replies "
+    "your friends send, or quietly stop them arriving.\n"
+    "\u2022  The partner passphrase. Even after the timer runs out and your "
+    "friends approve, an unlock needs this typed in \u2014 so they have to be "
+    "willing to say it out loud.\n\n"
+    "Neither is ever shown again. The passphrase is stored only as a hash.")
+
+FRIEND_INTRO_DISCORD = (
+    "One secret, and it is the one that matters.\n\n"
+    "\u2022  The partner passphrase. Even after the timer runs out and your "
+    "friends approve in the channel, an unlock needs this typed in \u2014 so "
+    "somebody has to be willing to say it out loud.\n\n"
+    "It is never shown again; only a hash of it is stored. The bot token is "
+    "not a secret in the same way: it lets this machine post and read in the "
+    "channel, but it can never approve anything.")
+
 PROVIDER_CHOICES = [
     ("Gmail", "gmail.com",
      "Make a fresh Gmail account for this, not your own. In that account turn "
@@ -133,6 +151,17 @@ def core_argv():
     if os.path.exists(local):
         return [sys.executable, local]
     return ["pornblock"]
+
+
+def person(doc, ident):
+    """Approvers are addresses on email and user ids on Discord."""
+    ident = str(ident or "").strip()
+    name = (doc.get("approver_names") or {}).get(ident)
+    if name:
+        return name
+    if doc.get("transport") == "discord" and ident.isdigit():
+        return "Discord user %s" % ident
+    return ident
 
 
 def read_status():
@@ -243,8 +272,8 @@ class SetupView(Gtk.Box):
         bar.append(self.next_btn)
         self.append(bar)
 
-        for builder in (self._p_welcome, self._p_you, self._p_friends,
-                        self._p_friction, self._p_mailbox, self._p_friend,
+        for builder in (self._p_welcome, self._p_you, self._p_channel,
+                        self._p_friends, self._p_friction, self._p_friend,
                         self._p_install):
             name, widget = builder()
             sw = Gtk.ScrolledWindow(vexpand=True,
@@ -253,8 +282,9 @@ class SetupView(Gtk.Box):
                                    margin_bottom=24, margin_start=16,
                                    margin_end=16, child=widget))
             self.stack.add_named(sw, name)
-        self.page_names = ["welcome", "you", "friends", "friction", "mailbox",
+        self.page_names = ["welcome", "you", "channel", "friends", "friction",
                            "friend", "install"]
+        self._transport_chosen()        # every pane agrees on Discord first
         self.show_page(0)
 
     # -- pages ------------------------------------------------------------
@@ -308,19 +338,10 @@ class SetupView(Gtk.Box):
 
     def _p_friends(self):
         b = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
-        self.g_friends = Adw.PreferencesGroup(
-            title="Your approvers",
-            description="Everyone here gets every alert. Pick people who will "
-                        "actually ask you why.")
-        add = Gtk.Button(icon_name="list-add-symbolic", valign=Gtk.Align.CENTER)
-        add.add_css_class("flat")
-        add.set_tooltip_text("Add another approver")
-        add.connect("clicked", lambda *_: self.add_approver())
-        self.g_friends.set_header_suffix(add)
-        b.append(self.g_friends)
-        self.approver_rows = []
-        for _ in range(2):
-            self.add_approver()
+        self.fstack = Gtk.Stack(vhomogeneous=False)
+        self.fstack.add_named(self._friends_discord(), "discord")
+        self.fstack.add_named(self._friends_email(), "email")
+        b.append(self.fstack)
 
         g2 = Adw.PreferencesGroup(
             title="How many must agree",
@@ -332,6 +353,126 @@ class SetupView(Gtk.Box):
         g2.add(self.s_threshold)
         b.append(g2)
         return "friends", b
+
+    # -- approvers, the email way: you type their addresses ---------------
+
+    def _friends_email(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        self.g_friends = Adw.PreferencesGroup(
+            title="Your approvers",
+            description="Everyone here gets every alert. Pick people who will "
+                        "actually ask you why.")
+        add = Gtk.Button(icon_name="list-add-symbolic", valign=Gtk.Align.CENTER)
+        add.add_css_class("flat")
+        add.set_tooltip_text("Add another approver")
+        add.connect("clicked", lambda *_: self.add_approver())
+        self.g_friends.set_header_suffix(add)
+        box.append(self.g_friends)
+        self.approver_rows = []
+        for _ in range(2):
+            self.add_approver()
+        return box
+
+    # -- approvers, the Discord way: they check in and it fills itself ----
+
+    def _friends_discord(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        self.discord_people = []
+        self.g_checkin = Adw.PreferencesGroup(
+            title="Your approvers",
+            description="Rather than anyone copying 18-digit ids, ask them in "
+                        "the channel. Everyone who answers lands here.")
+        self.r_checkin = Adw.ActionRow(
+            title="Ask them to check in",
+            subtitle="Posts one message and listens for two minutes")
+        self.r_checkin.add_prefix(
+            Gtk.Image.new_from_icon_name("system-users-symbolic"))
+        self.b_checkin = Gtk.Button(label="Ask them", valign=Gtk.Align.CENTER)
+        self.b_checkin.add_css_class("suggested-action")
+        self.b_checkin.connect("clicked", self.on_checkin)
+        self.r_checkin.add_suffix(self.b_checkin)
+        self.g_checkin.add(self.r_checkin)
+        box.append(self.g_checkin)
+
+        self.g_people = Adw.PreferencesGroup(title="Checked in")
+        manual = Gtk.Button(icon_name="list-add-symbolic",
+                            valign=Gtk.Align.CENTER)
+        manual.add_css_class("flat")
+        manual.set_tooltip_text("Add someone by user id instead")
+        manual.connect("clicked", lambda *_: self.add_discord_person("", ""))
+        self.g_people.set_header_suffix(manual)
+        self._people_rows = []
+        box.append(self.g_people)
+        self.l_checkin = Gtk.Label(wrap=True, xalign=0, visible=False)
+        self.l_checkin.add_css_class("caption")
+        box.append(self.l_checkin)
+        return box
+
+    def add_discord_person(self, uid, name):
+        person = {"id": str(uid or ""), "name": name or ""}
+        self.discord_people.append(person)
+        r = Adw.EntryRow(title=name or "Discord user id")
+        r.set_text(person["id"])
+        r.connect("changed", lambda e, pp=person: pp.update(
+            {"id": e.get_text().strip()}))
+        r.add_prefix(Gtk.Image.new_from_icon_name("avatar-default-symbolic"))
+        rm = Gtk.Button(icon_name="list-remove-symbolic", valign=Gtk.Align.CENTER)
+        rm.add_css_class("flat")
+
+        def drop(*_):
+            self.g_people.remove(r)
+            self._people_rows.remove(r)
+            if person in self.discord_people:
+                self.discord_people.remove(person)
+            self.check_inert()
+        rm.connect("clicked", drop)
+        r.add_suffix(rm)
+        self.g_people.add(r)
+        self._people_rows.append(r)
+        self.check_inert()
+
+    def on_checkin(self, *_):
+        err = self.validate(2)
+        if err:
+            self.window.toast(err)
+            self.show_page(2)
+            return
+        payload = json.dumps({"discord": self.answers()["discord"]})
+        self.b_checkin.set_sensitive(False)
+        self.b_checkin.set_label("Listening\u2026")
+        self.l_checkin.set_visible(True)
+        for c in ("success", "error"):
+            self.l_checkin.remove_css_class(c)
+        self.l_checkin.set_label(
+            "Posted in the channel. Whoever says the word in the next two "
+            "minutes becomes an approver.")
+
+        def done(ok, out):
+            self.b_checkin.set_sensitive(True)
+            self.b_checkin.set_label("Ask them")
+            try:
+                res = json.loads((out or "").strip().splitlines()[-1])
+            except (ValueError, IndexError):
+                res = {"error": (out or "").strip() or "nothing came back"}
+            if res.get("error"):
+                self.l_checkin.add_css_class("error")
+                self.l_checkin.set_label(res["error"])
+                return
+            fresh = 0
+            have = {p["id"] for p in self.discord_people}
+            for m in res.get("members") or []:
+                if m.get("id") and m["id"] not in have:
+                    self.add_discord_person(m["id"], m.get("name") or "")
+                    fresh += 1
+            self.l_checkin.add_css_class("success" if fresh else "error")
+            self.l_checkin.set_label(
+                "%d checked in." % fresh if fresh else
+                "Nobody answered. If the channel stayed silent, the bot may "
+                "not be allowed to read it - check the connection again.")
+            self.check_inert()
+
+        run_privileged(["discord-checkin", "--answers", "-", "--wait", "120"],
+                       stdin_text=payload, on_done=done, as_root=False)
 
     def add_approver(self, text=""):
         r = Adw.EntryRow(title="Approver %d" % (len(self.approver_rows) + 1))
@@ -393,7 +534,110 @@ class SetupView(Gtk.Box):
         b.append(g3)
         return "friction", b
 
-    def _p_mailbox(self):
+    def _p_channel(self):
+        b = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        g = Adw.PreferencesGroup(
+            title="How your friends hear about it",
+            description="Every request, every approval, every tamper alert and "
+                        "the nightly report goes one way - and their answers "
+                        "come back the same way.")
+        self.c_transport = Adw.ComboRow(
+            title="Where all of it happens",
+            model=Gtk.StringList.new(["A Discord channel", "Email"]))
+        self.c_transport.connect("notify::selected", self._transport_chosen)
+        g.add(self.c_transport)
+        b.append(g)
+
+        self.tstack = Gtk.Stack(vhomogeneous=False)
+        self.tstack.add_named(self._discord_pane(), "discord")
+        self.tstack.add_named(self._email_pane(), "email")
+        b.append(self.tstack)
+        return "channel", b
+
+    def transport(self):
+        return "discord" if self.c_transport.get_selected() == 0 else "email"
+
+    def _transport_chosen(self, *_):
+        name = self.transport()
+        self.tstack.set_visible_child_name(name)
+        self.fstack.set_visible_child_name(name)
+        self.g_mailpass.set_visible(name == "email")
+        self.l_friend_intro.set_label(
+            FRIEND_INTRO_EMAIL if name == "email" else FRIEND_INTRO_DISCORD)
+        self.check_inert()
+
+    def _discord_pane(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        steps = Gtk.Label(
+            wrap=True, xalign=0,
+            label="Someone has to make a bot once. It takes about five "
+                  "minutes and no new accounts:\n\n"
+                  "1.  discord.com/developers \u2192 New Application \u2192 "
+                  "give it a name.\n"
+                  "2.  Bot \u2192 Reset Token \u2192 copy the token. That is "
+                  "the long string below, not the application id.\n"
+                  "3.  Still on Bot: switch on MESSAGE CONTENT INTENT. Without "
+                  "it the bot sees every message as blank and no approval can "
+                  "ever land.\n"
+                  "4.  Installation \u2192 add the bot to your server with "
+                  "View Channel, Send Messages and Read Message History.\n"
+                  "5.  In Discord: Settings \u2192 Advanced \u2192 Developer "
+                  "Mode on, then right-click the channel \u2192 Copy Channel "
+                  "ID.")
+        steps.add_css_class("dim-label")
+        box.append(steps)
+
+        g = Adw.PreferencesGroup(title="The bot")
+        self.p_token = Adw.PasswordEntryRow(title="Bot token")
+        self.e_channel = Adw.EntryRow(title="Channel id")
+        g.add(self.p_token)
+        g.add(self.e_channel)
+        box.append(g)
+
+        row = Gtk.Box(spacing=10, halign=Gtk.Align.START)
+        self.b_dcheck = Gtk.Button(label="Check the connection")
+        self.b_dcheck.connect("clicked", self.on_check_discord)
+        row.append(self.b_dcheck)
+        box.append(row)
+        self.l_dcheck = Gtk.Label(wrap=True, xalign=0, visible=False)
+        self.l_dcheck.add_css_class("caption")
+        box.append(self.l_dcheck)
+
+        warn = Gtk.Label(
+            wrap=True, xalign=0,
+            label="Pick a channel your friends actually read, and one they can "
+                  "all see. Approving happens there, in front of everyone - "
+                  "that is the point of it.")
+        warn.add_css_class("dim-label")
+        warn.add_css_class("caption")
+        box.append(warn)
+        return box
+
+    def on_check_discord(self, *_):
+        if not self.p_token.get_text().strip():
+            self.window.toast("Paste the bot token first")
+            return
+        if not self.e_channel.get_text().strip().isdigit():
+            self.window.toast("The channel id is all digits")
+            return
+        payload = json.dumps({"discord": self.answers()["discord"]})
+        self.b_dcheck.set_sensitive(False)
+        self.b_dcheck.set_label("Checking\u2026")
+        self.l_dcheck.set_visible(False)
+
+        def done(ok, out):
+            self.b_dcheck.set_sensitive(True)
+            self.b_dcheck.set_label("Check the connection")
+            for c in ("success", "error"):
+                self.l_dcheck.remove_css_class(c)
+            self.l_dcheck.add_css_class("success" if ok else "error")
+            self.l_dcheck.set_label((out or "").strip() or "Nothing came back.")
+            self.l_dcheck.set_visible(True)
+
+        run_privileged(["check-discord", "--answers", "-"], stdin_text=payload,
+                       on_done=done, as_root=False)
+
+    def _email_pane(self):
         b = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
         g = Adw.PreferencesGroup(
             title="The approval mailbox",
@@ -441,7 +685,7 @@ class SetupView(Gtk.Box):
         self.c_provider.connect("notify::selected", self._provider_chosen)
         self._provider_chosen()          # start on Gmail, already filled in
         self._filling = False
-        return "mailbox", b
+        return b
 
     def _apply_provider(self, dom):
         sh, sp, ss, ih, ip_, isec = PROVIDERS[dom]
@@ -482,38 +726,35 @@ class SetupView(Gtk.Box):
         banner = Adw.Banner(title="Hand the keyboard to your friend now")
         banner.set_revealed(True)
         b.append(banner)
-        lbl = Gtk.Label(
-            wrap=True, xalign=0,
-            label="These two secrets are the ones you are not supposed to "
-                  "know.\n\n"
-                  "•  The mailbox password. If you know it, you can log "
-                  "into the approval mailbox and approve your own requests.\n"
-                  "•  The partner passphrase. Even after the timer runs "
-                  "out and your friends approve, an unlock needs this typed "
-                  "in — so they have to be willing to say it out loud.\n\n"
-                  "Neither is ever shown again. The passphrase is stored only "
-                  "as a hash.")
-        lbl.add_css_class("dim")
-        b.append(lbl)
+        self.l_friend_intro = Gtk.Label(wrap=True, xalign=0,
+                                        label=FRIEND_INTRO_DISCORD)
+        self.l_friend_intro.add_css_class("dim")
+        b.append(self.l_friend_intro)
 
-        g = Adw.PreferencesGroup(title="Typed by your friend")
+        self.g_mailpass = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
+                                  spacing=10)
+        gm = Adw.PreferencesGroup(title="The mailbox password")
         self.p_mailpass = Adw.PasswordEntryRow(title="Mailbox app password")
-        self.p_phrase1 = Adw.PasswordEntryRow(title="Partner passphrase")
-        self.p_phrase2 = Adw.PasswordEntryRow(title="Partner passphrase again")
-        for w in (self.p_mailpass, self.p_phrase1, self.p_phrase2):
-            g.add(w)
-        self.p_phrase1.connect("changed", lambda *_: self.check_inert())
-        b.append(g)
-
+        gm.add(self.p_mailpass)
+        self.g_mailpass.append(gm)
         # catch a wrong app password now, while the friend is still here
         check_box = Gtk.Box(spacing=10, halign=Gtk.Align.START)
         self.b_check = Gtk.Button(label="Check the mailbox now")
         self.b_check.connect("clicked", self.on_check_mailbox)
         check_box.append(self.b_check)
-        b.append(check_box)
+        self.g_mailpass.append(check_box)
         self.l_check = Gtk.Label(wrap=True, xalign=0, visible=False)
         self.l_check.add_css_class("caption")
-        b.append(self.l_check)
+        self.g_mailpass.append(self.l_check)
+        b.append(self.g_mailpass)
+
+        g = Adw.PreferencesGroup(title="The partner passphrase")
+        self.p_phrase1 = Adw.PasswordEntryRow(title="Partner passphrase")
+        self.p_phrase2 = Adw.PasswordEntryRow(title="Partner passphrase again")
+        for w in (self.p_phrase1, self.p_phrase2):
+            g.add(w)
+        self.p_phrase1.connect("changed", lambda *_: self.check_inert())
+        b.append(g)
 
         note = Gtk.Label(
             wrap=True, xalign=0,
@@ -612,35 +853,57 @@ class SetupView(Gtk.Box):
         return "@" in a and "." in a.split("@")[-1] and " " not in a and len(a) > 5
 
     def approvers(self):
+        if self.transport() == "discord":
+            return [p["id"].strip() for p in self.discord_people
+                    if p["id"].strip()]
         return [r.get_text().strip() for r in self.approver_rows
                 if r.get_text().strip()]
 
+    def approver_names(self):
+        if self.transport() != "discord":
+            return {}
+        return {p["id"].strip(): p["name"] for p in self.discord_people
+                if p["id"].strip() and p["name"]}
+
     def validate(self, page):
+        discord = self.transport() == "discord"
         if page == 1:
             if not self.e_name.get_text().strip():
-                return "Put your name in - it goes in the emails"
-            if not self._ok_email(self.e_email.get_text()):
+                return "Put your name in - it goes on every message"
+            if not discord and not self._ok_email(self.e_email.get_text()):
                 return "That does not look like an email address"
-        if page == 2:
+        if page == 2:                      # how they hear about it
+            if discord:
+                if not self.p_token.get_text().strip():
+                    return "Paste the bot token"
+                if not self.e_channel.get_text().strip().isdigit():
+                    return "The channel id is the long number, all digits"
+            else:
+                if not self._ok_email(self.e_mailbox.get_text()):
+                    return "The mailbox address does not look right"
+                if not self.e_smtp_host.get_text().strip():
+                    return "SMTP host is empty"
+                if not self.e_imap_host.get_text().strip():
+                    return "IMAP host is empty"
+        if page == 3:                      # who they are
             appr = self.approvers()
             if not appr:
-                return "You need at least one approver"
+                return ("Ask your friends to check in - nobody is an approver yet"
+                        if discord else "You need at least one approver")
             for a in appr:
-                if not self._ok_email(a):
+                if discord:
+                    if not a.isdigit() or len(a) < 15:
+                        return ("%s is not a Discord user id. Turn on "
+                                "Developer Mode, right-click the person, "
+                                "Copy User ID." % a)
+                elif not self._ok_email(a):
                     return "%s does not look like an email address" % a
             if int(self.s_threshold.get_value()) > len(appr):
                 return ("You are asking for %d approvals from %d people - it "
                         "could never unlock"
                         % (int(self.s_threshold.get_value()), len(appr)))
-        if page == 4:
-            if not self._ok_email(self.e_mailbox.get_text()):
-                return "The mailbox address does not look right"
-            if not self.e_smtp_host.get_text().strip():
-                return "SMTP host is empty"
-            if not self.e_imap_host.get_text().strip():
-                return "IMAP host is empty"
         if page == 5:
-            if not self.p_mailpass.get_text():
+            if not discord and not self.p_mailpass.get_text():
                 return "Your friend needs to enter the mailbox password"
             one, two = self.p_phrase1.get_text(), self.p_phrase2.get_text()
             if one or two:
@@ -658,6 +921,12 @@ class SetupView(Gtk.Box):
             "owner_name": self.e_name.get_text().strip(),
             "owner_email": self.e_email.get_text().strip(),
             "approvers": self.approvers(),
+            "approver_names": self.approver_names(),
+            "transport": self.transport(),
+            "discord": {
+                "channel_id": self.e_channel.get_text().strip(),
+                "bot_token": self.p_token.get_text().strip(),
+            },
             "approvals_required": int(self.s_threshold.get_value()),
             "cooloff_hours": float(self.s_cooloff.get_value()),
             "unlock_minutes": int(self.s_window.get_value()),
@@ -696,10 +965,10 @@ class SetupView(Gtk.Box):
         if not self.p_mailpass.get_text():
             self.window.toast("Your friend needs to type the password first")
             return
-        err = self.validate(4)
+        err = self.validate(2)
         if err:
             self.window.toast(err)
-            self.show_page(4)
+            self.show_page(2)
             return
         payload = json.dumps({"email": self.answers()["email"]})
         self.b_check.set_sensitive(False)
@@ -1050,7 +1319,7 @@ class Dashboard(Gtk.Box):
         self.g_people.set_visible(True)
         for a in self.doc.get("approvers") or []:
             done_ = a.strip().lower() in got
-            r = Adw.ActionRow(title=a)
+            r = Adw.ActionRow(title=person(self.doc, a))
             r.add_prefix(Gtk.Image.new_from_icon_name("avatar-default-symbolic"))
             if pending:
                 r.set_subtitle("approved" if done_ else "waiting")
@@ -1107,6 +1376,9 @@ class Dashboard(Gtk.Box):
         self._reset("setup", self.x_setup, True)
         for t, v in (
                 ("Approvals needed", "%s of %s" % (need, len(self.doc.get("approvers") or []))),
+                ("They are reached", "in Discord, channel %s"
+                 % (self.doc.get("channel_id") or "?")
+                 if self.doc.get("transport") == "discord" else "by email"),
                 ("Cool-off", "%g hours" % self.doc.get("cooloff_hours", 24)),
                 ("Unlock window", "%s minutes" % self.doc.get("unlock_minutes")),
                 ("Resolver", self.doc.get("filter_label", "?")),

@@ -129,14 +129,53 @@ def run(app):
         sv.e_name.set_text("Bill")
         sv.e_email.set_text("bill@example.com")
         check("valid details accepted", sv.validate(1) is None, sv.validate(1))
+
+        print("\n== setup wizard: the Discord way ==")
+        check("Discord is what it offers first", sv.transport() == "discord")
+        check("no mailbox password is asked for", not sv.g_mailpass.get_visible())
+        check("a missing bot token is caught", bool(sv.validate(2)))
+        sv.p_token.set_text("a.bot.token")
+        sv.e_channel.set_text("not-a-number")
+        check("a channel name where an id belongs is caught", bool(sv.validate(2)))
+        sv.e_channel.set_text("999999999999999999")
+        check("token and channel accepted", sv.validate(2) is None, sv.validate(2))
+        check("nobody is an approver until they check in",
+              "check in" in (sv.validate(3) or ""))
+        sv.add_discord_person("111111111111111111", "marcus")
+        sv.add_discord_person("222222222222222222", "james")
+        check("checked-in friends become the approvers",
+              sv.approvers() == ["111111111111111111", "222222222222222222"])
+        check("and their names are kept for the emails and the app",
+              sv.approver_names()["222222222222222222"] == "james")
+        sv.add_discord_person("marcus#1234", "typo")
+        check("something that is not a user id is caught",
+              "Copy User ID" in (sv.validate(3) or ""))
+        sv._people_rows[-1].get_last_child()      # keep the row referenced
+        sv.discord_people.pop()
+        sv.s_threshold.set_value(2)
+        check("two of two accepted", sv.validate(3) is None, sv.validate(3))
+        check("the friend only has a passphrase to type",
+              sv.validate(5) is None, sv.validate(5))
+        a = sv.answers()
+        check("the answers say Discord, with the channel and the token",
+              a["transport"] == "discord"
+              and a["discord"]["channel_id"] == "999999999999999999"
+              and a["discord"]["bot_token"] == "a.bot.token")
+        check("and carry the names alongside the ids",
+              a["approver_names"]["111111111111111111"] == "marcus")
+
+        print("\n== setup wizard: the email way ==")
+        sv.c_transport.set_selected(1)
+        check("switching to email brings the mailbox password back",
+              sv.transport() == "email" and sv.g_mailpass.get_visible())
         sv.approver_rows[0].set_text("a@x.com")
         sv.approver_rows[1].set_text("b@x.com")
         sv.add_approver("c@x.com")
         check("approvers can be added", len(sv.approvers()) == 3)
         sv.s_threshold.set_value(9)
-        check("impossible quorum is rejected", bool(sv.validate(2)))
+        check("impossible quorum is rejected", bool(sv.validate(3)))
         sv.s_threshold.set_value(2)
-        check("workable quorum accepted", sv.validate(2) is None)
+        check("workable quorum accepted", sv.validate(3) is None)
         check("the mailbox page starts on a real provider, already filled in",
               sv.e_smtp_host.get_text() == "smtp.gmail.com"
               and sv.e_imap_host.get_text() == "imap.gmail.com",
@@ -160,7 +199,7 @@ def run(app):
               sv.e_smtp_host.get_text() == "smtp.gmail.com"
               and int(sv.s_imap_port.get_value()) == 993, sv.e_smtp_host.get_text())
         sv.e_mailbox.set_text("bot@gmail.com")
-        check("mailbox page accepted", sv.validate(4) is None, sv.validate(4))
+        check("mailbox page accepted", sv.validate(2) is None, sv.validate(2))
         sv.p_mailpass.set_text("app-pw")
         sv.p_phrase1.set_text("secret-phrase")
         sv.p_phrase2.set_text("typo")
