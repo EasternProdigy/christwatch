@@ -1,5 +1,5 @@
 Name:           christwatch
-Version:        1.1.3
+Version:        1.1.4
 Release:        1%{?dist}
 Summary:        Accountability-gated content blocker
 
@@ -67,6 +67,10 @@ cd %{_builddir}/%{name}-%{version} && python3 selftest.py
 %{_datadir}/%{name}/
 
 %changelog
+* Tue Sep 22 2026 William Mezitis <wmezitis@gmail.com> - 1.1.4-1
+- Tell apart the three reasons the bot might not read a channel.
+- Approvals get through by mentioning the bot even if the intent is off.
+
 * Tue Sep 22 2026 William Mezitis <wmezitis@gmail.com> - 1.1.3-1
 - Prove the Message Content intent by reading the channel.
 

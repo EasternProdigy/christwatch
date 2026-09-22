@@ -128,8 +128,18 @@ The wizard walks it, and each step opens the page it is talking about:
 3. **Put it in your server.** Opens an invite asking for exactly three
    permissions: View Channel, Send Messages, Read Message History.
 4. **Let it read the channel.** Opens that bot's settings page. Switch on
-   **Message Content Intent** - without it the bot sees every message as
-   blank and no approval can ever land. The check tells you if it is off.
+   **Message Content Intent**, then press **Save Changes** at the bottom -
+   the toggle does nothing until you do. Without it every message arrives
+   blank.
+
+   The check does not take the portal's word for this. It reads the channel:
+   words from a person getting through is proof it works, messages arriving
+   blank is proof it does not, and an empty channel is neither, which it says
+   rather than claiming failure.
+
+   If it is off, approvals still get through when the person **mentions the
+   bot** in the message - a message that mentions it always carries its text.
+   The bot says so in the channel by itself when it notices it has gone deaf.
 5. **Pick the channel.** Press *Find channels* and choose from the list. No
    Developer Mode, no copying ids. There is a box for pasting one if you
    prefer.

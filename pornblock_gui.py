@@ -38,6 +38,8 @@ ICON_FILE = P("/usr/share/icons/hicolor/scalable/apps/christwatch.svg")
 STATUS_PATH = P("/run/pornblock/status.json")
 SOURCE_HINT = P("/run/pornblock/source-hint.json")
 CORE_BIN = "/usr/local/bin/pornblock"
+# the helper says this when the channel has nothing in it to judge by yet
+INCONCLUSIVE = "not proven yet"
 
 def app_icon():
     """The installed shield-and-cross, or None when running uninstalled."""
@@ -770,10 +772,15 @@ class SetupView(Gtk.Box):
         def done(ok, out):
             self.b_dcheck.set_sensitive(True)
             self.b_dcheck.set_label("Check the connection")
-            for c in ("success", "error"):
+            text = (out or "").strip()
+            for c in ("success", "warning", "error"):
                 self.l_dcheck.remove_css_class(c)
-            self.l_dcheck.add_css_class("success" if ok else "error")
-            self.l_dcheck.set_label((out or "").strip() or "Nothing came back.")
+            # "nothing to read back yet" is not a problem to solve, so do not
+            # paint it like one
+            self.l_dcheck.add_css_class(
+                "warning" if INCONCLUSIVE in text else
+                ("success" if ok else "error"))
+            self.l_dcheck.set_label(text or "Nothing came back.")
             self.l_dcheck.set_visible(True)
 
         run_privileged(["check-discord", "--answers", "-"], stdin_text=payload,

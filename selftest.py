@@ -443,6 +443,24 @@ st_d["request"]["approvals"] = {}
 check("a stranger in the channel cannot approve",
       pb.poll_approvals(dcfg, st_d, FakeDiscord(dcfg, pages=[strangers])) == [])
 
+_human_ok = [{"id": "9", "content": "hello", "author": {"id": "111", "bot": False}}]
+_human_blank = [{"id": "9", "content": "", "author": {"id": "111", "bot": False}}]
+_bots_only = [{"id": "9", "content": "alert", "author": {"id": "5", "bot": True}}]
+# when the bot is deaf it should say so where the people who can fix it are
+st_blind = pb.deep_merge(pb.DEFAULT_STATE, {})
+st_blind["mode"] = "PENDING"
+st_blind["request"] = {"token": "ABCD1234", "requested_at": pb.now() - 60,
+                       "eligible_at": pb.now() + 60, "approvals": {},
+                       "denials": {}}
+_blind = FakeDiscord(dcfg, pages=[_human_blank])
+_spy2 = FakeDiscord(dcfg)
+_real2 = pb.courier
+pb.courier = lambda _cfg: _spy2
+check("a blank reply gets no approval", pb.poll_approvals(dcfg, st_blind, _blind) == [])
+check("and the channel is told how to get through anyway",
+      _spy2.sent and "mention me" in _spy2.sent[0][1]["content"])
+pb.courier = _real2
+
 # a dead channel must leave the machine locked and enforcing, never wedge the
 # daemon: reading approvals is the one call that talks to the network on every
 # single tick
@@ -460,15 +478,15 @@ check("and even an unexpected error does not stop the tick",
       pb.poll_approvals(dcfg, st_d, ExplodingCourier()) == [])
 
 # what arrives beats what the portal claims
-_human_ok = [{"id": "9", "content": "hello", "author": {"id": "111", "bot": False}}]
-_human_blank = [{"id": "9", "content": "", "author": {"id": "111", "bot": False}}]
-_bots_only = [{"id": "9", "content": "alert", "author": {"id": "5", "bot": True}}]
 check("words getting through is proof the intent is on",
-      FakeDiscord(dcfg, pages=[_human_ok]).content_evidence() == (1, 0))
+      FakeDiscord(dcfg, pages=[_human_ok]).content_evidence() == (1, 0, None))
 check("people's messages arriving blank is proof it is off",
-      FakeDiscord(dcfg, pages=[_human_blank]).content_evidence() == (1, 1))
+      FakeDiscord(dcfg, pages=[_human_blank]).content_evidence() == (1, 1, None))
 check("a channel with only our own posts proves nothing either way",
-      FakeDiscord(dcfg, pages=[_bots_only]).content_evidence() == (0, 0))
+      FakeDiscord(dcfg, pages=[_bots_only]).content_evidence() == (0, 0, None))
+_why = DeadDiscord(dcfg).content_evidence()
+check("and a channel it cannot read says so, rather than reading as empty",
+      _why[0] == 0 and _why[2] and "down" in _why[2], _why)
 
 check("the content intent is read off the application flags",
       FakeDiscord(dcfg, me={"flags": 1 << 18}).content_intent()

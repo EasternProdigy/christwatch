@@ -148,6 +148,9 @@ def run(app):
             os.path.dirname(os.path.abspath(__file__)), "pornblock.py"))
         _core = _il.module_from_spec(_spec)
         _spec.loader.exec_module(_core)
+        check("the app and the helper agree on the inconclusive wording",
+              G.INCONCLUSIVE == _core.INCONCLUSIVE,
+              (G.INCONCLUSIVE, _core.INCONCLUSIVE))
         check("the app and the daemon read a token the same way",
               _core.app_id_from_token(real + ".x.y")
               == G.app_id_from_token(real + ".x.y") == "123456789012345678")
