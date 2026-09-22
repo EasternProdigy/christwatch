@@ -53,7 +53,7 @@ import urllib.request
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 HOMEPAGE = "https://github.com/EasternProdigy/christwatch"
 PROG = "pornblock"
 
@@ -1588,7 +1588,7 @@ def everyone(cfg: dict) -> list:
 
 def alert(cfg: dict, st: dict, key: str, subject: str, text: str,
           html: str | None = None, to=None, force: bool = False,
-          ping: bool = True) -> bool:
+          ping: bool = True, queue: bool = True) -> bool:
     """
     Loud email to all approvers (+ owner).  `key` rate-limits repeats of the
     same kind of alert so a wedged machine cannot spam your friends into
@@ -1608,7 +1608,8 @@ def alert(cfg: dict, st: dict, key: str, subject: str, text: str,
     prefix = "[%s DEMO] " % tag if SANDBOX else "[%s] " % tag
     if is_discord(cfg) and not ping:
         recipients = []          # still posted, just nobody's phone buzzes
-    return courier(cfg).send(st, recipients, prefix + subject, text, html)
+    return courier(cfg).send(st, recipients, prefix + subject, text, html,
+                             queue_on_fail=queue)
 
 
 # ==========================================================================
@@ -2933,6 +2934,16 @@ def reconcile_record(cfg: dict, st: dict) -> tuple:
         notes.append("Discord channel recorded as %s" % cfg_ch)
 
     rec_lobby = str(rec.get("group_lobby") or "")
+    if group_on(cfg) and rec_lobby and rec_lobby != group_lobby(cfg):
+        # Moving to a different shared channel is lateral, not a loosening -
+        # you are still reporting to a room your friends are in. But the
+        # record has to follow you, or leaving later would "restore" a lobby
+        # you walked away from months ago.
+        rec["group_lobby"] = group_lobby(cfg)
+        rec["group_member"] = group_me(cfg)
+        save_record(rec)
+        notes.append("group lobby moved to %s; recorded" % group_lobby(cfg))
+        rec_lobby = group_lobby(cfg)
     if rec_lobby and not group_on(cfg):
         # Walking out of the group is walking away from the people watching,
         # so it is a loosening like any other: it happens during an unlock,
@@ -4212,7 +4223,13 @@ def flush_blocked_alerts(cfg: dict, st: dict, post) -> list:
                else "%d blocked sites were just asked for" % len(ranked))
     # force=True because the rate limiting that matters here is the gap and
     # the per-site repeat window above, not the generic one on alert().
-    alert(cfg, st, "blocked_live", subject, body, force=True,
+    #
+    # queue=False because this one is only worth saying while it is true. If
+    # Discord is unreachable the post is dropped, not held: "just asked for"
+    # arriving three hours late describes nothing that is still happening,
+    # and an outage would otherwise release the whole backlog at once. The
+    # evening report still carries every line of it.
+    alert(cfg, st, "blocked_live", subject, body, force=True, queue=False,
           ping=bool(trk.get("live_alert_ping", False)))
     return ["said in the channel: %s" % ", ".join(d for d, _c in shown[:3])]
 
@@ -4381,6 +4398,23 @@ def cmd_activity(args) -> int:
 GROUP_MARKER = "CWG1 "
 
 
+def clean_label(text, limit: int = 48) -> str:
+    """
+    Another machine's idea of a name, made safe to print in our channel.
+
+    Everything in a heartbeat was written by somebody else and arrives over
+    a channel anyone in the server can post to. The roster gets wrapped in a
+    code fence and printed a line per member, so a backtick would break out
+    of the fence and a newline would forge a row. Neither is a way into this
+    machine - but a name is not the place to be relaxed about it either.
+
+    Mass-mention text cannot survive this, and could not have done anything
+    if it had: post() pins allowed_mentions to the ids it was handed.
+    """
+    out = re.sub(r"[`\r\n\x00-\x1f@]", "", str(text or ""))
+    return out.strip()[:limit]
+
+
 def group_cfg(cfg: dict) -> dict:
     return cfg.get("group") or {}
 
@@ -4496,7 +4530,7 @@ def read_group_beats(cfg: dict, st: dict, post) -> list:
         who_id = str(body.get("m") or "")
         if not who_id.isdigit() or who_id == me:
             continue                          # our own line tells us nothing
-        name = str(body.get("n") or who_id)[:48]
+        name = clean_label(body.get("n")) or who_id
         if str(body.get("s") or "") == "LEFT":
             # They said so on the way out. Dropping them here is the whole
             # point of saying it: otherwise the silence check would call
@@ -4530,15 +4564,15 @@ def read_group_beats(cfg: dict, st: dict, post) -> list:
         was_quiet = bool(row.get("quiet"))
         row.update({
             "name": name,
-            "host": str(body.get("h") or "")[:48],
-            "mode": str(body.get("s") or "?")[:16],
-            "version": str(body.get("ver") or "")[:16],
+            "host": clean_label(body.get("h")),
+            "mode": clean_label(body.get("s"), 16) or "?",
+            "version": clean_label(body.get("ver"), 16),
             "last_seen": max(float(row.get("last_seen") or 0), heard),
             "until": float(body.get("e") or 0),
             "approvals": body.get("a"),
             "required": body.get("r"),
             "blocked": body.get("b"),
-            "phones": str(body.get("p") or "")[:16],
+            "phones": clean_label(body.get("p"), 16),
             "quiet": False,
         })
         if was_quiet:

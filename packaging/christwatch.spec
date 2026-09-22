@@ -1,5 +1,5 @@
 Name:           christwatch
-Version:        1.8.0
+Version:        1.8.1
 Release:        1%{?dist}
 Summary:        Accountability-gated content blocker
 
@@ -67,6 +67,13 @@ cd %{_builddir}/%{name}-%{version} && python3 selftest.py
 %{_datadir}/%{name}/
 
 %changelog
+* Tue Sep 22 2026 William Mezitis <wmezitis@gmail.com> - 1.8.1-1
+- A live blocked-site post is dropped during an outage, not replayed
+  hours later as though it were still happening.
+- The install record follows the group lobby when you move it.
+- Names from other members cannot break the roster's formatting.
+- The release gate is exercised by the test suite, not just grepped.
+
 * Tue Sep 22 2026 William Mezitis <wmezitis@gmail.com> - 1.8.0-1
 - Name a blocked site in the channel as it is asked for, not only
   in the evening's report.

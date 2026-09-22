@@ -670,6 +670,13 @@ published each member id and says so in the channel if that ever changes:
 > Until now Sam's own machine posted their line in the lobby. This one came
 > from a different account.
 
+**Names in the lobby are other people's text.** They arrive over a channel
+anyone in the server can post to and get printed into a roster, so backticks,
+newlines and mention text are stripped out of them before they are shown. A
+member can still pick a silly name; they cannot forge a row for somebody who
+is not there, and it is the user id, never the name, that identifies who a
+line is about.
+
 **Silence is also what a laptop on holiday looks like.** Twelve hours of
 nothing is a question, not a verdict, and the message says so. If your group
 travels a lot, raise `group.silence_hours`.
@@ -694,6 +701,17 @@ Which lobby this machine answers to is pinned in the immutable install
 record, the same as the approver list and the channel. Editing yourself out
 of the group by hand is reverted and said out loud; leaving for real is
 `group --leave`, during an unlock.
+
+**Moving to a different lobby is allowed and needs no unlock.** Re-run
+`group --join --lobby <new id>` and the record moves with you - you are
+still reporting to a room your friends are in, which is the thing being
+pinned. Only walking out altogether is gated.
+
+**A word on the heartbeat, if you share one channel.** Every member posts a
+line every thirty minutes, so a lobby that is also somebody's alert channel
+collects about fifty short messages a day on top of everything else. It is
+the main reason the separate `#christwatch` lobby is the recommendation
+rather than a nicety.
 
 ---
 
@@ -819,6 +837,12 @@ anyway.
 **It does not fire for sites the resolver never saw.** A browser doing its
 own encrypted DNS is caught by the firewall, not by this, and shows up as
 `dns bypass drops` in the daily report instead.
+
+**If Discord is unreachable the post is dropped, not held.** Everything else
+here queues and retries; this one does not, on purpose. "Just asked for"
+arriving three hours late describes nothing that is still happening, and an
+outage would otherwise release the whole backlog at once. The evening report
+still carries every line of it.
 
 ### Be clear about what this means
 

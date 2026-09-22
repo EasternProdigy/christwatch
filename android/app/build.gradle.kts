@@ -11,8 +11,8 @@ android {
         applicationId = "io.christwatch.phone"
         minSdk = 29
         targetSdk = 35
-        versionCode = 4
-        versionName = "1.8.0"
+        versionCode = 5
+        versionName = "1.8.1"
     }
 
     signingConfigs {

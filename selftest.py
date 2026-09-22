@@ -1769,6 +1769,137 @@ finally:
 check("...and on your own, it does not start doing that",
       bool(_spy8.sent) and "Will" not in _spy8.sent[0][0])
 
+print("\n== the release gate, actually exercised ==")
+
+# The check above reads the source. This one runs it: a candidate is offered
+# to maybe_update and we watch whether apply_update is reached at all. That
+# gate is the only thing between a push to the branch and root on somebody's
+# laptop, so proving the strings are present is not proving anything.
+
+def _gate_trial(cand_version, bump_gate=True, auto_apply=True, mode="LOCKED"):
+    applied = []
+    gcfg = pb.deep_merge(base_cfg(), {
+        "updates": {"enabled": True, "repo": "https://example.invalid/r",
+                    "branch": "main", "auto_apply": auto_apply,
+                    "auto_needs_version_bump": bump_gate}})
+    gst = pb.deep_merge(pb.DEFAULT_STATE, {"mode": mode})
+    gst["update"]["last_check"] = 0
+    keep = (pb.remote_head_sha, pb.check_for_update, pb.apply_update,
+            pb.systemctl, pb.write_public_status)
+    pb.remote_head_sha = lambda c: "deadbeef"
+    pb.check_for_update = lambda c, s, quiet=True: {
+        "version": cand_version, "sha": "deadbeef", "subject": "s", "path": SB}
+    pb.apply_update = lambda c, s, p, sha, subj, nv: applied.append(nv) or []
+    pb.systemctl = lambda *a: pb.Result(0)
+    pb.write_public_status = lambda c, s: None
+    try:
+        pb.maybe_update(gcfg, gst)
+    finally:
+        (pb.remote_head_sha, pb.check_for_update, pb.apply_update,
+         pb.systemctl, pb.write_public_status) = keep
+    return applied
+
+check("a commit with the same version does not install itself",
+      _gate_trial(pb.VERSION) == [])
+check("nor does one that went backwards", _gate_trial("0.9.0") == [])
+check("a real release does install itself", _gate_trial("9999.0.0") != [])
+check("turning the gate off means every commit installs",
+      _gate_trial(pb.VERSION, bump_gate=False) != [])
+check("auto-apply off means nothing installs itself",
+      _gate_trial("9999.0.0", auto_apply=False) == [])
+check("and nothing installs mid-request",
+      _gate_trial("9999.0.0", mode="PENDING") == [])
+
+print("\n== what is worth retrying, and what is not ==")
+
+class DeadCourier:
+    """Discord is down. Everything raises."""
+
+    NAME = "discord"
+
+    def send(self, st, to, subject, text, html=None, queue_on_fail=True):
+        if queue_on_fail:
+            st.setdefault("outbox", []).append({"subject": subject})
+        return False
+
+    def flush_outbox(self, st):
+        pass
+
+
+def _outbox_after(fn):
+    ost = pb.deep_merge(pb.DEFAULT_STATE, {})
+    dead = DeadCourier()
+    keep, pb.courier = pb.courier, lambda _c: dead
+    try:
+        fn(ost)
+    finally:
+        pb.courier = keep
+    return ost.get("outbox") or []
+
+check("a tamper alert survives an outage and is sent later",
+      len(_outbox_after(lambda s: pb.alert(
+          LIVE_CFG, s, "tamper", "Someone changed something", "body\n",
+          force=True))) == 1)
+
+# A live alert is only true while it is true. Holding one through an outage
+# and releasing it hours later describes nothing that is still happening,
+# and releases the whole backlog at once.
+def _live_during_outage(s):
+    pb.note_blocked_lookups(LIVE_CFG, s, {"badsite.example": 1})
+    pb.flush_blocked_alerts(LIVE_CFG, s, None)
+
+check("a live blocked-site post is dropped instead, not held",
+      _outbox_after(_live_during_outage) == [])
+check("and the day's report still has it either way",
+      "badsite.example" in dict(pb.summarise_day(base_cfg(), pb.today_str())
+                                .get("blocked") or {}))
+
+print("\n== a name from somebody else's machine ==")
+
+# Everything in a heartbeat was written by another member and arrives over a
+# channel anyone in the server can post to. The roster is printed inside a
+# code fence, one line per member.
+check("a backtick cannot break out of the roster's code fence",
+      "`" not in pb.clean_label("ev```il"))
+check("a newline cannot forge a second row",
+      "\n" not in pb.clean_label("Sam\n  Jordan   pretending to be fine"))
+check("mass-mention text does not survive either",
+      "@" not in pb.clean_label("@everyone"))
+check("an ordinary name is left alone", pb.clean_label("Sam") == "Sam")
+check("a name is not allowed to be a paragraph",
+      len(pb.clean_label("x" * 400)) <= 48)
+
+_NASTY = pb.deep_merge(pb.DEFAULT_STATE, {})
+_LN = Lobby(GRP_CFG, [beat_msg(SAM, "```\n!! Jordan  totally fine")])
+pb.read_group_beats(GRP_CFG, _NASTY, _LN)
+_BOARD2 = pb.group_board(GRP_CFG, _NASTY)
+# Two members means two rows. A name carrying a newline would otherwise
+# add a third, reading as somebody who is not there.
+_ROWS2 = [l for l in _BOARD2.splitlines()
+          if l.strip() and not l.startswith("=")
+          and "who is still running" not in l and not l.endswith(".")]
+check("so a forged row cannot be smuggled onto the board",
+      len(_ROWS2) == 2, "\n".join(_ROWS2))
+check("and the id is still what identifies them, not the name",
+      SAM in _NASTY["group"]["members"])
+
+print("\n== the record follows the lobby ==")
+
+_MOVED = pb.deep_merge(GRP_CFG, {"group": {"lobby_channel_id": "777777777777777777"}})
+pb.save_record(pb.record_from_config(GRP_CFG))
+_spy9 = SpyCourier()
+_real9, pb.courier = pb.courier, lambda _c: _spy9
+try:
+    _fixed9, _notes9 = pb.reconcile_record(_MOVED, pb.deep_merge(pb.DEFAULT_STATE, {}))
+finally:
+    pb.courier = _real9
+check("moving to another shared channel is allowed",
+      pb.group_lobby(_fixed9) == "777777777777777777")
+check("and the record is moved with you, not left behind",
+      (pb.load_record() or {}).get("group_lobby") == "777777777777777777")
+check("so leaving later cannot restore a lobby you walked away from",
+      any("moved to" in n for n in _notes9))
+
 print("\n== packaging (skipped when not shipped in the tarball) ==")
 
 def _present(name):
