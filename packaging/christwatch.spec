@@ -1,5 +1,5 @@
 Name:           christwatch
-Version:        1.1.0
+Version:        1.1.1
 Release:        1%{?dist}
 Summary:        Accountability-gated content blocker
 
@@ -67,6 +67,9 @@ cd %{_builddir}/%{name}-%{version} && python3 selftest.py
 %{_datadir}/%{name}/
 
 %changelog
+* Tue Sep 22 2026 William Mezitis <wmezitis@gmail.com> - 1.1.1-1
+- The app walks you through making the Discord bot.
+
 * Tue Sep 22 2026 William Mezitis <wmezitis@gmail.com> - 1.1.0-1
 - Run the whole thing over a Discord channel instead of email.
 

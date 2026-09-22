@@ -117,22 +117,26 @@ sudo pornblock status
 
 ### Discord (the default)
 
-One bot, made once, in whatever server you and your friends already use:
+One bot, made once, in whatever server you and your friends already use.
+The wizard walks it, and each step opens the page it is talking about:
 
-1. **discord.com/developers** -> New Application -> name it.
-2. **Bot** -> Reset Token -> copy the token. That is the long string, not the
-   application id.
-3. Still on Bot: switch on **MESSAGE CONTENT INTENT**. Without it the bot sees
-   every message as blank and no approval can ever land. `check-discord` and
-   `test-email` both tell you if it is off.
-4. **Installation** -> add it to your server with *View Channel*, *Send
-   Messages* and *Read Message History*.
-5. In Discord: Settings -> Advanced -> **Developer Mode**, then right-click
-   the channel -> **Copy Channel ID**.
+1. **Make it.** Opens the developer portal. New Application, name it, Bot,
+   Reset Token, copy what it shows you.
+2. **Paste the token.** A bot token begins with its own application id, so
+   from here the app knows which bot you mean and builds the next two links
+   itself.
+3. **Put it in your server.** Opens an invite asking for exactly three
+   permissions: View Channel, Send Messages, Read Message History.
+4. **Let it read the channel.** Opens that bot's settings page. Switch on
+   **Message Content Intent** - without it the bot sees every message as
+   blank and no approval can ever land. The check tells you if it is off.
+5. **Pick the channel.** Press *Find channels* and choose from the list. No
+   Developer Mode, no copying ids. There is a box for pasting one if you
+   prefer.
 
-Then press **Ask them to check in** in the wizard. It posts one message in the
-channel, and everyone who answers becomes an approver - nobody has to copy an
-18-digit user id.
+Then press **Ask them to check in**. It posts one message in the channel, and
+everyone who answers becomes an approver, names and all - nobody has to copy
+an 18-digit user id either.
 
 ```bash
 # what that button runs, if you prefer a terminal

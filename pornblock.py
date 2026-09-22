@@ -17,6 +17,8 @@ copy in the repo.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import contextlib
 import datetime as dt
 import email
@@ -47,7 +49,7 @@ import urllib.request
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 HOMEPAGE = "https://github.com/EasternProdigy/christwatch"
 PROG = "pornblock"
 
@@ -999,6 +1001,44 @@ def snowflake_at(epoch_seconds: float) -> int:
     """A Discord id encodes its own timestamp, so "everything posted after
     the request went out" needs no bookkeeping on our side."""
     return max(0, int(epoch_seconds * 1000) - DISCORD_EPOCH_MS) << 22
+
+
+# View Channel + Send Messages + Read Message History, and nothing else
+DISCORD_PERMS = (1 << 10) | (1 << 11) | (1 << 16)
+
+
+def app_id_from_token(token: str) -> str:
+    """
+    A bot token starts with its own application id, base64'd.
+
+    Which means the app can build the invite link and link straight to the
+    right settings page, instead of asking anyone to hunt for an id.
+    """
+    head = (token or "").strip().split(".")[0]
+    if not head:
+        return ""
+    try:
+        raw = base64.urlsafe_b64decode(head + "=" * (-len(head) % 4))
+    except (ValueError, binascii.Error):
+        return ""
+    text = raw.decode("ascii", "ignore").strip()
+    return text if text.isdigit() and len(text) >= 15 else ""
+
+
+def invite_url(token_or_id: str) -> str:
+    app = (token_or_id if str(token_or_id).isdigit()
+           else app_id_from_token(token_or_id))
+    if not app:
+        return ""
+    return ("https://discord.com/oauth2/authorize?client_id=%s"
+            "&scope=bot&permissions=%d" % (app, DISCORD_PERMS))
+
+
+def bot_settings_url(token_or_id: str) -> str:
+    app = (token_or_id if str(token_or_id).isdigit()
+           else app_id_from_token(token_or_id))
+    return ("https://discord.com/developers/applications/%s/bot" % app
+            if app else "https://discord.com/developers/applications")
 
 
 def _discord_error(code: int, raw: str) -> str:
@@ -3398,6 +3438,44 @@ def cmd_check_discord(args) -> int:
     return 0 if ok else 1
 
 
+def cmd_discord_channels(args) -> int:
+    """
+    List the text channels the bot can see, so nobody has to turn on Developer
+    Mode and copy an id. Unprivileged, reads only.
+    """
+    try:
+        _ans, dc = _discord_from_answers(args)
+    except (OSError, ValueError) as exc:
+        print(dump_json({"error": "could not read the answers: %s" % exc}))
+        return 2
+    try:
+        guilds = dc._call("GET", "/users/@me/guilds")
+    except MailError as exc:
+        print(dump_json({"error": str(exc),
+                         "invite": invite_url(dc.d.get("bot_token") or "")}))
+        return 1
+    if not guilds:
+        print(dump_json({
+            "error": "this bot is not in any server yet",
+            "invite": invite_url(dc.d.get("bot_token") or ""),
+            "channels": []}))
+        return 1
+    out = []
+    for g in guilds[:20]:
+        try:
+            chans = dc._call("GET", "/guilds/%s/channels" % g.get("id"))
+        except MailError:
+            continue
+        for c in chans or []:
+            if c.get("type") in (0, 5):           # text and announcement
+                out.append({"id": str(c.get("id")), "name": c.get("name") or "",
+                            "server": g.get("name") or "",
+                            "position": int(c.get("position") or 0)})
+    out.sort(key=lambda c: (c["server"], c["position"], c["name"]))
+    print(dump_json({"channels": out}))
+    return 0 if out else 1
+
+
 def cmd_discord_checkin(args) -> int:
     """
     Ask the channel who the approvers are, instead of making anyone copy
@@ -4810,6 +4888,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--answers", default="-",
                    help="JSON file with a discord block, or - for stdin")
     s.set_defaults(fn=cmd_check_discord)
+
+    s = sub.add_parser("discord-channels",
+                       help="list the channels the bot can see")
+    s.add_argument("--answers", default="-")
+    s.set_defaults(fn=cmd_discord_channels)
 
     s = sub.add_parser("discord-checkin",
                        help="ask the channel who the approvers are")

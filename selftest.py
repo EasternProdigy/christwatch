@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline checks for pornblock. Runs entirely inside a throwaway sandbox."""
 
+import base64
 import inspect
 import json
 import datetime as dt
@@ -461,6 +462,28 @@ check("and even an unexpected error does not stop the tick",
 check("the content intent is read off the application flags",
       FakeDiscord(dcfg, me={"flags": 1 << 18}).content_intent()
       and not FakeDiscord(dcfg, me={"flags": 0}).content_intent())
+_tok = base64.urlsafe_b64encode(b"123456789012345678").decode().rstrip("=")
+_tok += ".Gabcde.xxxxxxxxxxxxxxxxxxxxxxxxxx"
+check("the application id is read out of the token itself",
+      pb.app_id_from_token(_tok) == "123456789012345678")
+check("junk in that field yields nothing rather than a broken link",
+      pb.app_id_from_token("not-a-token") == ""
+      and pb.app_id_from_token("") == "")
+check("the invite link asks for exactly three permissions",
+      pb.invite_url(_tok).endswith("scope=bot&permissions=68608")
+      and pb.DISCORD_PERMS == (1 << 10) | (1 << 11) | (1 << 16))
+check("and points at the right application",
+      "client_id=123456789012345678" in pb.invite_url(_tok))
+check("the settings link goes straight to that bot's page",
+      pb.bot_settings_url(_tok)
+      == "https://discord.com/developers/applications/123456789012345678/bot")
+check("with no token it still opens somewhere useful",
+      pb.bot_settings_url("").endswith("/applications"))
+check("listing channels needs no root and writes nothing",
+      "require_root" not in inspect.getsource(pb.cmd_discord_channels)
+      and not re.search(r"save_(config|state|record)",
+                        inspect.getsource(pb.cmd_discord_channels)))
+
 check("a token that is really an application id is explained",
       "not the application id" in pb._discord_error(401, "{}"))
 check("a channel the bot is not in is explained",

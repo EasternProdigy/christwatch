@@ -134,10 +134,38 @@ def run(app):
         check("Discord is what it offers first", sv.transport() == "discord")
         check("no mailbox password is asked for", not sv.g_mailpass.get_visible())
         check("a missing bot token is caught", bool(sv.validate(2)))
+        check("the invite link waits for a token",
+              not sv.b_invite.get_sensitive())
         sv.p_token.set_text("a.bot.token")
+        check("a token that is not shaped like one unlocks nothing",
+              not sv.b_invite.get_sensitive())
+        import base64 as _b64
+        real = _b64.urlsafe_b64encode(b"123456789012345678").decode().rstrip("=")
+        sv.p_token.set_text(real + ".Gabcde.xxxxxxxxxxxxxxxxxxxxxxxxxxx")
+        import importlib.util as _il
+        _spec = _il.spec_from_file_location("pbcore", os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "pornblock.py"))
+        _core = _il.module_from_spec(_spec)
+        _spec.loader.exec_module(_core)
+        check("the app and the daemon read a token the same way",
+              _core.app_id_from_token(real + ".x.y")
+              == G.app_id_from_token(real + ".x.y") == "123456789012345678")
+        check("a real-shaped token builds the invite link itself",
+              sv.b_invite.get_sensitive()
+              and sv.b_intent.get_sensitive()
+              and "client_id=123456789012345678" in sv._invite_url()
+              and "permissions=68608" in sv._invite_url(), sv._invite_url())
         sv.e_channel.set_text("not-a-number")
         check("a channel name where an id belongs is caught", bool(sv.validate(2)))
         sv.e_channel.set_text("999999999999999999")
+        check("a pasted id is accepted", sv.validate(2) is None, sv.validate(2))
+        sv._channels = [{"id": "888888888888888888", "name": "general",
+                         "server": "the lads"}]
+        sv.c_channel.set_model(Gtk.StringList.new(["the lads  \u2022  #general"]))
+        sv.c_channel.set_selected(0)
+        check("picking one from the list wins over the box",
+              sv.channel_id() == "888888888888888888")
+        sv._channels = []
         check("token and channel accepted", sv.validate(2) is None, sv.validate(2))
         check("nobody is an approver until they check in",
               "check in" in (sv.validate(3) or ""))
@@ -160,7 +188,7 @@ def run(app):
         check("the answers say Discord, with the channel and the token",
               a["transport"] == "discord"
               and a["discord"]["channel_id"] == "999999999999999999"
-              and a["discord"]["bot_token"] == "a.bot.token")
+              and a["discord"]["bot_token"].startswith(real))
         check("and carry the names alongside the ids",
               a["approver_names"]["111111111111111111"] == "marcus")
 

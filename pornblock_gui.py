@@ -12,6 +12,9 @@ passphrase) are piped to the privileged helper over stdin and never touch
 disk in this process.
 """
 
+import base64
+import binascii
+import contextlib
 import json
 import os
 import sys
@@ -59,13 +62,13 @@ FRIEND_INTRO_EMAIL = (
     "Neither is ever shown again. The passphrase is stored only as a hash.")
 
 FRIEND_INTRO_DISCORD = (
-    "One secret, and it is the one that matters.\n\n"
-    "\u2022  The partner passphrase. Even after the timer runs out and your "
-    "friends approve in the channel, an unlock needs this typed in \u2014 so "
-    "somebody has to be willing to say it out loud.\n\n"
-    "It is never shown again; only a hash of it is stored. The bot token is "
-    "not a secret in the same way: it lets this machine post and read in the "
-    "channel, but it can never approve anything.")
+    "Your friend types one thing here: a passphrase.\n\n"
+    "Even after the wait is over and they have approved in the channel, an "
+    "unlock needs this typed in. So somebody has to be willing to say it out "
+    "loud.\n\n"
+    "It is never shown again, and only a hash of it is kept. The bot token is "
+    "different: it lets this machine post and read in the channel, but it can "
+    "never approve anything.")
 
 PROVIDER_CHOICES = [
     ("Gmail", "gmail.com",
@@ -151,6 +154,32 @@ def core_argv():
     if os.path.exists(local):
         return [sys.executable, local]
     return ["pornblock"]
+
+
+def open_url(uri, parent=None):
+    if not uri:
+        return
+    try:
+        Gtk.UriLauncher.new(uri).launch(
+            parent if isinstance(parent, Gtk.Window) else None, None, None, None)
+        return
+    except (AttributeError, TypeError, GLib.Error):
+        pass
+    with contextlib.suppress(GLib.Error):
+        Gio.AppInfo.launch_default_for_uri(uri, None)
+
+
+def app_id_from_token(token):
+    """A bot token begins with its own application id, base64'd."""
+    head = (token or "").strip().split(".")[0]
+    if not head:
+        return ""
+    try:
+        raw = base64.urlsafe_b64decode(head + "=" * (-len(head) % 4))
+    except (ValueError, binascii.Error):
+        return ""
+    text = raw.decode("ascii", "ignore").strip()
+    return text if text.isdigit() and len(text) >= 15 else ""
 
 
 def person(doc, ident):
@@ -308,11 +337,11 @@ class SetupView(Gtk.Box):
         g.add(row("A couple of friends", "Their email addresses. They hear "
                   "about it when you ask to unlock, and they are the ones who "
                   "decide.", "system-users-symbolic"))
-        g.add(row("A spare email account", "Not your normal one. It sends the "
-                  "messages and reads the replies, and you will need an app "
-                  "password for it.", "mail-unread-symbolic"))
-        g.add(row("One friend sitting with you", "Near the end they type two "
-                  "things you are not meant to know.",
+        g.add(row("A Discord channel you are all in", "The app walks you "
+                  "through making a bot for it. Email works too if you would "
+                  "rather.", "user-available-symbolic"))
+        g.add(row("One friend sitting with you", "Near the end they type a "
+                  "passphrase you are not meant to know.",
                   "dialog-password-symbolic"))
         b.append(g)
         note = Gtk.Label(
@@ -380,8 +409,8 @@ class SetupView(Gtk.Box):
         self.discord_people = []
         self.g_checkin = Adw.PreferencesGroup(
             title="Your approvers",
-            description="Rather than anyone copying 18-digit ids, ask them in "
-                        "the channel. Everyone who answers lands here.")
+            description="Ask them in the channel and whoever answers lands "
+                        "here. Nobody has to copy any ids.")
         self.r_checkin = Adw.ActionRow(
             title="Ask them to check in",
             subtitle="Posts one message and listens for two minutes")
@@ -538,11 +567,11 @@ class SetupView(Gtk.Box):
         b = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
         g = Adw.PreferencesGroup(
             title="How your friends hear about it",
-            description="Every request, every approval, every tamper alert and "
-                        "the nightly report goes one way - and their answers "
-                        "come back the same way.")
+            description="Requests, approvals, tamper alerts and the nightly "
+                        "report all go one way. Their answers come back the "
+                        "same way.")
         self.c_transport = Adw.ComboRow(
-            title="Where all of it happens",
+            title="Where it happens",
             model=Gtk.StringList.new(["A Discord channel", "Email"]))
         self.c_transport.connect("notify::selected", self._transport_chosen)
         g.add(self.c_transport)
@@ -568,34 +597,69 @@ class SetupView(Gtk.Box):
 
     def _discord_pane(self):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
-        steps = Gtk.Label(
-            wrap=True, xalign=0,
-            label="Someone has to make a bot once. It takes about five "
-                  "minutes and no new accounts:\n\n"
-                  "1.  discord.com/developers \u2192 New Application \u2192 "
-                  "give it a name.\n"
-                  "2.  Bot \u2192 Reset Token \u2192 copy the token. That is "
-                  "the long string below, not the application id.\n"
-                  "3.  Still on Bot: switch on MESSAGE CONTENT INTENT. Without "
-                  "it the bot sees every message as blank and no approval can "
-                  "ever land.\n"
-                  "4.  Installation \u2192 add the bot to your server with "
-                  "View Channel, Send Messages and Read Message History.\n"
-                  "5.  In Discord: Settings \u2192 Advanced \u2192 Developer "
-                  "Mode on, then right-click the channel \u2192 Copy Channel "
-                  "ID.")
-        steps.add_css_class("dim-label")
-        box.append(steps)
+        self._channels = []
+        g = Adw.PreferencesGroup(
+            title="Make a bot",
+            description="This is the fiddly bit and you only do it once. "
+                        "Each step here opens the right page for you.")
 
-        g = Adw.PreferencesGroup(title="The bot")
-        self.p_token = Adw.PasswordEntryRow(title="Bot token")
-        self.e_channel = Adw.EntryRow(title="Channel id")
+        r1 = Adw.ActionRow(
+            title="1.  Make it",
+            subtitle="New Application, give it a name, then Bot, then Reset "
+                     "Token and copy what it shows you")
+        b1 = Gtk.Button(label="Open Discord", valign=Gtk.Align.CENTER)
+        b1.connect("clicked", lambda *_: open_url(
+            "https://discord.com/developers/applications", self.window))
+        r1.add_suffix(b1)
+        g.add(r1)
+
+        self.p_token = Adw.PasswordEntryRow(title="2.  Paste the token here")
+        self.p_token.connect("changed", lambda *_: self._token_changed())
         g.add(self.p_token)
-        g.add(self.e_channel)
+
+        self.r_invite = Adw.ActionRow(
+            title="3.  Put it in your server",
+            subtitle="Paste the token first and this link builds itself")
+        self.b_invite = Gtk.Button(label="Open the invite", valign=Gtk.Align.CENTER)
+        self.b_invite.set_sensitive(False)
+        self.b_invite.connect("clicked", lambda *_: open_url(self._invite_url(), self.window))
+        self.r_invite.add_suffix(self.b_invite)
+        g.add(self.r_invite)
+
+        self.r_intent = Adw.ActionRow(
+            title="4.  Let it read the channel",
+            subtitle="On the Bot page, switch on Message Content Intent. "
+                     "Without it the bot sees every message as blank")
+        self.b_intent = Gtk.Button(label="Open its settings", valign=Gtk.Align.CENTER)
+        self.b_intent.set_sensitive(False)
+        self.b_intent.connect("clicked", lambda *_: open_url(
+            "https://discord.com/developers/applications/%s/bot"
+            % self._app_id(), self.window))
+        self.r_intent.add_suffix(self.b_intent)
+        g.add(self.r_intent)
         box.append(g)
 
+        g2 = Adw.PreferencesGroup(title="5.  Pick the channel")
+        self.b_find = Gtk.Button(label="Find channels", valign=Gtk.Align.CENTER)
+        self.b_find.add_css_class("flat")
+        self.b_find.connect("clicked", self.on_find_channels)
+        g2.set_header_suffix(self.b_find)
+        self.c_channel = Adw.ComboRow(
+            title="Channel",
+            model=Gtk.StringList.new(["press Find channels"]))
+        self.c_channel.set_sensitive(False)
+        g2.add(self.c_channel)
+        self.x_manual = Adw.ExpanderRow(
+            title="Or paste a channel id",
+            subtitle="Developer Mode on, right-click the channel, Copy Channel ID")
+        self.e_channel = Adw.EntryRow(title="Channel id")
+        self.x_manual.add_row(self.e_channel)
+        g2.add(self.x_manual)
+        box.append(g2)
+
         row = Gtk.Box(spacing=10, halign=Gtk.Align.START)
-        self.b_dcheck = Gtk.Button(label="Check the connection")
+        self.b_dcheck = Gtk.Button(label="Check it all")
+        self.b_dcheck.add_css_class("suggested-action")
         self.b_dcheck.connect("clicked", self.on_check_discord)
         row.append(self.b_dcheck)
         box.append(row)
@@ -605,20 +669,84 @@ class SetupView(Gtk.Box):
 
         warn = Gtk.Label(
             wrap=True, xalign=0,
-            label="Pick a channel your friends actually read, and one they can "
-                  "all see. Approving happens there, in front of everyone - "
-                  "that is the point of it.")
+            label="Pick a channel they all actually read. Approving happens "
+                  "there, where everyone can see it.")
         warn.add_css_class("dim-label")
         warn.add_css_class("caption")
         box.append(warn)
         return box
 
+    # -- the bot's own id, straight out of the token ----------------------
+
+    def _app_id(self):
+        return app_id_from_token(self.p_token.get_text())
+
+    def _invite_url(self):
+        app = self._app_id()
+        return ("https://discord.com/oauth2/authorize?client_id=%s&scope=bot"
+                "&permissions=68608" % app) if app else ""
+
+    def _token_changed(self):
+        ok = bool(self._app_id())
+        self.b_invite.set_sensitive(ok)
+        self.b_intent.set_sensitive(ok)
+        self.r_invite.set_subtitle(
+            "Adds it with permission to see the channel, post, and read what "
+            "was said" if ok else
+            "Paste the token first and this link builds itself")
+
+    def channel_id(self):
+        """Whichever the person actually used: the picker or the box."""
+        i = self.c_channel.get_selected()
+        if self._channels and 0 <= i < len(self._channels):
+            return self._channels[i]["id"]
+        return self.e_channel.get_text().strip()
+
+    def on_find_channels(self, *_):
+        if not self.p_token.get_text().strip():
+            self.window.toast("Paste the bot token first")
+            return
+        payload = json.dumps({"discord": {"bot_token":
+                                          self.p_token.get_text().strip()}})
+        self.b_find.set_sensitive(False)
+        self.b_find.set_label("Looking\u2026")
+
+        def done(ok, out):
+            self.b_find.set_sensitive(True)
+            self.b_find.set_label("Find channels")
+            try:
+                res = json.loads((out or "").strip().splitlines()[-1])
+            except (ValueError, IndexError):
+                res = {"error": (out or "").strip() or "nothing came back"}
+            chans = res.get("channels") or []
+            self._channels = chans
+            if not chans:
+                self.c_channel.set_sensitive(False)
+                self.c_channel.set_model(
+                    Gtk.StringList.new(["nothing found"]))
+                self.l_dcheck.set_visible(True)
+                for c in ("success", "error"):
+                    self.l_dcheck.remove_css_class(c)
+                self.l_dcheck.add_css_class("error")
+                self.l_dcheck.set_label(
+                    res.get("error") or "No channels came back."
+                    + ("  Use step 3 to put the bot in your server first."
+                       if res.get("invite") else ""))
+                return
+            self.c_channel.set_model(Gtk.StringList.new(
+                ["%s  \u2022  #%s" % (c["server"], c["name"]) for c in chans]))
+            self.c_channel.set_sensitive(True)
+            self.window.toast("Found %d channel(s)" % len(chans))
+
+        run_privileged(["discord-channels", "--answers", "-"],
+                       stdin_text=payload, on_done=done, as_root=False)
+
     def on_check_discord(self, *_):
         if not self.p_token.get_text().strip():
             self.window.toast("Paste the bot token first")
             return
-        if not self.e_channel.get_text().strip().isdigit():
-            self.window.toast("The channel id is all digits")
+        if not self.channel_id().isdigit():
+            self.window.toast("Pick a channel first")
             return
         payload = json.dumps({"discord": self.answers()["discord"]})
         self.b_dcheck.set_sensitive(False)
@@ -876,8 +1004,8 @@ class SetupView(Gtk.Box):
             if discord:
                 if not self.p_token.get_text().strip():
                     return "Paste the bot token"
-                if not self.e_channel.get_text().strip().isdigit():
-                    return "The channel id is the long number, all digits"
+                if not self.channel_id().isdigit():
+                    return "Pick a channel, or paste its id"
             else:
                 if not self._ok_email(self.e_mailbox.get_text()):
                     return "The mailbox address does not look right"
@@ -924,7 +1052,7 @@ class SetupView(Gtk.Box):
             "approver_names": self.approver_names(),
             "transport": self.transport(),
             "discord": {
-                "channel_id": self.e_channel.get_text().strip(),
+                "channel_id": self.channel_id(),
                 "bot_token": self.p_token.get_text().strip(),
             },
             "approvals_required": int(self.s_threshold.get_value()),
