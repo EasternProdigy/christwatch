@@ -24,13 +24,62 @@ jobs:
         with:
           name: rpm
           path: dist/*.rpm
+
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: SDK pieces
+        run: |
+          set -e
+          sdk="$ANDROID_SDK_ROOT"
+          mgr="$sdk/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$mgr" ] || mgr=$(find "$sdk/cmdline-tools" -name sdkmanager -type f | head -1)
+          yes | "$mgr" --licenses > /dev/null 2>&1 || true
+          "$mgr" "platforms;android-35" "build-tools;35.0.0" "platform-tools"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+      - name: Build the phone app
+        working-directory: android
+        run: gradle --no-daemon assembleRelease
+      - name: Name it after the version
+        run: |
+          set -e
+          ver=$(grep -oP 'versionName = "\K[^"]+' android/app/build.gradle.kts)
+          mkdir -p dist
+          cp android/app/build/outputs/apk/release/app-release.apk \
+             "dist/ChristWatch-$ver.apk"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apk
+          path: dist/*.apk
+
+  publish:
+    needs: [rpm, apk]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: ls -l dist/
       - name: Attach to the release
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.rpm
+          files: dist/*
           body: |
-            Download the `.rpm` and double-click it to install (Fedora).
+            **Laptop (Fedora).** Download the `.rpm` and double-click it.
             Other distributions: unpack the source and run `./install.sh`.
-
             Nothing is blocked until you open ChristWatch and finish setup.
+
+            **Phone.** Do not download the `.apk` here — run
+            `sudo pornblock phone --add "my phone"` on the laptop instead. It
+            puts the app, the pairing link and the setting on one page you
+            open on the phone, and pairs it to your own channel.
+            An iPhone gets a configuration profile from the same page.

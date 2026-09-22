@@ -24,7 +24,7 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
 
 APP_ID = "io.github.christwatch"
 PREFIX = os.environ.get("PORNBLOCK_PREFIX", "").rstrip("/")
@@ -1393,6 +1393,304 @@ def gate_row(title, icon):
     return r, state
 
 
+class PhonesDialog(Adw.Dialog):
+    """
+    Phones, in the order you actually do them.
+
+    Neither phone runs a copy of the blocker. Both of them have a setting
+    that sends every app's lookups to the filtered resolver, and on Android
+    that one setting covers every profile on the device at once. So this
+    walks you to the setting, and then watches whether it stays.
+    """
+
+    def __init__(self, window):
+        super().__init__(title="Your phones", content_width=520,
+                         content_height=560)
+        self.window = window
+        self.proc = None
+        self.deadline = 0
+        self.timer = 0
+
+        head = Adw.HeaderBar()
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
+        view = Adw.ToolbarView()
+        view.add_top_bar(head)
+        view.set_content(self.stack)
+        self.set_child(view)
+
+        self.stack.add_named(self._list_page(), "list")
+        self.stack.add_named(self._add_page(), "add")
+        self.stack.add_named(self._serve_page(), "serve")
+        self.connect("closed", lambda *_: self._stop())
+        self.reload()
+
+    # -- the list ---------------------------------------------------------
+
+    def _list_page(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16,
+                      margin_top=14, margin_bottom=18,
+                      margin_start=14, margin_end=14)
+        self.g_list = Adw.PreferencesGroup(title="Phones being watched")
+        self._rows = []
+        box.append(self.g_list)
+
+        self.g_how = Adw.PreferencesGroup(
+            title="The setting that does the blocking",
+            description="Type it once. Every app follows it, in every "
+                        "profile on the device.")
+        self.r_host = Adw.ActionRow(title="Private DNS hostname")
+        self.r_host.add_prefix(Gtk.Image.new_from_icon_name("network-wired-symbolic"))
+        self.l_host = Gtk.Label()
+        self.l_host.add_css_class("monospace")
+        self.r_host.add_suffix(self.l_host)
+        b = Gtk.Button(icon_name="edit-copy-symbolic", valign=Gtk.Align.CENTER)
+        b.add_css_class("flat")
+        b.set_tooltip_text("Copy it")
+        b.connect("clicked", self._copy_host)
+        self.r_host.add_suffix(b)
+        self.g_how.add(self.r_host)
+        box.append(self.g_how)
+
+        add = Gtk.Button(label="Add a phone", halign=Gtk.Align.CENTER)
+        add.add_css_class("pill")
+        add.add_css_class("suggested-action")
+        add.connect("clicked", lambda *_: self.stack.set_visible_child_name("add"))
+        box.append(add)
+
+        sw = Gtk.ScrolledWindow(vexpand=True,
+                                hscrollbar_policy=Gtk.PolicyType.NEVER)
+        sw.set_child(box)
+        return sw
+
+    def reload(self):
+        run_privileged(["phone", "--json"], as_root=False,
+                       on_done=self._loaded)
+
+    def _loaded(self, ok, out):
+        doc = read_json_output(out) or {}
+        self.l_host.set_label(doc.get("hostname") or "-")
+        for r in self._rows:
+            self.g_list.remove(r)
+        self._rows = []
+        devices = doc.get("devices") or []
+        self.g_list.set_description(
+            None if devices else
+            "None yet. Add one and it takes about a minute.")
+        for d in devices:
+            r = Adw.ActionRow(title=d.get("name") or "phone",
+                              subtitle=d.get("detail") or "")
+            r.add_prefix(Gtk.Image.new_from_icon_name(
+                "phone-apple-iphone-symbolic" if d.get("kind") == "ios"
+                else "phone-symbolic"))
+            img = Gtk.Image.new_from_icon_name(
+                "object-select-symbolic" if d.get("ok")
+                else "dialog-warning-symbolic")
+            img.add_css_class("success" if d.get("ok") else "warning")
+            r.add_suffix(img)
+            again = Gtk.Button(label="Set up again", valign=Gtk.Align.CENTER)
+            again.add_css_class("flat")
+            again.connect("clicked", self._reserve, d.get("name"),
+                          d.get("kind"))
+            r.add_suffix(again)
+            drop = Gtk.Button(icon_name="user-trash-symbolic",
+                              valign=Gtk.Align.CENTER)
+            drop.add_css_class("flat")
+            drop.set_tooltip_text("Stop watching this phone")
+            drop.connect("clicked", self._remove, d.get("name"))
+            r.add_suffix(drop)
+            self.g_list.add(r)
+            self._rows.append(r)
+
+    def _copy_host(self, *_):
+        self.get_clipboard().set(self.l_host.get_label())
+        self.window.toast("Copied")
+
+    def _remove(self, _b, name):
+        run_privileged(["phone", "--remove", name],
+                       on_done=lambda ok, out: (self.reload(),
+                                                self.window.refresh()))
+
+    def _reserve(self, _b, name, kind):
+        self.e_name.set_text(name or "")
+        self.kind.set_selected(1 if kind == "ios" else 0)
+        self._begin(existing=True)
+
+    # -- adding one -------------------------------------------------------
+
+    def _add_page(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16,
+                      margin_top=14, margin_bottom=18,
+                      margin_start=14, margin_end=14)
+        g = Adw.PreferencesGroup(title="A new phone")
+        self.e_name = Adw.EntryRow(title="What to call it")
+        g.add(self.e_name)
+        self.kind = Adw.ComboRow(title="Which kind")
+        self.kind.set_model(Gtk.StringList.new(["Android", "iPhone"]))
+        self.kind.connect("notify::selected", lambda *_: self._kind_changed())
+        g.add(self.kind)
+        box.append(g)
+
+        self.g_pass = Adw.PreferencesGroup(
+            title="Hand the laptop to your friend",
+            description="They pick a password. Without it the profile cannot "
+                        "come off the phone. Leave it empty if you would "
+                        "rather be able to take it off yourself.")
+        self.e_pass = Adw.PasswordEntryRow(title="Removal password")
+        self.e_pass2 = Adw.PasswordEntryRow(title="Again")
+        self.g_pass.add(self.e_pass)
+        self.g_pass.add(self.e_pass2)
+        box.append(self.g_pass)
+
+        self.l_kind = Gtk.Label(wrap=True, xalign=0)
+        self.l_kind.add_css_class("dim-label")
+        box.append(self.l_kind)
+
+        row_ = Gtk.Box(spacing=10, halign=Gtk.Align.CENTER, margin_top=6)
+        back = Gtk.Button(label="Back")
+        back.add_css_class("pill")
+        back.connect("clicked",
+                     lambda *_: self.stack.set_visible_child_name("list"))
+        go = Gtk.Button(label="Show me the page")
+        go.add_css_class("pill")
+        go.add_css_class("suggested-action")
+        go.connect("clicked", lambda *_: self._begin())
+        row_.append(back)
+        row_.append(go)
+        box.append(row_)
+        self._kind_changed()
+        return box
+
+    def _kind_changed(self):
+        ios = self.kind.get_selected() == 1
+        self.g_pass.set_visible(ios)
+        self.l_kind.set_label(
+            "The profile sets encrypted DNS for the whole phone. iOS has no "
+            "way for an app to watch it, so this one is held by the password "
+            "your friend sets rather than by anything reporting back."
+            if ios else
+            "You get a small app that reads the setting once an hour and "
+            "tells your channel if it changes — or if it stops being "
+            "able to tell them anything at all.")
+
+    # -- the page the phone opens -----------------------------------------
+
+    def _serve_page(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14,
+                      margin_top=24, margin_bottom=20,
+                      margin_start=18, margin_end=18,
+                      valign=Gtk.Align.CENTER)
+        t = Gtk.Label(label="Open this on the phone")
+        t.add_css_class("title-2")
+        box.append(t)
+        self.l_url = Gtk.Label(selectable=True, wrap=True,
+                               wrap_mode=Pango.WrapMode.CHAR)
+        self.l_url.add_css_class("title-3")
+        self.l_url.add_css_class("monospace")
+        box.append(self.l_url)
+        self.l_note = Gtk.Label(wrap=True, justify=Gtk.Justification.CENTER)
+        self.l_note.add_css_class("dim-label")
+        box.append(self.l_note)
+        done = Gtk.Button(label="Done", halign=Gtk.Align.CENTER, margin_top=10)
+        done.add_css_class("pill")
+        done.add_css_class("suggested-action")
+        done.connect("clicked", lambda *_: self._finish())
+        box.append(done)
+        return box
+
+    def _begin(self, existing=False):
+        name = self.e_name.get_text().strip()
+        if not name:
+            self.window.toast("Give it a name first")
+            return
+        ios = self.kind.get_selected() == 1
+        if ios and not existing:
+            if self.e_pass.get_text() != self.e_pass2.get_text():
+                self.window.toast("Those passwords do not match")
+                return
+        self.l_url.set_label("…")
+        self.l_note.set_label("Starting…")
+        self.stack.set_visible_child_name("serve")
+
+        argv = ["phone"]
+        if not existing:
+            argv += ["--add", name] + (["--ios"] if ios else [])
+        else:
+            argv += ["--serve", name]
+        argv += ["--minutes", "10"]
+        if ios:
+            argv.append("--password-stdin")
+        self._spawn(argv, self.e_pass.get_text() if ios else None)
+
+    def _spawn(self, argv, password):
+        self._stop()
+        flags = Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE
+        if password is not None:
+            flags |= Gio.SubprocessFlags.STDIN_PIPE
+        try:
+            self.proc = Gio.Subprocess.new(
+                ["pkexec"] + core_argv() + argv, flags)
+        except GLib.Error as exc:
+            self.l_url.set_label("could not start")
+            self.l_note.set_label(exc.message)
+            return
+        if password is not None:
+            pipe = self.proc.get_stdin_pipe()
+            with contextlib.suppress(GLib.Error):
+                pipe.write_all((password + "\n").encode("utf-8"), None)
+                pipe.close(None)
+        self.e_pass.set_text("")
+        self.e_pass2.set_text("")
+        self.reader = Gio.DataInputStream.new(self.proc.get_stdout_pipe())
+        self.reader.read_line_async(GLib.PRIORITY_DEFAULT, None, self._line)
+        self.deadline = time.time() + 10 * 60
+        self.timer = GLib.timeout_add_seconds(1, self._tick)
+
+    def _line(self, stream, res):
+        try:
+            raw, _len = stream.read_line_finish_utf8(res)
+        except GLib.Error:
+            return
+        if raw is None:
+            return
+        text = raw.strip()
+        if text.startswith("http://"):
+            self.l_url.set_label(text)
+        elif "Could not" in text or "could not" in text:
+            self.l_url.set_label("that did not work")
+            self.l_note.set_label(text)
+            self.deadline = 0
+        stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self._line)
+
+    def _tick(self):
+        left = int(self.deadline - time.time())
+        if left <= 0:
+            self.l_note.set_label("The address has expired. Press Done and "
+                                  "start again.")
+            self.timer = 0
+            return False
+        if self.l_url.get_label().startswith("http"):
+            self.l_note.set_label(
+                "Same wifi as this laptop. %d:%02d left."
+                % (left // 60, left % 60))
+        return True
+
+    def _stop(self):
+        if self.timer:
+            GLib.source_remove(self.timer)
+            self.timer = 0
+        if self.proc is not None:
+            with contextlib.suppress(GLib.Error):
+                self.proc.force_exit()
+            self.proc = None
+
+    def _finish(self):
+        self._stop()
+        self.e_name.set_text("")
+        self.stack.set_visible_child_name("list")
+        self.reload()
+        self.window.refresh()
+
+
 class Dashboard(Gtk.Box):
     def __init__(self, window):
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
@@ -1486,6 +1784,14 @@ class Dashboard(Gtk.Box):
         self.g_today.set_header_suffix(report)
         col.append(self.g_today)
 
+        # -- phones ---------------------------------------------------
+        self.g_phones = Adw.PreferencesGroup(title="Your phones")
+        manage = Gtk.Button(label="Set up a phone", valign=Gtk.Align.CENTER)
+        manage.add_css_class("flat")
+        manage.connect("clicked", lambda *_: self.window.show_phones())
+        self.g_phones.set_header_suffix(manage)
+        col.append(self.g_phones)
+
         # -- collapsible detail ---------------------------------------
         self.g_detail = Adw.PreferencesGroup()
         self.x_setup = Adw.ExpanderRow(title="The arrangement")
@@ -1501,7 +1807,7 @@ class Dashboard(Gtk.Box):
         sw.set_child(Adw.Clamp(maximum_size=620, child=col))
         self.append(sw)
         self._kids = {"setup": [], "health": [], "people": [], "update": [],
-                      "today": []}
+                      "today": [], "phones": []}
 
     # -- helpers ----------------------------------------------------------
 
@@ -1620,6 +1926,25 @@ class Dashboard(Gtk.Box):
                     img.add_css_class("success")
                     r.add_suffix(img)
             self._put("people", self.g_people, r)
+
+        # phones. The rows come out of the same health report the rest of
+        # this page reads, so there is nothing extra to ask for.
+        self._reset("phones", self.g_phones)
+        phones = [h for h in (self.doc.get("health") or [])
+                  if str(h.get("name", "")).startswith("phone: ")]
+        self.g_phones.set_description(
+            None if phones else
+            "Nothing is blocked on your phone until you set one up.")
+        for h in phones:
+            r = Adw.ActionRow(title=h["name"].split(": ", 1)[1],
+                              subtitle=h.get("detail") or "")
+            r.add_prefix(Gtk.Image.new_from_icon_name("phone-symbolic"))
+            img = Gtk.Image.new_from_icon_name(
+                "object-select-symbolic" if h.get("ok")
+                else "dialog-warning-symbolic")
+            img.add_css_class("success" if h.get("ok") else "warning")
+            r.add_suffix(img)
+            self._put("phones", self.g_phones, r)
 
         # today
         trk = self.doc.get("tracking") or {}
@@ -2101,6 +2426,9 @@ class MainWindow(Adw.ApplicationWindow):
                        self.show_output("Today", out,
                                         "This is what your approvers get "
                                         "emailed tonight."))
+
+    def show_phones(self):
+        PhonesDialog(self).present(self)
 
     def show_activity(self):
         doc = read_status() or {}

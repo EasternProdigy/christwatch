@@ -60,6 +60,7 @@ Optimise for *"I'd be embarrassed to bypass this"*, not for *"I can't."*
 | 1. hosts | StevenBlack porn-only list (~77k domains) plus forced SafeSearch / YouTube Restricted pinning, injected between markers | `/etc/hosts` |
 | 2. DNS | Forces systemd-resolved to DNS-over-TLS to a filtering resolver, and stops NetworkManager pushing DHCP resolvers over the top | `/etc/systemd/resolved.conf.d/90-pornblock.conf`, `/etc/NetworkManager/conf.d/90-pornblock-dns.conf` |
 | 3. firewall | Own nftables table dropping outbound 53/853 to anything except the filter, plus rejecting 443 to well-known public DoH endpoints | `table inet pornblock` |
+| 3b. phones | Watches the one device-wide DNS setting on your Android phones and says so in the channel when it changes or stops reporting | nothing on this machine |
 | 4. browsers | Forces DoH to the filter, SafeSearch, YouTube Restricted, no private/incognito, blocks `about:config` and `chrome://flags` | `/etc/firefox/policies/policies.json`, `/etc/chromium/policies/managed/pornblock.json`, `/etc/opt/chrome/policies/managed/pornblock.json` |
 
 Layer 3 deliberately touches **only** the `pornblock` table. firewalld and
@@ -269,6 +270,7 @@ sudo pornblock passphrase       # enter the partner passphrase
 sudo pornblock cancel           # always allowed, always the right answer
 sudo pornblock test-email       # re-verify the mail path
 sudo pornblock enforce          # force one enforcement pass now
+sudo pornblock phone            # what your phones are doing
 ```
 
 ### How the desktop app is wired
@@ -322,6 +324,78 @@ type can satisfy it - unanimity becomes the only route. That is deliberate.
 > it is not really a third gate. `status` says so, and the wizard warns you
 > while it is still one click to change. Three approvers with a quorum of
 > two, or `passphrase_recovery: false`, gives you the third gate back.
+
+---
+
+## Your phone
+
+The laptop is half your day. This covers the other half.
+
+Neither phone runs a copy of the blocker, and neither one needs to. Android
+and iOS both have a system-wide setting that sends every app's lookups to a
+resolver of your choosing, and pointing it at the filtering resolver blocks
+the same sites the laptop blocks. On Android that setting lives in
+`Settings.Global`, which every profile on the device shares - so **one change
+covers your owner profile and your second profile at once**, and there is
+only one copy of it for anyone to switch off.
+
+So the software's job here is not to block. It is to make switching it off
+something your friends find out about.
+
+```bash
+sudo pornblock phone --add "my phone"          # Android
+sudo pornblock phone --add "my iphone" --ios   # iPhone
+sudo pornblock phone                           # how they are doing
+sudo pornblock phone --remove "my phone"
+```
+
+`--add` finishes by putting a page on your home network and printing the
+address. Open that address on the phone and everything it needs is there: the
+app, the pairing link, the hostname to type, or the iPhone profile. The
+address stops working after twenty minutes. Nothing is emailed to yourself,
+and nothing is left in your downloads.
+
+### Android
+
+The page hands you a small app. It has no filter in it and asks for no
+unusual permission - it reads one system setting once an hour and posts to a
+**webhook** for your channel, which can write in that one channel and read
+nothing, anywhere. The bot token never leaves the laptop.
+
+It posts when the setting changes, and once a day when it has not, so
+*silence is itself an answer*: if the app is uninstalled or stopped, the
+laptop notices within `phone.silence_hours` (36 by default) and tells your
+friends that the phone has gone quiet.
+
+Install it in **each profile** you use. Both copies watch the same setting,
+which means removing it from one still leaves the other reporting - and the
+one you removed goes quiet, which is heard.
+
+The setting itself, if you would rather type it:
+Settings → Network & internet → Private DNS → *Private DNS provider
+hostname* → `family.cloudflare-dns.com`.
+
+### iPhone
+
+iOS has no way for an app to watch this, so there is no app. What the page
+gives you instead is a configuration profile that sets encrypted DNS for the
+whole phone, and the honest lock on it is a **removal password your friend
+types on your laptop**. Until someone enters it, iOS greys out the Remove
+button.
+
+Same bargain as everything else here: erasing the phone clears it, and the
+password sits in the profile in plain text, which is exactly why that file is
+served to the phone over your own network and never saved anywhere.
+
+### What it does not cover
+
+- A browser with its own DNS built in - Firefox on Android, or any app
+  shipping its own DoH - goes around the system setting. Vanadium and Chrome
+  turn their own secure DNS off when Private DNS is on, so they follow it.
+- A VPN app replaces DNS for the whole device. Nothing here stops one being
+  installed.
+- On Android, you can turn Private DNS off in about four taps. That is the
+  point: it is quick, and it is reported.
 
 ---
 
@@ -578,6 +652,21 @@ endpoint, or any DoH server not on that list, gets through. Closing this
 properly needs allowlist-style egress filtering, which would break ordinary
 use of the machine.
 
+**Your phone is watched, not held.**  The Android app cannot stop you
+changing the setting and it cannot stop you uninstalling it - no app can,
+without being a device-owner app you provision from a factory reset. What it
+can do is post the change to your channel, and go quiet in a way the laptop
+notices. On an iPhone even the watching is impossible: the only real lock
+there is the removal password your friend holds. Both are friction plus
+witnesses, which is what the rest of this program is too.
+
+**The phone's webhook is in the pairing link.**  Anyone who gets that link
+can post messages into your channel as the phone - including a fake "still
+on" once a day, which would hide a real phone going quiet. It travels from
+the laptop to the phone over your own network and is not emailed or stored;
+`sudo pornblock phone --remove` and making a new webhook in Discord is the
+fix if it ever leaks.
+
 **VPNs, Tor, proxies.**  Anything that tunnels traffic sidesteps every layer
 here. A system VPN, a browser proxy extension, Tor Browser (which ships its
 own DNS and its own policy-immune profile), or an SSH `-D` SOCKS proxy all
@@ -656,6 +745,8 @@ Short version: nothing you will feel. Longer version, from a real machine:
 | nftables lockdown | 15 rules on the output hook, unmeasurable |
 | `/etc/hosts` with the 70k list | ~5 ms of parsing on **every** lookup, because glibc re-reads the whole 2 MB file each time |
 | `/etc/hosts` without it | 4 KB, nothing to speak of |
+| Private DNS on the phone | no extra hop - it replaces the resolver rather than sitting in front of one, and it is encrypted either way |
+| The phone app | one HTTPS post a day, one setting read an hour, no VPN slot and no always-on service |
 
 That last row is why `enforce.hosts_blocklist` defaults to **off**. The
 resolver blocks the same sites for free, so the file keeps only the SafeSearch

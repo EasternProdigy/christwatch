@@ -28,10 +28,12 @@ import email.utils
 import getpass
 import hashlib
 import hmac
+import http.server
 import imaplib
 import io
 import json
 import os
+import plistlib
 import pwd
 import re
 import secrets
@@ -44,13 +46,14 @@ import sys
 import tarfile
 import tempfile
 import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 HOMEPAGE = "https://github.com/EasternProdigy/christwatch"
 PROG = "pornblock"
 
@@ -205,9 +208,22 @@ DEFAULT_CONFIG = {
     "approver_names": {},
     "discord": {
         "channel_id": "",
+        "channel_name": "",      # learnt from Discord, only so status reads well
         "bot_token": "",          # kept in secrets.json, blanked out here
         "ping_on_alert": True,
         "poll_seconds": 45,
+    },
+    # Your phones. Neither one runs a copy of this program: Android and iOS
+    # both have a system-wide setting that sends every app's lookups to the
+    # filtered resolver, and on Android that setting covers every profile on
+    # the device at once. What is tracked here is whether it is still on.
+    "phone": {
+        "enabled": True,
+        # A phone whose app has not said anything for this long is assumed
+        # to have had the app removed, and that is said out loud.
+        "silence_hours": 36.0,
+        # id -> {"name", "kind": android|ios, "added"}
+        "devices": {},
     },
     "approvals_required": 2,
     "cooloff_hours": 24.0,
@@ -272,10 +288,11 @@ DEFAULT_CONFIG = {
     "enforce": {
         "hosts": True,
         # The 70,000-name list, written into /etc/hosts. glibc re-reads that
-        # file on every lookup on the machine, so this costs about 12ms per
-        # name resolved - everywhere, forever. The filtering resolver blocks
-        # the same sites for nothing, so this is off unless you want the
-        # belt as well as the braces.
+        # file on every lookup on the machine - measured at roughly 5ms of
+        # parsing per name resolved, paid everywhere, forever. The filtering
+        # resolver blocks the same sites for nothing and catches browsers
+        # doing their own encrypted DNS, which this never could. So it is
+        # off unless you want the belt as well as the braces.
         "hosts_blocklist": False,
         "hosts_block_ipv6": False,
         "safesearch_hosts": True,
@@ -310,6 +327,9 @@ DEFAULT_STATE = {
                "rolled_back": ""},
     "activity": {"journal_cursor": "", "last_sample": 0, "last_digest_day": ""},
     "alerts": {},
+    # id -> {"last_seen", "state", "dns", "profile", "silent"}
+    "phones": {},
+    "phone_cursor": 0,
     "enforced_once": False,
     "history": [],
 }
@@ -598,6 +618,9 @@ DEFAULT_SECRETS = {
     "smtp_password": "",
     "imap_password": "",
     "discord_bot_token": "",
+    # write-only URL the phone app posts through; it can say things in one
+    # channel and read nothing, anywhere
+    "phone_webhook": "",
     # {"algo","iter","salt","hash","set_at"} - never the passphrase itself
     "partner_passphrase": None,
 }
@@ -1055,6 +1078,9 @@ def snowflake_at(epoch_seconds: float) -> int:
 # View Channel, Send Messages, Read Message History, Add Reactions,
 # and nothing else
 DISCORD_PERMS = (1 << 10) | (1 << 11) | (1 << 16) | (1 << 6)
+# ...plus Manage Webhooks, which is only needed to hand a phone a write-only
+# way into the channel, and is asked for only when you enrol one
+DISCORD_PERMS_PHONE = DISCORD_PERMS | (1 << 29)
 TICK, CROSS = "\u2705", "\u274c"
 
 
@@ -1076,13 +1102,13 @@ def app_id_from_token(token: str) -> str:
     return text if text.isdigit() and len(text) >= 15 else ""
 
 
-def invite_url(token_or_id: str) -> str:
+def invite_url(token_or_id: str, perms: int = DISCORD_PERMS) -> str:
     app = (token_or_id if str(token_or_id).isdigit()
            else app_id_from_token(token_or_id))
     if not app:
         return ""
     return ("https://discord.com/oauth2/authorize?client_id=%s"
-            "&scope=bot&permissions=%d" % (app, DISCORD_PERMS))
+            "&scope=bot&permissions=%d" % (app, perms))
 
 
 def bot_settings_url(token_or_id: str) -> str:
@@ -1317,10 +1343,67 @@ class DiscordCourier:
                 "Message Content intent for the bot")
         return out
 
+    # -- phones -----------------------------------------------------------
+
+    def webhook(self, name: str = "ChristWatch phone") -> str:
+        """
+        A write-only way into this one channel, made once and reused.
+
+        A phone gets this instead of the bot token. It can post to one
+        channel and it can read nothing at all, so a stolen phone costs you
+        a channel someone can write in - not the blocker.
+        """
+        cid = self._channel()
+        for h in self._call("GET", "/channels/%s/webhooks" % cid) or []:
+            if (h.get("name") or "") == name and h.get("token"):
+                return "%s/webhooks/%s/%s" % (DISCORD_API, h["id"], h["token"])
+        h = self._call("POST", "/channels/%s/webhooks" % cid, {"name": name})
+        if not (h or {}).get("token"):
+            raise MailError("Discord did not hand back a webhook token")
+        return "%s/webhooks/%s/%s" % (DISCORD_API, h["id"], h["token"])
+
+    def reports(self, since_epoch: float) -> list:
+        """
+        What the phones have posted since then, already parsed.
+
+        These come in as webhook messages, which scan() deliberately skips
+        along with everything else the channel's bots say. Never raises: a
+        phone we cannot hear from looks the same as a phone that has gone
+        quiet, and the silence check is what catches that either way.
+        """
+        out = []
+        try:
+            after = snowflake_at(since_epoch)
+            for _page in range(5):
+                msgs = self._call("GET", "/channels/%s/messages?limit=100&after=%d"
+                                  % (self._channel(), after))
+                if not isinstance(msgs, list) or not msgs:
+                    break
+                msgs.sort(key=lambda m: int(m.get("id") or 0))
+                for m in msgs:
+                    with contextlib.suppress(TypeError, ValueError):
+                        after = max(after, int(m.get("id") or 0))
+                    if not m.get("webhook_id"):
+                        continue
+                    for line in (m.get("content") or "").splitlines():
+                        line = line.strip().strip("`").strip()
+                        if not line.startswith(PHONE_MARKER):
+                            continue
+                        with contextlib.suppress(ValueError):
+                            body = json.loads(line[len(PHONE_MARKER):])
+                            if isinstance(body, dict):
+                                out.append(body)
+                if len(msgs) < 100:
+                    break
+        except MailError as exc:
+            log("could not read phone reports: %s" % exc)
+        return out
+
     def probe(self) -> str:
         me = self._call("GET", "/users/@me")
         ch = self._call("GET", "/channels/%s" % self._channel())
         name = ch.get("name") or self._channel()
+        self.d["channel_name"] = ch.get("name") or ""
         return "signed in as %s, can see #%s" % (me.get("username") or "?", name)
 
     def content_intent(self) -> bool:
@@ -1411,6 +1494,548 @@ def alert(cfg: dict, st: dict, key: str, subject: str, text: str,
     if is_discord(cfg) and not ping:
         recipients = []          # still posted, just nobody's phone buzzes
     return courier(cfg).send(st, recipients, prefix + subject, text, html)
+
+
+# ==========================================================================
+# Phones
+# ==========================================================================
+#
+# The laptop is only half of anyone's day. This is the other half.
+#
+# Neither phone runs a copy of the blocker. Both of them already have a
+# system-wide setting that sends every lookup, in every app, to a resolver
+# that will not answer for porn - Private DNS on Android, a DNS profile on
+# iOS. Setting it takes half a minute and costs nothing at all in speed.
+#
+# So the job here is not to block. It is to make turning the block off
+# something your friends find out about, which is the same job this program
+# does on the laptop.
+
+PHONE_MARKER = "CW1 "
+PAIR_SCHEME = "christwatch://pair#"
+MOBILECONFIG_TYPE = "application/x-apple-aspen-config"
+APK_TYPE = "application/vnd.android.package-archive"
+
+
+def phone_devices(cfg: dict) -> dict:
+    return dict((cfg.get("phone") or {}).get("devices") or {})
+
+
+def new_device_id() -> str:
+    return os.urandom(4).hex()
+
+
+def find_device(cfg: dict, needle: str) -> str:
+    """A device by its id or by the name you gave it. Empty if no match."""
+    needle = (needle or "").strip().lower()
+    devices = phone_devices(cfg)
+    if needle in devices:
+        return needle
+    for dev, meta in devices.items():
+        if (meta.get("name") or "").strip().lower() == needle:
+            return dev
+    return ""
+
+
+def pair_link(cfg: dict, webhook: str, dev_id: str, name: str,
+              home: str = "") -> str:
+    """
+    Everything the phone app needs, in something you can tap.
+
+    The webhook inside it can post to one channel and read nothing, anywhere.
+    That is why the phone gets one instead of the bot token: a phone is the
+    thing most likely to be lost, and losing this one costs you a channel
+    someone could write in, not the keys to the blocker.
+    """
+    body = {
+        "v": 1,
+        "id": dev_id,
+        "hook": webhook,
+        "name": name,
+        "dns": FILTERS[cfg["filter"]]["dot_name"],
+        "home": home or "your channel",
+    }
+    raw = json.dumps(body, separators=(",", ":")).encode("utf-8")
+    return PAIR_SCHEME + base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def read_pair_link(link: str) -> dict:
+    """The other half of pair_link, so the self-test can prove they agree."""
+    text = (link or "").strip()
+    if "#" in text:
+        text = text.split("#", 1)[1]
+    try:
+        raw = base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+        return json.loads(raw.decode("utf-8"))
+    except (ValueError, binascii.Error, UnicodeDecodeError):
+        return {}
+
+
+# --------------------------------------------------------------------------
+# iPhone: a profile, and a friend who holds the password to remove it
+# --------------------------------------------------------------------------
+
+def mobileconfig(cfg: dict, name: str = "iPhone",
+                 removal_password: str = "") -> bytes:
+    """
+    An iOS configuration profile that points the whole phone at the filtered
+    resolver over encrypted DNS.
+
+    With a removal password, iOS greys out the Remove button until someone
+    types it - so the friend who set it is the one who can take it off, which
+    is the same arrangement the laptop already runs on.
+
+    Be honest about the edge: erasing the phone removes it too, and the
+    password is written in this file in the clear, so the file should reach
+    the phone and go no further. `--serve` exists for exactly that reason.
+    """
+    f = FILTERS[cfg["filter"]]
+    payloads = [{
+        "PayloadType": "com.apple.dnsSettings.managed",
+        "PayloadIdentifier": "io.christwatch.dns.settings",
+        "PayloadUUID": str(uuid.uuid4()),
+        "PayloadVersion": 1,
+        "PayloadDisplayName": "Filtered DNS",
+        "PayloadDescription":
+            "Sends every lookup on this phone to %s, which does not answer "
+            "for pornography." % f["dot_name"],
+        "DNSSettings": {
+            "DNSProtocol": "HTTPS",
+            "ServerURL": f["doh_url"],
+            "ServerAddresses": list(f["ipv4"]),
+        },
+        "ProhibitDisablement": True,
+    }]
+    if removal_password:
+        payloads.append({
+            "PayloadType": "com.apple.profileRemovalPassword",
+            "PayloadIdentifier": "io.christwatch.removal",
+            "PayloadUUID": str(uuid.uuid4()),
+            "PayloadVersion": 1,
+            "PayloadDisplayName": "Removal password",
+            "RemovalPassword": removal_password,
+        })
+    doc = {
+        "PayloadType": "Configuration",
+        "PayloadVersion": 1,
+        "PayloadIdentifier": "io.christwatch.profile",
+        "PayloadUUID": str(uuid.uuid4()),
+        "PayloadDisplayName": "%s — %s" % (cfg.get("app_name") or "ChristWatch", name),
+        "PayloadOrganization": cfg.get("app_name") or "ChristWatch",
+        "PayloadDescription":
+            "Filtered DNS for this phone. Set up by %s."
+            % (cfg.get("owner_name") or "its owner"),
+        "PayloadRemovalDisallowed": bool(removal_password),
+        "PayloadContent": payloads,
+    }
+    return plistlib.dumps(doc)
+
+
+# --------------------------------------------------------------------------
+# Getting it onto the phone
+# --------------------------------------------------------------------------
+
+def lan_address() -> str:
+    """The address this machine has on the network the phone is also on."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("1.1.1.1", 53))       # no packet is sent by a UDP connect
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def apk_cache_path() -> str:
+    return os.path.join(STATE_DIR, "ChristWatch.apk")
+
+
+def fetch_apk(cfg: dict, timeout: int = 120) -> str:
+    """
+    Download the phone app from the same repo this machine updates from.
+
+    Returns the local path, or "" with the reason logged. A missing APK is
+    not fatal: the page still offers the iPhone profile and a link out.
+    """
+    repo = ((cfg.get("updates") or {}).get("repo") or "").rstrip("/")
+    if "github.com/" not in repo:
+        return ""
+    slug = repo.split("github.com/", 1)[1].removesuffix(".git")
+    url = "https://api.github.com/repos/%s/releases/latest" % slug
+    try:
+        req = urllib.request.Request(url, headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "%s/%s" % (PROG, VERSION)})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            rel = json.loads(resp.read().decode("utf-8", "replace"))
+        asset = next((a for a in rel.get("assets") or []
+                      if str(a.get("name") or "").endswith(".apk")), None)
+        if not asset:
+            log("no .apk on the latest release of %s" % slug)
+            return ""
+        dest = P(apk_cache_path())
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        req = urllib.request.Request(asset["browser_download_url"], headers={
+            "User-Agent": "%s/%s" % (PROG, VERSION)})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read()
+        with open(dest, "wb") as fh:
+            fh.write(body)
+        os.chmod(dest, 0o644)
+        log("fetched %s (%d bytes)" % (asset["name"], len(body)))
+        return dest
+    except (urllib.error.URLError, OSError, ValueError, KeyError) as exc:
+        log("could not fetch the phone app: %r" % exc)
+        return ""
+
+
+PHONE_PAGE = """<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>%(app)s</title>
+<style>
+ :root { color-scheme: dark; }
+ body { margin:0; padding:28px 20px 56px; background:#0E1524; color:#EDEFF4;
+        font:17px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+ .wrap { max-width:32rem; margin:0 auto; }
+ h1 { font-size:1.45rem; margin:0 0 4px; letter-spacing:-.01em; }
+ .sub { color:#8E99B0; margin:0 0 28px; }
+ .card { background:#151E31; border:1px solid #243149; border-radius:14px;
+         padding:20px; margin:0 0 16px; }
+ .card h2 { font-size:1.05rem; margin:0 0 10px; }
+ .card p { margin:0 0 14px; color:#C3CBDA; font-size:.96rem; }
+ a.btn { display:block; text-align:center; background:#D8A84E; color:#0E1524;
+         text-decoration:none; font-weight:650; padding:14px 16px;
+         border-radius:10px; margin:0 0 10px; }
+ a.ghost { background:transparent; color:#D8A84E; border:1px solid #3A4A6B; }
+ code { background:#0A0F1B; border:1px solid #243149; border-radius:7px;
+        padding:3px 7px; font-size:.9rem; word-break:break-all; }
+ ol { margin:0; padding-left:1.2em; color:#C3CBDA; font-size:.96rem; }
+ li { margin-bottom:7px; }
+ .foot { color:#6F7B93; font-size:.85rem; text-align:center; margin-top:26px; }
+</style></head><body><div class="wrap">
+<h1>%(app)s</h1>
+<p class="sub">%(owner)s &middot; this page is only on your home network, and
+only for the next %(minutes)d minutes.</p>
+%(android)s
+%(ios)s
+<div class="card">
+<h2>Either way, set this</h2>
+<p>Every app on the phone follows it, in both profiles at once.</p>
+<ol>
+<li><b>Android:</b> Settings &rarr; Network &amp; internet &rarr; Private DNS
+&rarr; Private DNS provider hostname.</li>
+<li>Type <code>%(dot)s</code></li>
+<li><b>iPhone:</b> install the profile above instead &mdash; it does the
+same thing.</li>
+</ol>
+</div>
+<p class="foot">%(app)s %(version)s</p>
+</div></body></html>
+"""
+
+ANDROID_CARD = """<div class="card">
+<h2>Android</h2>
+<p>Install the app, then tap Pair. It watches the setting below and tells
+%(home)s if it ever changes.</p>
+%(download)s
+<a class="btn ghost" href="%(pair)s">Pair this phone</a>
+</div>
+"""
+
+IOS_CARD = """<div class="card">
+<h2>iPhone</h2>
+<p>Tap this, then open Settings &rarr; Profile Downloaded and install it.
+%(locked)s</p>
+<a class="btn" href="%(url)s">Get the profile</a>
+</div>
+"""
+
+
+class PhoneHandler(http.server.BaseHTTPRequestHandler):
+    """Serves exactly three things, to whoever is on the same wifi."""
+
+    files = {}          # path -> (bytes, content type)
+    page = b""
+    token = ""
+
+    def log_message(self, fmt, *a):          # quiet: the journal has enough
+        pass
+
+    def do_GET(self):
+        path = urllib.parse.urlparse(self.path).path
+        if not path.startswith("/" + self.token):
+            self.send_error(404)
+            return
+        rest = path[len(self.token) + 1:] or "/"
+        if rest == "/":
+            self._send(self.page, "text/html; charset=utf-8")
+            return
+        item = self.files.get(rest)
+        if not item:
+            self.send_error(404)
+            return
+        body, ctype = item
+        self._send(body, ctype, download=rest.lstrip("/"))
+
+    def _send(self, body: bytes, ctype: str, download: str = ""):
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        if download:
+            self.send_header("Content-Disposition",
+                             'attachment; filename="%s"' % download)
+        self.end_headers()
+        self.wfile.write(body)
+
+
+@contextlib.contextmanager
+def port_open(port: int):
+    """
+    Let the phone reach us, and put the firewall back exactly as it was.
+
+    Runtime only: nothing touches the permanent config, so a reboot undoes
+    anything this got wrong.
+
+    The check first is not politeness. Fedora Workstation's zone already
+    allows 1025-65535, and asking firewalld to remove a single port out of
+    a range it never granted individually makes it split the range - which
+    would leave one port closed that used to be open, for good.
+    """
+    if SANDBOX or not shutil.which("firewall-cmd"):
+        yield True
+        return
+    already = run(["firewall-cmd", "--query-port=%d/tcp" % port],
+                  timeout=20).out.strip() == "yes"
+    if already:
+        yield True
+        return
+    opened = run(["firewall-cmd", "--add-port=%d/tcp" % port], timeout=20).ok
+    try:
+        yield opened
+    finally:
+        if opened:
+            run(["firewall-cmd", "--remove-port=%d/tcp" % port], timeout=20)
+
+
+def serve_phone_page(cfg: dict, dev_id: str = "", minutes: int = 20,
+                     port: int = 8723, ios_password: str = "",
+                     want_ios: bool = True) -> int:
+    """
+    Put everything a phone needs on one page, on the local network, briefly.
+
+    This exists because the alternative is emailing yourself an APK and a
+    configuration profile that has a password in it. One address, typed once,
+    and nothing is left lying around afterwards.
+    """
+    app = cfg.get("app_name") or "ChristWatch"
+    token = secrets.token_urlsafe(9)
+    files, android, ios = {}, "", ""
+
+    if dev_id:
+        devices = phone_devices(cfg)
+        meta = devices.get(dev_id) or {}
+        hook = (load_secrets() or {}).get("phone_webhook") or ""
+        link = pair_link(cfg, hook, dev_id, meta.get("name") or "phone",
+                         channel_label(cfg)) if hook else ""
+        apk = P(apk_cache_path())
+        if os.path.exists(apk):
+            with open(apk, "rb") as fh:
+                files["/ChristWatch.apk"] = (fh.read(), APK_TYPE)
+            download = ('<a class="btn" href="/%s/ChristWatch.apk">'
+                        'Download the app</a>' % token)
+        else:
+            download = ('<a class="btn" href="%s/releases/latest">'
+                        'Download the app</a>' % HOMEPAGE)
+        android = ANDROID_CARD % {"download": download, "pair": link or "#",
+                                  "home": channel_label(cfg)}
+
+    if want_ios:
+        files["/ChristWatch.mobileconfig"] = (
+            mobileconfig(cfg, "iPhone", ios_password), MOBILECONFIG_TYPE)
+        ios = IOS_CARD % {
+            "url": "/%s/ChristWatch.mobileconfig" % token,
+            "locked": ("Removing it later needs the password your friend set."
+                       if ios_password else
+                       "Nobody set a removal password, so you can take it off "
+                       "again whenever you like."),
+        }
+
+    page = PHONE_PAGE % {
+        "app": app, "owner": cfg.get("owner_name") or "",
+        "minutes": minutes, "android": android, "ios": ios,
+        "dot": FILTERS[cfg["filter"]]["dot_name"], "version": VERSION,
+    }
+
+    PhoneHandler.files = files
+    PhoneHandler.page = page.encode("utf-8")
+    PhoneHandler.token = token
+
+    httpd = http.server.ThreadingHTTPServer(("0.0.0.0", port), PhoneHandler)
+    httpd.timeout = 1
+    url = "http://%s:%d/%s/" % (lan_address(), port, token)
+
+    print("")
+    print("  Open this on the phone:\n")
+    print("      " + bold(url))
+    print("")
+    print(dim("  Same wifi as this laptop. The address stops working in "
+              "%d minutes." % minutes))
+    print(dim("  Ctrl-C when the phone is done.\n"))
+    # The desktop app reads this address off our stdout while we keep
+    # running. A pipe is block-buffered, so without this it would sit in
+    # Python's buffer until we exited - which is the one moment it is no
+    # longer any use.
+    sys.stdout.flush()
+
+    deadline = now() + minutes * 60
+    with port_open(port) as opened:
+        if not opened and shutil.which("firewall-cmd"):
+            print(yellow("  The firewall would not open port %d. If the "
+                         "phone cannot reach it, that is why.\n" % port))
+        try:
+            while now() < deadline:
+                httpd.handle_request()
+        except KeyboardInterrupt:
+            print("")
+        finally:
+            httpd.server_close()
+    print(green("  Page closed.\n"))
+    return 0
+
+
+def channel_label(cfg: dict) -> str:
+    """The channel by name once we have learnt it, by description until then."""
+    name = ((cfg.get("discord") or {}).get("channel_name") or "").strip()
+    return ("#" + name) if name else "your channel"
+
+
+# --------------------------------------------------------------------------
+# Listening for what the phones say
+# --------------------------------------------------------------------------
+
+def poll_phones(cfg: dict, st: dict, post) -> list:
+    """
+    Read the phones' own posts out of the channel and act on them.
+
+    Two things are worth telling your friends about: a phone that says
+    filtering went off, and a phone that stops saying anything at all. The
+    second one matters more, because uninstalling the app is easier than
+    changing the setting - so silence is treated as an answer.
+    """
+    ph = cfg.get("phone") or {}
+    known = phone_devices(cfg)
+    if not ph.get("enabled", True) or not known or not is_discord(cfg):
+        return []
+
+    seen = st.setdefault("phones", {})
+    moves = []
+    since = float(st.get("phone_cursor") or 0) or (now() - 7200)
+    for rep in post.reports(since):
+        dev = str(rep.get("d") or "")
+        if dev not in known:
+            continue
+        row = seen.setdefault(dev, {})
+        was = row.get("state")
+        row.update({
+            "last_seen": now(),
+            "reported_at": float(rep.get("at") or now()),
+            "state": str(rep.get("s") or "?"),
+            "dns": str(rep.get("dns") or ""),
+            "profile": rep.get("u"),
+            "silent": False,
+        })
+        name = known[dev].get("name") or dev
+        if row["state"] == was:
+            continue
+        if row["state"] != "on":
+            moves.append("%s: filtering %s" % (name, row["state"]))
+            alert(cfg, st, "phone_off_" + dev,
+                  "%s stopped filtering" % name,
+                  "%s reports that Private DNS is %s (it should be %s).\n\n"
+                  "Every app on that phone can reach anything right now.\n"
+                  % (name, row["state"], FILTERS[cfg["filter"]]["dot_name"]))
+        elif was not in (None, "on"):
+            moves.append("%s: filtering back on" % name)
+            alert(cfg, st, "phone_on_" + dev, "%s is filtering again" % name,
+                  "%s is back on %s.\n"
+                  % (name, FILTERS[cfg["filter"]]["dot_name"]), ping=False)
+
+    # A cursor a little behind the clock: a report that lands between the
+    # read and this line is seen twice rather than never, and seeing one
+    # twice changes nothing.
+    st["phone_cursor"] = now() - 120
+
+    limit = max(1.0, float(ph.get("silence_hours") or 36)) * 3600
+    for dev, meta in known.items():
+        if (meta.get("kind") or "android") != "android":
+            continue          # an iPhone has nothing to report from
+        row = seen.setdefault(dev, {})
+        last = float(row.get("last_seen") or meta.get("added") or 0)
+        if not last or now() - last <= limit or row.get("silent"):
+            continue
+        row["silent"] = True
+        name = meta.get("name") or dev
+        moves.append("%s: silent" % name)
+        alert(cfg, st, "phone_silent_" + dev,
+              "%s has gone quiet" % name,
+              "%s has not checked in for %s. The app is normally heard from "
+              "once a day, so this usually means it was uninstalled or the "
+              "phone was told to stop running it.\n"
+              % (name, human_delta(now() - last)))
+    return moves
+
+
+
+def phone_table(cfg: dict, st: dict) -> list:
+    """One row per phone: (name, kind, ok, what to say about it)."""
+    rows = []
+    seen = st.get("phones") or {}
+    limit = max(1.0, float((cfg.get("phone") or {}).get("silence_hours") or 36))
+    for dev, meta in sorted(phone_devices(cfg).items(),
+                            key=lambda kv: kv[1].get("added") or 0):
+        kind = meta.get("kind") or "android"
+        name = meta.get("name") or dev
+        row = seen.get(dev) or {}
+        if kind != "android":
+            rows.append((name, kind, True,
+                         "profile installed by hand, nothing to report from"))
+            continue
+        last = float(row.get("last_seen") or 0)
+        if not last:
+            # Enrolling a phone and walking over to it takes a few minutes,
+            # and the app checks in hourly. Calling that a failure straight
+            # away would teach you to ignore the word.
+            waiting = now() - float(meta.get("added") or 0) < limit * 3600
+            rows.append((name, kind, waiting,
+                         "waiting for its first check-in" if waiting
+                         else "never checked in"))
+            continue
+        ago = human_delta(now() - last)
+        if now() - last > limit * 3600:
+            rows.append((name, kind, False, "silent for %s" % ago))
+        elif row.get("state") == "on":
+            rows.append((name, kind, True, "filtering, last heard %s ago" % ago))
+        else:
+            rows.append((name, kind, False,
+                         "filtering is %s (%s ago)"
+                         % (row.get("state") or "?", ago)))
+    return rows
+
+
+def phone_webhook(cfg: dict, post) -> str:
+    """The write-only way into the channel, made once and kept."""
+    sec = load_secrets()
+    have = (sec.get("phone_webhook") or "").strip()
+    if have:
+        return have
+    url = post.webhook()
+    sec["phone_webhook"] = url
+    save_secrets(sec)
+    return url
 
 
 # ==========================================================================
@@ -3208,6 +3833,11 @@ def public_status_doc(cfg: dict, st: dict) -> dict:
                            (cfg.get("approver_names") or {}).items()},
         "transport": (cfg.get("transport") or "email").lower(),
         "channel_id": str((cfg.get("discord") or {}).get("channel_id") or ""),
+        # Every phone you paired, so an update that dropped one is caught
+        # and refused rather than quietly leaving a phone unwatched.
+        "phones": sorted("%s:%s" % (m.get("kind") or "android",
+                                    m.get("name") or d)
+                         for d, m in phone_devices(cfg).items()),
         "approvals_required": int(cfg.get("approvals_required") or 1),
         "cooloff_hours": float(cfg.get("cooloff_hours") or 24),
         "unlock_minutes": int(cfg.get("unlock_minutes") or 60),
@@ -3362,6 +3992,8 @@ def health(cfg: dict, st: dict) -> list:
         tact = systemctl("is-active", "pornblock-watchdog.timer").out.strip()
         tena = systemctl("is-enabled", "pornblock-watchdog.timer").out.strip()
         add("watchdog timer", tact == "active", "%s / %s" % (tact or "?", tena or "?"))
+    for name, kind, pok, detail in phone_table(cfg, st):
+        add("phone: " + name, pok, detail)
     return rows
 
 
@@ -3733,6 +4365,165 @@ def cmd_block(args) -> int:
     enforce_hosts(cfg, st, apply=st.get("mode") != "UNLOCKED")
     save_state(st)
     print(dim("  %d site(s) blocked by hand.\n" % len(cfg["custom_blocked"])))
+    return 0
+
+
+def cmd_phone(args) -> int:
+    require_root()
+    cfg = load_config()
+    if not cfg:
+        print(red("Not configured. Run setup first."))
+        return 1
+    st = load_state()
+    cfg.setdefault("phone", {}).setdefault("devices", {})
+
+    # -- take one off ------------------------------------------------------
+    if args.remove:
+        dev = find_device(cfg, args.remove)
+        if not dev:
+            print(red("\n  No phone called %r.\n" % args.remove))
+            return 1
+        meta = cfg["phone"]["devices"].pop(dev)
+        (st.get("phones") or {}).pop(dev, None)
+        save_config(cfg)
+        save_state(st)
+        name = meta.get("name") or dev
+        alert(cfg, st, "phone_removed", "%s was unenrolled" % name,
+              "%s took %s off the list of phones being watched on %s.\n"
+              % (who(cfg), name, socket.gethostname()), force=True)
+        save_state(st)
+        print(green("\n  %s removed. Its own setting was not changed - "
+                    "check the phone itself.\n" % name))
+        return 0
+
+    # -- add one -----------------------------------------------------------
+    if args.add:
+        name = args.add.strip()[:40]
+        if find_device(cfg, name):
+            print(red("\n  There is already a phone called %r.\n" % name))
+            return 1
+        kind = "ios" if args.ios else "android"
+        dev = new_device_id()
+        cfg["phone"]["devices"][dev] = {
+            "name": name, "kind": kind, "added": now()}
+        save_config(cfg)
+        st.setdefault("phones", {})[dev] = {}
+        save_state(st)
+        print(green("\n  Added %s (%s)." % (name, kind)))
+        if kind == "android":
+            print(dim("  Pair it with:  %s phone --serve %s\n" % (PROG, name)))
+        else:
+            print(dim("  Install its profile with:  %s phone --serve %s\n"
+                      % (PROG, name)))
+        args.serve = name
+
+    # -- hand it to the phone ---------------------------------------------
+    if args.serve:
+        dev = find_device(cfg, args.serve)
+        if not dev:
+            print(red("\n  No phone called %r. Add it first with --add.\n"
+                      % args.serve))
+            return 1
+        meta = cfg["phone"]["devices"][dev]
+        kind = meta.get("kind") or "android"
+        password = ""
+        if kind == "ios" and args.password_stdin:
+            password = sys.stdin.readline().rstrip("\n")
+        elif kind == "ios":
+            print("")
+            print(bold("  Hand the laptop to your friend."))
+            print(dim("  They set a password, and without it the profile "
+                      "cannot come off the phone."))
+            print(dim("  Leave it empty if you would rather be able to "
+                      "remove it yourself.\n"))
+            try:
+                password = getpass.getpass("  Removal password (their choice): ")
+                again = getpass.getpass("  Again: ") if password else ""
+            except (EOFError, OSError):
+                password = again = ""    # no terminal: no password, no crash
+            if password and password != again:
+                print(red("\n  Those did not match.\n"))
+                return 1
+        elif not os.path.exists(P(apk_cache_path())):
+            print(dim("\n  Fetching the phone app..."))
+            fetch_apk(cfg)
+        if kind == "android":
+            try:
+                phone_webhook(cfg, courier(cfg))
+            except MailError as exc:
+                # Only a refusal is about permissions. A rejected token or a
+                # channel that has gone is a different problem, and the
+                # generic advice for a 403 would send you the wrong way.
+                refused = "not allowed" in str(exc)
+                link = invite_url(
+                    (cfg.get("discord") or {}).get("bot_token") or "",
+                    DISCORD_PERMS_PHONE) if refused else ""
+                if refused:
+                    print(yellow("\n  Your bot needs one more permission "
+                                 "before a phone can post: Manage Webhooks."))
+                    print(dim("  It is what lets it hand the phone a "
+                              "write-only way into the channel.\n"))
+                    if link:
+                        print("  Add it in one click, then run this again:")
+                        print("      " + bold(link) + "\n")
+                else:
+                    print(red("\n  Could not make a webhook: %s\n" % exc))
+                print(dim("  Or make one yourself: Server Settings -> "
+                          "Integrations -> Webhooks -> New Webhook, point it\n"
+                          "  at your channel, Copy Webhook URL, then run"))
+                print(dim("      %s phone --webhook <url>\n" % PROG))
+                return 1
+        return serve_phone_page(cfg, dev, minutes=args.minutes,
+                                port=args.port, ios_password=password,
+                                want_ios=(kind == "ios"))
+
+    # -- paste a webhook made by hand --------------------------------------
+    if args.webhook:
+        url = args.webhook.strip()
+        if not url.startswith("https://discord.com/api/webhooks/"):
+            print(red("\n  That is not a Discord webhook URL.\n"))
+            return 1
+        sec = load_secrets()
+        sec["phone_webhook"] = url
+        save_secrets(sec)
+        print(green("\n  Saved. Phones will post through it.\n"))
+        return 0
+
+    # -- say where things stand -------------------------------------------
+    rows = phone_table(cfg, st)
+    if args.json:
+        print(dump_json({
+            "devices": [{"name": n, "kind": k, "ok": ok, "detail": d}
+                        for n, k, ok, d in rows],
+            "hostname": FILTERS[cfg["filter"]]["dot_name"],
+            "profile_url": FILTERS[cfg["filter"]]["doh_url"],
+            "paired": bool((load_secrets() or {}).get("phone_webhook")),
+        }))
+        return 0
+
+    print("")
+    if not rows:
+        print("  No phones yet.")
+        print("")
+        print("  The setting that does the blocking is the same on every "
+              "phone you own:")
+        print("      " + bold(FILTERS[cfg["filter"]]["dot_name"]))
+        print("")
+        print(dim("  On Android it covers every profile on the device at "
+                  "once, because there is only one copy of it."))
+        print("")
+        print("  Add one:")
+        print("      %s phone --add \"my phone\"" % PROG)
+        print("      %s phone --add \"my iphone\" --ios" % PROG)
+        print("")
+        return 0
+
+    for name, kind, ok, detail in rows:
+        mark = green("[ ok ]") if ok else red("[FAIL]")
+        print("  %s %-22s %-8s %s" % (mark, name[:22], kind, detail))
+    print("")
+    print(dim("  Should be on:  %s" % FILTERS[cfg["filter"]]["dot_name"]))
+    print("")
     return 0
 
 
@@ -4701,6 +5492,7 @@ def tick(cfg_override=None) -> dict:
         refresh_safesearch_ips(cfg, st)
 
     moves = advance(cfg, st, post)
+    moves += poll_phones(cfg, st, post)
     apply = st.get("mode") != "UNLOCKED"
     quiet = bool(moves) or bool(notes) or bl == "refreshed" or not st.get("enforced_once")
     changes = enforce_all(cfg, st, apply, quiet=quiet)
@@ -4947,7 +5739,8 @@ def current_source_sha() -> str:
 
 ARRANGEMENT_KEYS = ("configured", "mode", "transport", "approvers",
                     "approvals_required", "cooloff_hours", "unlock_minutes",
-                    "channel_id", "passphrase_set", "filter", "armed")
+                    "channel_id", "passphrase_set", "filter", "armed",
+                    "phones")
 
 
 def arrangement(doc: dict) -> dict:
@@ -5497,6 +6290,28 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--remove", action="store_true", help="take one off again")
     s.add_argument("--list", action="store_true", help="show the list")
     s.set_defaults(fn=cmd_block)
+
+    s = sub.add_parser("phone",
+                       help="put the blocker on your phone and watch it there")
+    s.add_argument("--add", metavar="NAME",
+                   help="enrol a phone and hand it its setup")
+    s.add_argument("--ios", action="store_true",
+                   help="with --add: an iPhone, which gets a profile instead "
+                        "of an app")
+    s.add_argument("--serve", metavar="NAME",
+                   help="put that phone's setup on a page only your home "
+                        "network can reach")
+    s.add_argument("--remove", metavar="NAME", help="stop watching a phone")
+    s.add_argument("--webhook", metavar="URL",
+                   help="use a webhook you made in Discord yourself")
+    s.add_argument("--minutes", type=int, default=20,
+                   help="how long the page stays up (default 20)")
+    s.add_argument("--port", type=int, default=8723, help="which port to use")
+    s.add_argument("--password-stdin", action="store_true",
+                   help="with an iPhone: read the removal password from "
+                        "stdin instead of asking")
+    s.add_argument("--json", action="store_true", help="machine-readable")
+    s.set_defaults(fn=cmd_phone)
 
     s = sub.add_parser("no-password",
                        help="stop asking for a password for these commands")
