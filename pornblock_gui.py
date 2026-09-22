@@ -433,9 +433,16 @@ class SetupView(Gtk.Box):
                         "here. Nobody has to copy any ids.")
         self.r_checkin = Adw.ActionRow(
             title="Ask them to check in",
-            subtitle="Posts one message and listens for two minutes")
+            subtitle="Posts in the channel and listens for two minutes, "
+                     "or message a few people directly instead")
         self.r_checkin.add_prefix(
             Gtk.Image.new_from_icon_name("system-users-symbolic"))
+        self.b_private = Gtk.Button(label="Privately", valign=Gtk.Align.CENTER)
+        self.b_private.set_tooltip_text(
+            "Direct-message the people you pick, instead of posting in the "
+            "channel")
+        self.b_private.connect("clicked", self.on_checkin_private)
+        self.r_checkin.add_suffix(self.b_private)
         self.b_checkin = Gtk.Button(label="Ask them", valign=Gtk.Align.CENTER)
         self.b_checkin.add_css_class("suggested-action")
         self.b_checkin.connect("clicked", self.on_checkin)
@@ -499,26 +506,120 @@ class SetupView(Gtk.Box):
         def done(ok, out):
             self.b_checkin.set_sensitive(True)
             self.b_checkin.set_label("Ask them")
-            res = read_json_output(out) or {
-                "error": (out or "").strip() or "nothing came back"}
-            if res.get("error"):
-                self.l_checkin.add_css_class("error")
-                self.l_checkin.set_label(res["error"])
-                return
-            fresh = 0
-            have = {p["id"] for p in self.discord_people}
-            for m in res.get("members") or []:
-                if m.get("id") and m["id"] not in have:
-                    self.add_discord_person(m["id"], m.get("name") or "")
-                    fresh += 1
-            self.l_checkin.add_css_class("success" if fresh else "error")
-            self.l_checkin.set_label(
-                "%d checked in." % fresh if fresh else
-                "Nobody answered. If the channel stayed silent, the bot may "
-                "not be allowed to read it - check the connection again.")
-            self.check_inert()
+            self.apply_checkin(read_json_output(out) or {
+                "error": (out or "").strip() or "nothing came back"})
 
         run_privileged(["discord-checkin", "--answers", "-", "--wait", "120"],
+                       stdin_text=payload, on_done=done, as_root=False)
+
+    def apply_checkin(self, res):
+        """Fold whoever answered into the approver list."""
+        for c in ("success", "error"):
+            self.l_checkin.remove_css_class(c)
+        self.l_checkin.set_visible(True)
+        trouble = "  ".join(res.get("failed", {}).values())
+        if res.get("error"):
+            self.l_checkin.add_css_class("error")
+            self.l_checkin.set_label(
+                " ".join(x for x in (res["error"], trouble) if x))
+            return 0
+        fresh = 0
+        have = {p["id"] for p in self.discord_people}
+        for m in res.get("members") or []:
+            if m.get("id") and m["id"] not in have:
+                self.add_discord_person(m["id"], m.get("name") or "")
+                fresh += 1
+        self.l_checkin.add_css_class("success" if fresh else "error")
+        if fresh:
+            self.l_checkin.set_label(
+                "%d checked in.%s" % (fresh, "  " + trouble if trouble else ""))
+        else:
+            self.l_checkin.set_label(
+                trouble or ("Nobody answered in time. Try again, or add them "
+                            "by user id below."))
+        self.check_inert()
+        return fresh
+
+    # -- asking a few people quietly instead of the whole channel ---------
+
+    def on_checkin_private(self, *_):
+        err = self.validate(2)
+        if err:
+            self.window.toast(err)
+            self.show_page(2)
+            return
+        payload = json.dumps({"discord": self.answers()["discord"]})
+        self.b_private.set_sensitive(False)
+
+        def listed(ok, out):
+            self.b_private.set_sensitive(True)
+            res = read_json_output(out) or {}
+            people = res.get("people") or []
+            if not people:
+                self.window.toast(
+                    res.get("error")
+                    or "Nobody has spoken in that channel yet, so there is "
+                       "nobody to pick. Ask in the channel instead.")
+                return
+            self._pick_people(people)
+
+        run_privileged(["discord-people", "--answers", "-"],
+                       stdin_text=payload, on_done=listed, as_root=False)
+
+    def _pick_people(self, people):
+        dlg = Adw.AlertDialog(
+            heading="Ask them privately",
+            body="Each one gets a direct message from the bot instead of a "
+                 "post in the channel. They answer there and land in your "
+                 "approver list.")
+        group = Adw.PreferencesGroup()
+        rows = {}
+        for p in people[:25]:
+            r = Adw.SwitchRow(title=p.get("name") or p["id"])
+            group.add(r)
+            rows[p["id"]] = r
+        box = Gtk.ScrolledWindow(propagate_natural_height=True,
+                                 max_content_height=320,
+                                 hscrollbar_policy=Gtk.PolicyType.NEVER)
+        box.set_child(group)
+        dlg.set_extra_child(box)
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("ask", "Message them")
+        dlg.set_response_appearance("ask", Adw.ResponseAppearance.SUGGESTED)
+        dlg.set_default_response("ask")
+
+        def answered(_d, response):
+            if response != "ask":
+                return
+            picked = [uid for uid, r in rows.items() if r.get_active()]
+            if not picked:
+                self.window.toast("Nobody picked")
+                return
+            self.start_private_checkin(picked)
+
+        dlg.connect("response", answered)
+        dlg.present(self.window)
+
+    def start_private_checkin(self, ids):
+        payload = json.dumps({"discord": self.answers()["discord"],
+                              "owner_name": self.e_name.get_text().strip()})
+        self.b_private.set_sensitive(False)
+        self.b_private.set_label("Waiting\u2026")
+        self.l_checkin.set_visible(True)
+        for c in ("success", "error"):
+            self.l_checkin.remove_css_class(c)
+        self.l_checkin.set_label(
+            "Messaged %d of them. Whoever answers in the next two minutes "
+            "becomes an approver." % len(ids))
+
+        def done(ok, out):
+            self.b_private.set_sensitive(True)
+            self.b_private.set_label("Privately")
+            self.apply_checkin(read_json_output(out) or {
+                "error": (out or "").strip() or "nothing came back"})
+
+        run_privileged(["discord-checkin", "--answers", "-", "--wait", "120",
+                        "--dm", ",".join(ids)],
                        stdin_text=payload, on_done=done, as_root=False)
 
     def add_approver(self, text=""):

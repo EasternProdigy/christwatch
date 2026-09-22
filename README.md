@@ -125,8 +125,9 @@ The wizard walks it, and each step opens the page it is talking about:
 2. **Paste the token.** A bot token begins with its own application id, so
    from here the app knows which bot you mean and builds the next two links
    itself.
-3. **Put it in your server.** Opens an invite asking for exactly three
-   permissions: View Channel, Send Messages, Read Message History.
+3. **Put it in your server.** Opens an invite asking for exactly four
+   permissions: View Channel, Send Messages, Read Message History, Add
+   Reactions.
 4. **Let it read the channel.** Opens that bot's settings page. Switch on
    **Message Content Intent**, then press **Save Changes** at the bottom -
    the toggle does nothing until you do. Without it every message arrives
@@ -146,7 +147,10 @@ The wizard walks it, and each step opens the page it is talking about:
 
 Then press **Ask them to check in**. It posts one message in the channel, and
 everyone who answers becomes an approver, names and all - nobody has to copy
-an 18-digit user id either.
+an 18-digit user id either. **Privately** does the same thing by direct
+message to people you pick from the channel, if you would rather the whole
+server did not watch you set this up. Anyone whose DMs are shut is named, so
+you can ask them the other way.
 
 ```bash
 # what that button runs, if you prefer a terminal
@@ -155,8 +159,17 @@ echo '{"discord":{"bot_token":"...","channel_id":"..."}}' | pornblock discord-ch
 ```
 
 Requests, approvals, denials, tamper alerts and the nightly report all go to
-that one channel, and approvals are read back out of it: your friends type
-`APPROVE <code>` where everyone can see. DMs to the bot are ignored on
+that one channel. **Approving is one tap**: the bot puts a tick and a cross
+under the request, and your friends press one. Taking the tick back takes the
+approval back, any time before it is granted. Typing `APPROVE <code>` still
+works for anyone who prefers it.
+
+A tap is worth more than convenience here - a reaction carries a user id and
+nothing else, so it works whether or not the Message Content intent is on,
+and it cannot be forged by anyone who is not that person.
+
+Enrolment can be private, but approving is not: it happens in the channel,
+where everyone can see it. DMs to the bot are ignored for approvals on
 purpose.
 
 **Why this is stronger than email.** An email approval is matched on a `From:`

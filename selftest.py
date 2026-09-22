@@ -446,6 +446,81 @@ check("a stranger in the channel cannot approve",
 _human_ok = [{"id": "9", "content": "hello", "author": {"id": "111", "bot": False}}]
 _human_blank = [{"id": "9", "content": "", "author": {"id": "111", "bot": False}}]
 _bots_only = [{"id": "9", "content": "alert", "author": {"id": "5", "bot": True}}]
+class ButtonDiscord(FakeDiscord):
+    """A channel where people tap rather than type."""
+
+    def __init__(self, cfg, ticks=(), crosses=()):
+        super().__init__(cfg)
+        self.ticks, self.crosses = set(ticks), set(crosses)
+        self.reacted = []
+
+    def _call(self, method, path, body=None, timeout=25, retries=1):
+        if method == "PUT" and "/reactions/" in path:
+            self.reacted.append(path)
+            return {}
+        if method == "GET" and "/reactions/" in path:
+            import urllib.parse as _u
+            emoji = _u.unquote(path.split("/reactions/")[1].split("?")[0])
+            who = self.ticks if emoji == pb.TICK else self.crosses
+            return [{"id": u} for u in sorted(who)]
+        if method == "POST":
+            self.sent.append((path, body))
+            return {"id": "555000111222333444"}
+        return super()._call(method, path, body, timeout, retries)
+
+
+def _pending(token="ABCD1234", **extra):
+    st_ = pb.deep_merge(pb.DEFAULT_STATE, {})
+    st_["mode"] = "PENDING"
+    st_["request"] = dict({"token": token, "requested_at": pb.now() - 60,
+                           "eligible_at": pb.now() + 60, "approvals": {},
+                           "denials": {}}, **extra)
+    return st_
+
+
+# the posting path renders the whole request, so it needs a whole config
+dfull = pb.deep_merge(pb.DEFAULT_CONFIG, dict(dcfg, owner_name="Bill",
+                                              approvals_required=2))
+dfull["_secrets"] = {}
+
+_st_post = _pending()
+_poster = ButtonDiscord(dfull)
+_real3 = pb.DiscordCourier
+pb.DiscordCourier = lambda _cfg: _poster
+check("the request is posted and gets its buttons",
+      pb.ensure_request_posted(dfull, _st_post)
+      and _st_post["request"]["message_id"] == "555000111222333444"
+      and len(_poster.reacted) == 2)
+check("the tick goes on first", pb.TICK in
+      __import__("urllib.parse", fromlist=["x"]).unquote(_poster.reacted[0]))
+_before = len(_poster.sent)
+check("posting it twice does not happen",
+      pb.ensure_request_posted(dfull, _st_post) and len(_poster.sent) == _before)
+pb.DiscordCourier = _real3
+
+_st_tap = _pending(message_id="555")
+_req = _st_tap["request"]
+_ev = pb.poll_reactions(dcfg, _st_tap, ButtonDiscord(dcfg, ticks=["111111111111111111"]), _req)
+check("one tap is one approval", _ev == [("approve", "111111111111111111")]
+      and "111111111111111111" in _req["approvals"])
+_ev = pb.poll_reactions(dcfg, _st_tap, ButtonDiscord(dcfg, ticks=["111111111111111111"]), _req)
+check("the same tap is not counted twice", _ev == [])
+_ev = pb.poll_reactions(dcfg, _st_tap, ButtonDiscord(dcfg), _req)
+check("taking the tick back takes the approval back",
+      _ev == [("unapprove", "111111111111111111")]
+      and "111111111111111111" not in _req["approvals"])
+_ev = pb.poll_reactions(dcfg, _pending(message_id="555"),
+                        ButtonDiscord(dcfg, ticks=["444444444444444444"]),
+                        {"message_id": "555", "approvals": {}, "denials": {}})
+check("a stranger tapping it does nothing", _ev == [])
+_st_no = _pending(message_id="555")
+_ev = pb.poll_reactions(dcfg, _st_no, ButtonDiscord(dcfg, crosses=["222222222222222222"]),
+                        _st_no["request"])
+check("the cross is a refusal", _ev == [("deny", "222222222222222222")])
+check("and a request with no message has no buttons to read",
+      pb.poll_reactions(dcfg, _pending(), ButtonDiscord(dcfg),
+                        {"approvals": {}}) == [])
+
 # when the bot is deaf it should say so where the people who can fix it are
 st_blind = pb.deep_merge(pb.DEFAULT_STATE, {})
 st_blind["mode"] = "PENDING"
@@ -498,9 +573,9 @@ check("the application id is read out of the token itself",
 check("junk in that field yields nothing rather than a broken link",
       pb.app_id_from_token("not-a-token") == ""
       and pb.app_id_from_token("") == "")
-check("the invite link asks for exactly three permissions",
-      pb.invite_url(_tok).endswith("scope=bot&permissions=68608")
-      and pb.DISCORD_PERMS == (1 << 10) | (1 << 11) | (1 << 16))
+check("the invite link asks for exactly four permissions",
+      pb.invite_url(_tok).endswith("scope=bot&permissions=68672")
+      and pb.DISCORD_PERMS == (1 << 10) | (1 << 11) | (1 << 16) | (1 << 6))
 check("and points at the right application",
       "client_id=123456789012345678" in pb.invite_url(_tok))
 check("the settings link goes straight to that bot's page",

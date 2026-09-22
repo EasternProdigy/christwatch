@@ -183,8 +183,23 @@ def run(app):
         check("token and channel accepted", sv.validate(2) is None, sv.validate(2))
         check("nobody is an approver until they check in",
               "check in" in (sv.validate(3) or ""))
-        sv.add_discord_person("111111111111111111", "marcus")
-        sv.add_discord_person("222222222222222222", "james")
+        check("there are two ways to ask them",
+              sv.b_checkin.get_sensitive() and sv.b_private.get_sensitive())
+        fresh = sv.apply_checkin({"members": [
+            {"id": "111111111111111111", "name": "marcus"},
+            {"id": "222222222222222222", "name": "james"}]})
+        check("whoever checks in becomes an approver", fresh == 2
+              and sv.approvers() == ["111111111111111111", "222222222222222222"])
+        check("the same person checking in twice is not added twice",
+              sv.apply_checkin({"members": [
+                  {"id": "111111111111111111", "name": "marcus"}]}) == 0)
+        sv.apply_checkin({"members": [], "failed": {
+            "333": "cannot send them a direct message"}})
+        check("someone with their DMs shut is explained, not swallowed",
+              "direct message" in sv.l_checkin.get_label())
+        sv.apply_checkin({"error": "the bot token was rejected"})
+        check("and an outright failure is shown as one",
+              "rejected" in sv.l_checkin.get_label())
         check("checked-in friends become the approvers",
               sv.approvers() == ["111111111111111111", "222222222222222222"])
         check("and their names are kept for the emails and the app",
