@@ -53,7 +53,7 @@ import urllib.request
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-VERSION = "1.7.1"
+VERSION = "1.7.2"
 HOMEPAGE = "https://github.com/EasternProdigy/christwatch"
 PROG = "pornblock"
 
@@ -80,6 +80,7 @@ CONFIG_PATH = ETC_DIR + "/config.json"
 RECORD_PATH = ETC_DIR + "/install-record.json"
 SECRETS_PATH = ETC_DIR + "/secrets.json"
 NFT_CONF_PATH = ETC_DIR + "/nftables.conf"
+JOURNAL_DROPIN = "/etc/systemd/journald.conf.d/90-pornblock.conf"
 
 STATE_DIR = "/var/lib/pornblock"
 STATE_PATH = STATE_DIR + "/state.json"
@@ -259,6 +260,9 @@ DEFAULT_CONFIG = {
         # until the branch head actually moves.
         "check_minutes": 15,
         "auto_apply": True,
+        # Apply by itself only when VERSION actually went up. Every commit
+        # on the branch would otherwise ship to every machine as root.
+        "auto_needs_version_bump": True,
         "require_unlock": False,
     },
     # What gets recorded once the blocker is active. The daily digest goes
@@ -270,6 +274,10 @@ DEFAULT_CONFIG = {
         "apps": True,
         "dns_log": True,
         "keep_days": 90,
+        # dns_log makes systemd-resolved log every lookup, which is how the
+        # domain list is built. It is chatty enough to be worth bounding.
+        # 0 leaves your journal settings alone.
+        "journal_cap_mb": 512,
         "digest_enabled": True,
         "digest_hour": 20,
         "top_n": 15,
@@ -2678,6 +2686,7 @@ def enforce_all(cfg: dict, st: dict, apply: bool, quiet: bool = False) -> list:
         if enf.get("firefox_policy", True) or enf.get("chromium_policy", True):
             changes += enforce_browsers(cfg, st, apply)
         changes += enforce_dns_logging(cfg, apply)
+        changes += enforce_journal_cap(cfg, apply)
     except Exception as exc:                                  # never crash-loop
         log("enforcement error: %r" % exc)
         changes.append("ERROR during enforcement: %r" % exc)
@@ -3854,6 +3863,50 @@ def enforce_dns_logging(cfg: dict, apply: bool) -> list:
     if not res.ok:
         return []
     return ["systemd-resolved logging set to %s (domain tracking)" % want]
+
+
+def journal_cap_body(mb: int) -> str:
+    return (
+        "# Written by %s.\n"
+        "#\n"
+        "# Tracking which domains get looked up means asking systemd-resolved\n"
+        "# to log at debug level, and it is chatty: tens of thousands of lines\n"
+        "# an hour on a machine in normal use. Without a cap that lands in the\n"
+        "# journal's default budget of a tenth of the disk.\n"
+        "#\n"
+        "# This bounds it. Set tracking.journal_cap_mb to 0 to leave your\n"
+        "# journal settings alone, or turn tracking.dns_log off to stop the\n"
+        "# logging at source.\n"
+        "[Journal]\n"
+        "SystemMaxUse=%dM\n" % (PROG, mb))
+
+
+def enforce_journal_cap(cfg: dict, apply: bool) -> list:
+    """
+    Bound the cost of our own logging.
+
+    This is the one thing here that touches a setting outside the blocker's
+    own territory, and only because the blocker is what caused the cost. It
+    is a drop-in of our own, named after us, removed when we are.
+    """
+    if SANDBOX and not PREFIX:
+        return []
+    trk = cfg.get("tracking") or {}
+    mb = int(trk.get("journal_cap_mb") or 0)
+    want = bool(apply and trk.get("enabled", True)
+                and trk.get("dns_log", True) and mb > 0)
+    if not want:
+        return ["journal cap removed"] if remove_managed(JOURNAL_DROPIN) else []
+    what = write_managed(JOURNAL_DROPIN, journal_cap_body(mb), mode=0o644,
+                         immutable=False, backup=False)
+    if what == "unchanged":
+        return []
+    if not SANDBOX:
+        # The cap applies from journald's next start; the vacuum makes it
+        # true now as well, so turning this on actually gives the disk back.
+        systemctl("restart", "systemd-journald")
+        run(["journalctl", "--vacuum-size=%dM" % mb], timeout=120)
+    return ["journal capped at %d MB (we are what makes it chatty)" % mb]
 
 
 def read_nft_counters() -> dict:
@@ -5809,6 +5862,7 @@ def cmd_uninstall(args) -> int:
     systemctl("daemon-reload")
 
     remove_harden()
+    remove_managed(JOURNAL_DROPIN)
     for path in (RESOLVED_DROPIN, NM_DROPIN, FIREFOX_POLICY, CHROMIUM_POLICY,
                  CHROME_POLICY, NFT_CONF_PATH, RECORD_PATH, CONFIG_PATH,
                  SECRETS_PATH, SELF_COPY, GUI_SELF_COPY, BIN_PATH,
@@ -6009,6 +6063,20 @@ def remote_head_sha(cfg: dict) -> str:
     if not r.ok or not r.out.strip():
         return ""
     return r.out.split()[0].strip()
+
+
+def version_tuple(v: str) -> tuple:
+    """
+    (1, 7, 1) out of "1.7.1", for deciding which of two releases is newer.
+
+    Anything unparseable sorts lowest, so a candidate that cannot say what
+    version it is never wins a comparison against one that can.
+    """
+    out = []
+    for part in str(v or "").split("."):
+        digits = "".join(c for c in part if c.isdigit())
+        out.append(int(digits) if digits else 0)
+    return tuple(out) or (0,)
 
 
 def update_interval_seconds(cfg: dict) -> float:
@@ -6326,6 +6394,17 @@ def maybe_update(cfg: dict, st: dict) -> None:
         if avail:
             log("update %s is available; waiting to be applied by hand"
                 % avail.get("version"))
+        return
+    # Installing by itself is for releases, not for every commit that lands
+    # on the branch. Without this, work in progress that happens to pass the
+    # self-test goes out to every machine tracking the repo, as root, within
+    # the poll interval. Bumping VERSION is the deliberate act that says
+    # "this one is meant for people".
+    if up.get("auto_needs_version_bump", True) and \
+            version_tuple(avail.get("version")) <= version_tuple(VERSION):
+        log("%s is on the branch but its version is not newer than %s; "
+            "not applying it by itself - run 'update' to take it anyway"
+            % (avail.get("version"), VERSION))
         return
     unl = st.get("unlock") or {}
     if up.get("require_unlock") and not (st.get("mode") == "UNLOCKED" and

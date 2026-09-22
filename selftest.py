@@ -1420,6 +1420,56 @@ check("a candidate that fails its own self-test is refused",
 check("auto-apply does not skip the self-test",
       "auto_apply" not in VS)
 
+print("\n== releases, not every commit ==")
+
+check("a newer version wins", pb.version_tuple("1.8.0") > pb.version_tuple("1.7.1"))
+check("double digits are numbers, not text",
+      pb.version_tuple("1.10.0") > pb.version_tuple("1.9.9"))
+check("the same version is not newer",
+      not (pb.version_tuple("1.7.1") > pb.version_tuple("1.7.1")))
+check("a candidate that cannot say its version never wins",
+      pb.version_tuple("") < pb.version_tuple("0.0.1"))
+
+SRC = open(os.path.join(HERE, "pornblock.py"), encoding="utf-8").read()
+MU = SRC[SRC.index("def maybe_update"):SRC.index("def cmd_update_source")]
+check("applying by itself is gated on the version going up",
+      "auto_needs_version_bump" in MU and "version_tuple" in MU)
+check("and taking it by hand is still allowed",
+      "run 'update' to take it anyway" in MU)
+check("the gate is on by default",
+      pb.DEFAULT_CONFIG["updates"]["auto_needs_version_bump"] is True)
+
+print("\n== the cost of our own logging ==")
+
+JCFG = pb.deep_merge(base_cfg(), {"tracking": {"dns_log": True,
+                                               "journal_cap_mb": 256}})
+pb.enforce_journal_cap(JCFG, True)
+check("tracking domains caps the journal",
+      os.path.exists(pb.P(pb.JOURNAL_DROPIN)))
+BODY = open(pb.P(pb.JOURNAL_DROPIN), encoding="utf-8").read()
+check("the cap is the number asked for", "SystemMaxUse=256M" in BODY)
+check("it says whose fault the logging is and how to stop it",
+      "dns_log" in BODY and "journal_cap_mb" in BODY)
+check("writing it twice changes nothing",
+      pb.enforce_journal_cap(JCFG, True) == [])
+
+NOLOG = pb.deep_merge(base_cfg(), {"tracking": {"dns_log": False,
+                                                "journal_cap_mb": 256}})
+pb.enforce_journal_cap(NOLOG, True)
+check("no debug logging, no reason to touch your journal",
+      not os.path.exists(pb.P(pb.JOURNAL_DROPIN)))
+
+OPTOUT = pb.deep_merge(base_cfg(), {"tracking": {"dns_log": True,
+                                                 "journal_cap_mb": 0}})
+pb.enforce_journal_cap(OPTOUT, True)
+check("zero means leave my journal alone",
+      not os.path.exists(pb.P(pb.JOURNAL_DROPIN)))
+
+pb.enforce_journal_cap(JCFG, True)
+pb.enforce_journal_cap(JCFG, False)
+check("lifting enforcement lifts the cap too",
+      not os.path.exists(pb.P(pb.JOURNAL_DROPIN)))
+
 print("\n== packaging (skipped when not shipped in the tarball) ==")
 
 def _present(name):

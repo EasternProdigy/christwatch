@@ -646,12 +646,20 @@ decides nothing about where code comes from - only whether you are asked
 first. Where it comes from is pinned, and repointing it needs a granted
 unlock.
 
-**If you turn auto-apply on, `main` is a release channel.** Every commit
-that lands there runs as root on every machine tracking it, within about
-fifteen minutes. It has to pass the project's own self-test in a sandbox
-first, keep your arrangement intact, and start cleanly or it is rolled
-back - but half-finished work that happens to pass the tests will still
-ship. Do the work on a branch and fast-forward `main` when it is released.
+**Applying by itself only happens on a version bump.** A candidate whose
+`VERSION` is not higher than the installed one is reported but not
+installed, however green it is - so work in progress on the branch does not
+go out to everybody as root just because it passed the tests. Bumping
+`VERSION` is the deliberate act that says this one is meant for people.
+
+```bash
+sudo pornblock update     # takes it anyway, bump or no bump
+```
+
+Set `updates.auto_needs_version_bump: false` if you really do want every
+commit. On top of that, a candidate still has to compile, declare a version,
+pass the project's own self-test in a sandbox, keep your arrangement intact
+and start cleanly - or it is rolled back and your approvers are told.
 
 Set `auto_apply: false` if you would rather approve each one; the app then
 shows a banner with an **Install** button instead.
@@ -878,6 +886,7 @@ Short version: nothing you will feel. Longer version, from a real machine:
 | nftables lockdown | 15 rules on the output hook, unmeasurable |
 | `/etc/hosts` with the 70k list | ~5 ms of parsing on **every** lookup, because glibc re-reads the whole 2 MB file each time |
 | `/etc/hosts` without it | 4 KB, nothing to speak of |
+| Domain tracking | systemd-resolved at debug level: ~28,000 journal lines an hour on a machine in use, which is why `tracking.journal_cap_mb` bounds the journal at 512 MB |
 | Private DNS on the phone | no extra hop - it replaces the resolver rather than sitting in front of one, and it is encrypted either way |
 | The phone app | one HTTPS post a day, one setting read an hour, no VPN slot and no always-on service |
 
