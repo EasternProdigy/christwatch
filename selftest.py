@@ -1469,6 +1469,305 @@ pb.enforce_journal_cap(JCFG, True)
 pb.enforce_journal_cap(JCFG, False)
 check("lifting enforcement lifts the cap too",
       not os.path.exists(pb.P(pb.JOURNAL_DROPIN)))
+print("\n== saying it while it still matters ==")
+
+check("ordinals read like a person wrote them",
+      [pb.ordinal(n) for n in (1, 2, 3, 4, 11, 12, 13, 21, 101)]
+      == ["1st", "2nd", "3rd", "4th", "11th", "12th", "13th", "21st", "101st"])
+
+LIVE_CFG = pb.deep_merge(pb.DEFAULT_CONFIG, {
+    "owner_name": "Will", "transport": "discord",
+    "approvers": ["111111111111111111"],
+    "discord": {"channel_id": "999999999999999999", "bot_token": "tok"},
+})
+
+
+class SpyCourier:
+    """Catches what alert() would have posted, and posts nothing."""
+
+    NAME = "discord"
+
+    def __init__(self):
+        self.sent = []
+
+    def send(self, st, to, subject, text, html=None, queue_on_fail=True):
+        self.sent.append((subject, text))
+        return True
+
+    def flush_outbox(self, st):
+        pass
+
+
+def live_run(cfg, hits, st=None, gap_ago=9999):
+    """One round of: these were looked up, this is what the channel got."""
+    st = st if st is not None else pb.deep_merge(pb.DEFAULT_STATE, {})
+    st["activity"]["last_live_alert"] = pb.now() - gap_ago
+    spy = SpyCourier()
+    real, pb.courier = pb.courier, lambda _c: spy
+    try:
+        pb.note_blocked_lookups(cfg, st, hits)
+        moves = pb.flush_blocked_alerts(cfg, st, spy)
+    finally:
+        pb.courier = real
+    return st, spy, moves
+
+
+_st, _spy, _moves = live_run(LIVE_CFG, {"badsite.example": 3, "other.example": 1})
+check("a blocked lookup is said in the channel straight away", len(_spy.sent) == 1)
+check("the message names the site",
+      "badsite.example" in _spy.sent[0][1] and "other.example" in _spy.sent[0][1])
+check("and says how many times today, in words",
+      "3rd time today" in _spy.sent[0][1])
+check("the subject counts them", "2 blocked sites" in _spy.sent[0][0])
+check("it says they did not load", "Refused by the resolver" in _spy.sent[0][1])
+
+# The same site again, in the same hour, is not a second message: somebody
+# has already been told, which was the entire object of the exercise.
+pb.note_blocked_lookups(LIVE_CFG, _st, {"badsite.example": 4})
+check("the same site is not said twice within the hour",
+      not _st["activity"]["blocked_queue"])
+
+# ...but a site nobody has heard about yet still gets through.
+pb.note_blocked_lookups(LIVE_CFG, _st, {"fresh.example": 1})
+check("a site not yet mentioned is still queued",
+      list(_st["activity"]["blocked_queue"]) == ["fresh.example"])
+check("but not posted until the gap has passed",
+      pb.flush_blocked_alerts(LIVE_CFG, _st, _spy) == [])
+
+_QUIET = pb.deep_merge(LIVE_CFG, {"tracking": {"live_alert_names": False}})
+_, _spy2, _ = live_run(_QUIET, {"badsite.example": 2, "other.example": 1})
+check("naming the site can be switched off",
+      "badsite.example" not in _spy2.sent[0][1]
+      and "2 blocked sites were" in _spy2.sent[0][1])
+
+_OFF = pb.deep_merge(LIVE_CFG, {"tracking": {"live_alerts": False}})
+_, _spy3, _ = live_run(_OFF, {"badsite.example": 1})
+check("the whole thing can be switched off", not _spy3.sent)
+
+_unl = pb.deep_merge(pb.DEFAULT_STATE, {"mode": "UNLOCKED"})
+_, _spy4, _ = live_run(LIVE_CFG, {"badsite.example": 1}, st=_unl)
+check("an approved unlock is not shouted through", not _spy4.sent)
+check("and the queue is not left to burst out afterwards",
+      not _unl["activity"]["blocked_queue"])
+
+_MANY = pb.deep_merge(pb.DEFAULT_STATE, {})
+pb.note_blocked_lookups(LIVE_CFG, _MANY,
+                        dict(("d%d.example" % i, 1) for i in range(500)))
+check("one machine cannot queue an unbounded pile",
+      len(_MANY["activity"]["blocked_queue"]) <= 200)
+
+_, _spy5, _ = live_run(LIVE_CFG, dict(("d%d.example" % i, i + 1)
+                                      for i in range(40)))
+check("a bad afternoon is one message, not forty", len(_spy5.sent) == 1)
+check("and it names a handful, then counts the rest",
+      "...and" in _spy5.sent[0][1]
+      and _spy5.sent[0][1].count(" time today") <= 8)
+
+# harvest_dns is where the blocked sites are actually spotted, so give it a
+# journal to read and check it picks the blocked one out of ordinary traffic.
+JOURNAL = ("Looking up RR for news.example.com IN A.\n"
+           "Looking up RR for badsite.example IN AAAA.\n"
+           "Looking up RR for cdn.badsite.example IN A.\n"
+           "Looking up RR for 1.0.168.192.in-addr.arpa IN PTR.\n"
+           "-- cursor: abc123\n")
+_doc = {"day": "x", "domains": {}, "blocked": {}}
+_hits = {}
+_realrun, pb.run = pb.run, lambda *a, **k: pb.Result(0, JOURNAL)
+try:
+    _seen = pb.harvest_dns(LIVE_CFG, pb.deep_merge(pb.DEFAULT_STATE, {}),
+                           _doc, _hits)
+finally:
+    pb.run = _realrun
+check("every lookup is counted", _seen == 3 and _doc["domains"]["news.example.com"] == 1)
+check("reverse lookups are not", "1.0.168.192.in-addr.arpa" not in _doc["domains"])
+check("the blocked ones are picked out of ordinary traffic",
+      set(_hits) == {"badsite.example", "cdn.badsite.example"})
+check("and handed over with how many times today", _hits["badsite.example"] == 1)
+
+print("\n== several of you, one server ==")
+
+GRP_CFG = pb.deep_merge(pb.DEFAULT_CONFIG, {
+    "owner_name": "Will", "transport": "discord",
+    "approvers": ["111111111111111111", "222222222222222222"],
+    "discord": {"channel_id": "999999999999999999", "bot_token": "tok"},
+    "group": {"enabled": True, "name": "the lads",
+              "lobby_channel_id": "555555555555555555",
+              "member_id": "111111111111111111", "member_name": "Will"},
+})
+ME = "111111111111111111"
+SAM, JORDAN = "222222222222222222", "333333333333333333"
+
+
+class Lobby(pb.DiscordCourier):
+    """The shared channel, with whatever has been posted in it so far."""
+
+    def __init__(self, cfg, messages=()):
+        super().__init__(cfg)
+        self.messages = list(messages)
+        self.posted = []
+
+    def _call(self, method, path, body=None, timeout=25, retries=1):
+        if method == "POST":
+            self.posted.append((path, (body or {}).get("content", "")))
+            return {"id": "1"}
+        if "/messages?" in path:
+            return list(self.messages)
+        return {}
+
+
+def beat_msg(mid, name, mode="LOCKED", ago=0, author="bot1", **extra):
+    body = dict({"v": 1, "m": mid, "n": name, "h": name.lower() + "-box",
+                 "s": mode, "at": int(pb.now() - ago), "ver": pb.VERSION},
+                **extra)
+    return {"id": str(900 + abs(hash(mid + mode)) % 90),
+            "author": {"id": author, "bot": True},
+            "content": "`" + pb.GROUP_MARKER
+                       + json.dumps(body, separators=(",", ":")) + "`"}
+
+
+check("a group needs a lobby and a name to post under", pb.group_on(GRP_CFG))
+check("...and is off without one",
+      not pb.group_on(pb.deep_merge(GRP_CFG, {"group": {"lobby_channel_id": ""}})))
+check("a group over email is refused",
+      any("Discord" in e for e in pb.validate_group(
+          pb.deep_merge(GRP_CFG, {"transport": "email"}))))
+check("one missed heartbeat must not make somebody a quitter",
+      any("two heartbeats" in e for e in pb.validate_group(
+          pb.deep_merge(GRP_CFG, {"group": {"silence_hours": 0.5}}))))
+check("a sound group passes", pb.validate_group(GRP_CFG) == [])
+
+ST = pb.deep_merge(pb.DEFAULT_STATE, {})
+LOB = Lobby(GRP_CFG)
+check("this machine posts a line saying it is still here",
+      pb.post_group_beat(GRP_CFG, ST, LOB, force=True))
+_line = LOB.posted[0][1]
+check("that line is machine-readable", pb.GROUP_MARKER in _line)
+check("and it goes to the lobby, not to your own channel",
+      "555555555555555555" in LOB.posted[0][0])
+_body = json.loads(_line.strip("`")[len(pb.GROUP_MARKER):])
+check("it carries who and what state", _body["m"] == ME and _body["s"] == "LOCKED")
+check("it does not carry what you looked up",
+      not any(k in _body for k in ("domains", "apps", "blocked_domains")))
+
+# Reading the others.
+ST2 = pb.deep_merge(pb.DEFAULT_STATE, {})
+LOB2 = Lobby(GRP_CFG, [beat_msg(ME, "Will"),
+                       beat_msg(SAM, "Sam", "PENDING", a=1, r=2, b=7),
+                       beat_msg(JORDAN, "Jordan", ago=30 * 3600)])
+pb.read_group_beats(GRP_CFG, ST2, LOB2)
+_mem = ST2["group"]["members"]
+check("everybody else's line is taken in", set(_mem) == {SAM, JORDAN})
+check("our own line tells us nothing and is ignored", ME not in _mem)
+check("a member's state is read off their line",
+      _mem[SAM]["mode"] == "PENDING" and _mem[SAM]["approvals"] == 1
+      and _mem[SAM]["blocked"] == 7)
+check("meeting somebody for the first time is not an event",
+      not _mem[SAM].get("quiet"))
+
+_silence = pb.group_silence(GRP_CFG, ST2, LOB2)
+check("a machine that stopped posting is noticed",
+      _silence == ["Jordan: gone quiet"])
+check("and said out loud, by name, in the lobby",
+      any("Jordan has gone quiet" in c for _p, c in LOB2.posted))
+check("but only once", pb.group_silence(GRP_CFG, ST2, LOB2) == [])
+
+# Five machines watching one lobby must not all shout at once.
+check("the lowest member still being heard from does the talking",
+      pb.group_speaker(GRP_CFG, ST2) == ME)
+_NOT_ME = pb.deep_merge(GRP_CFG, {"group": {"member_id": "999999999999999999"}})
+_ST3 = pb.deep_merge(pb.DEFAULT_STATE, {})
+_L3 = Lobby(_NOT_ME, [beat_msg(SAM, "Sam"), beat_msg(JORDAN, "Jordan", ago=30 * 3600)])
+pb.read_group_beats(_NOT_ME, _ST3, _L3)
+check("a machine that is not the speaker stays quiet",
+      pb.group_speaker(_NOT_ME, _ST3) == SAM
+      and pb.group_silence(_NOT_ME, _ST3, _L3) == ["Jordan: gone quiet"]
+      and not any("gone quiet" in c for _p, c in _L3.posted))
+
+# Leaving openly is not the same as walking out.
+_ST4 = pb.deep_merge(pb.DEFAULT_STATE, {})
+_L4 = Lobby(GRP_CFG, [beat_msg(SAM, "Sam")])
+pb.read_group_beats(GRP_CFG, _ST4, _L4)
+_L4.messages = [beat_msg(SAM, "Sam", "LEFT")]
+_L4gone = pb.read_group_beats(GRP_CFG, _ST4, _L4)
+check("a member who leaves openly comes off the roster",
+      _L4gone == ["Sam: left the group"] and not _ST4["group"]["members"])
+check("so nobody calls them a quitter twelve hours later",
+      pb.group_silence(GRP_CFG, _ST4, _L4) == [])
+
+# A line arriving from somewhere new is worth saying out loud.
+_ST5 = pb.deep_merge(pb.DEFAULT_STATE, {})
+_L5 = Lobby(GRP_CFG, [beat_msg(SAM, "Sam", author="botA")])
+pb.read_group_beats(GRP_CFG, _ST5, _L5)
+_L5.messages = [beat_msg(SAM, "Sam", author="botB")]
+_spyg = SpyCourier()
+_realg, pb.courier = pb.courier, lambda _c: _spyg
+try:
+    _moved = pb.read_group_beats(GRP_CFG, _ST5, _L5)
+finally:
+    pb.courier = _realg
+check("a member's line changing hands is noticed",
+      _ST5["group"]["members"][SAM].get("impostor") is True and _moved)
+check("and somebody is told about it",
+      any("changed hands" in s for s, _t in _spyg.sent))
+
+# You cannot buy yourself silence by claiming to be in the future.
+_ST6 = pb.deep_merge(pb.DEFAULT_STATE, {})
+_L6 = Lobby(GRP_CFG, [beat_msg(SAM, "Sam", ago=-86400 * 7)])
+pb.read_group_beats(GRP_CFG, _ST6, _L6)
+check("a line from the future is clamped to now",
+      _ST6["group"]["members"][SAM]["last_seen"] <= pb.now() + 1)
+
+_BOARD = pb.group_board(GRP_CFG, ST2)
+check("the board names the group", "the lads" in _BOARD)
+check("it marks the one to ask about", "!!" in _BOARD and "Jordan" in _BOARD)
+check("it says which row is you", "(you)" in _BOARD)
+check("and it does not list what anybody looked up",
+      "badsite.example" not in _BOARD)
+
+check("the roster is part of your setup, not of the program",
+      "group_lobby" in pb.ARRANGEMENT_KEYS)
+_before = pb.arrangement({"group_lobby": "555555555555555555"})
+_after = pb.arrangement({"group_lobby": ""})
+check("an update that quietly left the group would be refused",
+      bool(pb.arrangement_diff(_before, _after)))
+
+check("the record pins which lobby this machine answers to",
+      pb.record_from_config(GRP_CFG)["group_lobby"] == "555555555555555555")
+
+# Editing yourself out of the group by hand is a loosening like any other.
+_GONE = pb.deep_merge(GRP_CFG, {"group": {"enabled": False}})
+_rec = pb.record_from_config(GRP_CFG)
+pb.save_record(_rec)
+_spy6 = SpyCourier()
+_real6, pb.courier = pb.courier, lambda _c: _spy6
+try:
+    _fixed, _notes = pb.reconcile_record(_GONE, pb.deep_merge(pb.DEFAULT_STATE, {}))
+finally:
+    pb.courier = _real6
+check("taking this machine out of the group by hand is put back",
+      pb.group_on(_fixed) and any("taken out of the group" in n for n in _notes))
+check("and the notes say how to leave for real",
+      any("group --leave" in n for n in _notes))
+
+_spy7 = SpyCourier()
+_real7, pb.courier = pb.courier, lambda _c: _spy7
+try:
+    pb.alert(GRP_CFG, pb.deep_merge(pb.DEFAULT_STATE, {}), "k",
+             "Something happened", "body\n", force=True)
+finally:
+    pb.courier = _real7
+check("in a group, every post says whose machine is talking",
+      bool(_spy7.sent) and "Will" in _spy7.sent[0][0],
+      repr(_spy7.sent[:1]))
+_spy8 = SpyCourier()
+_real8, pb.courier = pb.courier, lambda _c: _spy8
+try:
+    pb.alert(LIVE_CFG, pb.deep_merge(pb.DEFAULT_STATE, {}), "k",
+             "Something happened", "body\n", force=True)
+finally:
+    pb.courier = _real8
+check("...and on your own, it does not start doing that",
+      bool(_spy8.sent) and "Will" not in _spy8.sent[0][0])
 
 print("\n== packaging (skipped when not shipped in the tarball) ==")
 

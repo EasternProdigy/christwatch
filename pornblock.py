@@ -53,7 +53,7 @@ import urllib.request
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-VERSION = "1.7.2"
+VERSION = "1.8.0"
 HOMEPAGE = "https://github.com/EasternProdigy/christwatch"
 PROG = "pornblock"
 
@@ -233,6 +233,25 @@ DEFAULT_CONFIG = {
         "enabled": False,
         "watch_grub": True,
     },
+    # Several of you, one Discord server. Each machine still enforces on its
+    # own and still answers to its own approvers in its own channel; this
+    # only adds one shared channel that every machine posts a short line to
+    # on a timer, so that a machine which stops running the blocker stops
+    # posting, and is seen to stop. Off until you are actually in a group.
+    "group": {
+        "enabled": False,
+        "name": "",                  # what you call yourselves
+        "lobby_channel_id": "",      # the shared channel everyone can see
+        "member_id": "",             # your own Discord user id
+        "member_name": "",           # how the roster should name you
+        "heartbeat_minutes": 30,
+        # Deliberately shorter than the phones' 36h: a laptop that is on at
+        # all posts every half hour, so half a day of nothing is already a
+        # long time to have heard nothing.
+        "silence_hours": 12.0,
+        "announce_silence": True,
+        "share_counts": True,        # put today's blocked count in the line
+    },
     "approvals_required": 2,
     "cooloff_hours": 24.0,
     "unlock_minutes": 60,
@@ -281,6 +300,23 @@ DEFAULT_CONFIG = {
         "digest_enabled": True,
         "digest_hour": 20,
         "top_n": 15,
+        # Say it in the channel as it happens, not only in the nightly
+        # report. The report already lists every one of these - but twelve
+        # hours later is not a moment when anybody can do anything, and the
+        # whole point of this program is that somebody finds out while it
+        # still matters.
+        "live_alerts": True,
+        "live_alert_names": True,          # name the site, not just the count
+        "live_alert_ping": False,          # ...but do not buzz phones for it
+        # An unlock was approved by the group, so shouting through it is
+        # noise. The nightly report still has every line of it.
+        "live_alert_when_unlocked": False,
+        # One page load fires a dozen lookups and one stubborn afternoon
+        # fires hundreds. These three are what keep a bad hour down to a
+        # handful of messages people will actually still be reading.
+        "live_alert_gap_seconds": 120,     # never two posts closer than this
+        "live_alert_repeat_minutes": 60,   # same site, said again after this
+        "live_alert_max_domains": 8,       # names per post; the rest counted
     },
     "blocklist_url": BLOCKLIST_URL,
     "blocklist_refresh_hours": 24,
@@ -340,8 +376,13 @@ DEFAULT_STATE = {
     "update": {"last_check": 0, "installed_sha": "", "available": None,
                "last_applied": 0, "last_error": "", "last_remote_sha": "",
                "rolled_back": ""},
-    "activity": {"journal_cursor": "", "last_sample": 0, "last_digest_day": ""},
+    "activity": {"journal_cursor": "", "last_sample": 0, "last_digest_day": "",
+                 # blocked sites waiting to be said, and when each was last
+                 # said, so a stubborn afternoon is not a stream of posts
+                 "blocked_queue": {}, "blocked_said": {}, "last_live_alert": 0},
     "alerts": {},
+    # member id -> what their last line in the lobby said
+    "group": {"members": {}, "cursor": 0, "last_beat": 0},
     # id -> {"last_seen", "state", "dns", "profile", "silent"}
     "phones": {},
     "phone_cursor": 0,
@@ -761,6 +802,8 @@ def record_from_config(cfg: dict) -> dict:
         "filter": cfg["filter"],
         "transport": (cfg.get("transport") or "email").lower(),
         "discord_channel": str((cfg.get("discord") or {}).get("channel_id") or ""),
+        "group_lobby": group_lobby(cfg) if group_on(cfg) else "",
+        "group_member": group_me(cfg) if group_on(cfg) else "",
         "update_repo": (cfg.get("updates") or {}).get("repo", ""),
         "update_branch": (cfg.get("updates") or {}).get("branch", "main"),
         "update_require_unlock": bool((cfg.get("updates") or {}
@@ -1229,9 +1272,15 @@ class DiscordCourier:
 
     # -- outgoing ---------------------------------------------------------
 
-    def post(self, text: str, ping_ids=()) -> str:
-        """Post, and hand back the id of the last message written."""
-        cid = self._channel()
+    def post(self, text: str, ping_ids=(), channel: str = "") -> str:
+        """
+        Post, and hand back the id of the last message written.
+
+        `channel` sends it somewhere other than this machine's own, which is
+        only ever the group lobby - the one shared place several people's
+        machines all report to.
+        """
+        cid = str(channel or "").strip() or self._channel()
         ids = [str(i) for i in ping_ids if str(i).isdigit()]
         chunks = _chunk_text(text)
         last = ""
@@ -1415,6 +1464,52 @@ class DiscordCourier:
             log("could not read phone reports: %s" % exc)
         return out
 
+    def marked(self, cid: str, since_epoch: float, marker: str,
+               pages: int = 5) -> list:
+        """
+        (who posted it, the decoded line, message id) for every marker line
+        in that channel since then.
+
+        The phones' reports and the group's heartbeats are both one tagged
+        JSON line in an otherwise human channel, which is what lets a
+        machine read a channel people are also talking in. Unlike reports()
+        this looks at what bots said too, because in a group the heartbeats
+        are posted by the bot.
+
+        Never raises. A channel we cannot read looks exactly like a group
+        that has gone quiet, and the silence check handles that either way.
+        """
+        out = []
+        if not str(cid or "").strip():
+            return out
+        try:
+            after = snowflake_at(since_epoch)
+            for _page in range(max(1, pages)):
+                msgs = self._call("GET", "/channels/%s/messages?limit=100&after=%d"
+                                  % (cid, after))
+                if not isinstance(msgs, list) or not msgs:
+                    break
+                msgs.sort(key=lambda m: int(m.get("id") or 0))
+                for m in msgs:
+                    with contextlib.suppress(TypeError, ValueError):
+                        after = max(after, int(m.get("id") or 0))
+                    src_id = str((m.get("author") or {}).get("id") or "")
+                    if m.get("webhook_id"):
+                        src_id = "webhook:%s" % m["webhook_id"]
+                    for line in (m.get("content") or "").splitlines():
+                        line = line.strip().strip("`").strip()
+                        if not line.startswith(marker):
+                            continue
+                        with contextlib.suppress(ValueError):
+                            body = json.loads(line[len(marker):])
+                            if isinstance(body, dict):
+                                out.append((src_id, body, str(m.get("id") or "")))
+                if len(msgs) < 100:
+                    break
+        except MailError as exc:
+            log("could not read channel %s: %s" % (cid, exc))
+        return out
+
     def probe(self) -> str:
         me = self._call("GET", "/users/@me")
         ch = self._call("GET", "/channels/%s" % self._channel())
@@ -1506,7 +1601,11 @@ def alert(cfg: dict, st: dict, key: str, subject: str, text: str,
     st.setdefault("alerts", {})[key] = now()
     recipients = to if to is not None else everyone(cfg)
     app = cfg.get("app_name") or PROG
-    prefix = "[%s DEMO] " % app if SANDBOX else "[%s] " % app
+    # In a group the same bot posts for everybody, and several of you may
+    # be sharing one channel. A bare "[ChristWatch]" in front of every line
+    # would make it impossible to tell whose machine is talking.
+    tag = "%s: %s" % (app, group_my_name(cfg)) if group_on(cfg) else app
+    prefix = "[%s DEMO] " % tag if SANDBOX else "[%s] " % tag
     if is_discord(cfg) and not ping:
         recipients = []          # still posted, just nobody's phone buzzes
     return courier(cfg).send(st, recipients, prefix + subject, text, html)
@@ -2833,6 +2932,25 @@ def reconcile_record(cfg: dict, st: dict) -> tuple:
         save_record(rec)
         notes.append("Discord channel recorded as %s" % cfg_ch)
 
+    rec_lobby = str(rec.get("group_lobby") or "")
+    if rec_lobby and not group_on(cfg):
+        # Walking out of the group is walking away from the people watching,
+        # so it is a loosening like any other: it happens during an unlock,
+        # through `pornblock group --leave`, or it does not happen.
+        grp = cfg.setdefault("group", {})
+        grp["enabled"] = True
+        grp["lobby_channel_id"] = rec_lobby
+        grp["member_id"] = grp.get("member_id") or rec.get("group_member") or ""
+        reverted = True
+        notes.append("this machine was taken out of the group; reverted "
+                     "(to leave for real: %s group --leave, during an unlock)"
+                     % PROG)
+    elif not rec_lobby and group_on(cfg):
+        rec["group_lobby"] = group_lobby(cfg)
+        rec["group_member"] = group_me(cfg)
+        save_record(rec)
+        notes.append("group lobby recorded as %s" % group_lobby(cfg))
+
     up = cfg.setdefault("updates", {})
     rec_repo = rec.get("update_repo") or ""
     cfg_repo = (up.get("repo") or "").strip()
@@ -3820,8 +3938,14 @@ _SKIP_DOMAIN = re.compile(
     r"(\.in-addr\.arpa$|\.ip6\.arpa$|\.local$|^_|\.arpa$|^localhost$)", re.I)
 
 
-def harvest_dns(cfg: dict, st: dict, doc: dict) -> int:
-    """Pull new resolved debug lines and count the domains looked up."""
+def harvest_dns(cfg: dict, st: dict, doc: dict, hits: dict | None = None) -> int:
+    """
+    Pull new resolved debug lines and count the domains looked up.
+
+    `hits`, if given, is filled with the blocked sites this pass turned up
+    and how many times each has been asked for today. That is what the
+    channel gets told about while it is still the same afternoon.
+    """
     act = st.setdefault("activity", {})
     args = ["journalctl", "-u", "systemd-resolved", "-o", "cat", "--no-pager",
             "-q", "--show-cursor"]
@@ -3845,6 +3969,8 @@ def harvest_dns(cfg: dict, st: dict, doc: dict) -> int:
         seen += 1
         if is_blocked_domain(domain):
             doc["blocked"][domain] = doc["blocked"].get(domain, 0) + 1
+            if hits is not None:
+                hits[domain] = doc["blocked"][domain]
     return seen
 
 
@@ -3961,7 +4087,9 @@ def sample_activity(cfg: dict, st: dict) -> None:
         for app in running_apps(uid):
             doc["apps"][app] = int(doc["apps"].get(app, 0) + elapsed)
     if trk.get("dns_log", True):
-        harvest_dns(cfg, st, doc)
+        hits = {}
+        harvest_dns(cfg, st, doc, hits)
+        note_blocked_lookups(cfg, st, hits)
     counters = read_nft_counters()
     if counters:
         doc["bypass"] = counters
@@ -3986,6 +4114,107 @@ def prune_activity(cfg: dict) -> None:
         if d < cutoff:
             with contextlib.suppress(OSError):
                 os.unlink(os.path.join(P(ACTIVITY_DIR), name))
+
+
+# --------------------------------------------------------------------------
+# Saying it while it still matters
+# --------------------------------------------------------------------------
+#
+# The nightly report already lists every blocked site that was asked for.
+# It arrives at eight in the evening, by which time the afternoon it is
+# describing is over and nobody can do anything about it but read.
+#
+# This is the same information, arriving at the only time it is any use.
+# The cost of it is noise: one page load fires a dozen lookups, and an
+# afternoon spent trying fires hundreds. A channel that buzzes forty times
+# gets muted, and a muted channel is worth less than no channel at all - so
+# nearly all of the code below is about collecting first and speaking once.
+
+
+def ordinal(n: int) -> str:
+    """1st, 2nd, 3rd, 11th. "4th today" is a harder sentence to read about
+    yourself than "4", which is the entire reason this exists."""
+    n = int(n)
+    if 10 <= (n % 100) <= 20:
+        return "%dth" % n
+    return "%d%s" % (n, {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th"))
+
+
+def note_blocked_lookups(cfg: dict, st: dict, hits: dict) -> None:
+    """
+    Remember the blocked sites this pass turned up. Posts nothing.
+
+    A site that was just said about is not said about again for an hour:
+    the point is that somebody finds out, and they have found out.
+    """
+    trk = cfg.get("tracking") or {}
+    if not hits or not trk.get("enabled", True) or not trk.get("live_alerts", True):
+        return
+    act = st.setdefault("activity", {})
+    said = act.setdefault("blocked_said", {})
+    queue = act.setdefault("blocked_queue", {})
+    repeat = max(0.0, float(trk.get("live_alert_repeat_minutes") or 60)) * 60
+    for domain, count in hits.items():
+        last = float(said.get(domain) or 0)
+        if last and (now() - last) < repeat:
+            continue                 # already said; the nightly report has it
+        queue[domain] = max(int(count), int(queue.get(domain) or 0))
+    # A machine left alone with an open browser must not be able to grow
+    # either of these without limit.
+    if len(queue) > 200:
+        act["blocked_queue"] = dict(sorted(queue.items(),
+                                           key=lambda kv: -kv[1])[:200])
+    stale = [d for d, t in said.items() if (now() - float(t or 0)) > repeat * 4]
+    for domain in stale:
+        said.pop(domain, None)
+
+
+def flush_blocked_alerts(cfg: dict, st: dict, post) -> list:
+    """Say in the channel what has just been asked for, in one message."""
+    trk = cfg.get("tracking") or {}
+    act = st.setdefault("activity", {})
+    queue = dict(act.get("blocked_queue") or {})
+    if not queue or not trk.get("live_alerts", True):
+        return []
+    if st.get("mode") == "UNLOCKED" and not trk.get("live_alert_when_unlocked", False):
+        # Your friends agreed to this hour. Shouting through it is noise,
+        # and every line of it is still in tonight's report.
+        act["blocked_queue"] = {}
+        return []
+    gap = max(0.0, float(trk.get("live_alert_gap_seconds") or 120))
+    if (now() - float(act.get("last_live_alert") or 0)) < gap:
+        return []                    # still inside the last message's shadow
+
+    act["last_live_alert"] = now()
+    act["blocked_queue"] = {}
+    said = act.setdefault("blocked_said", {})
+    for domain in queue:
+        said[domain] = now()
+
+    ranked = sorted(queue.items(), key=lambda kv: (-kv[1], kv[0]))
+    cap = max(1, int(trk.get("live_alert_max_domains") or 8))
+    shown, rest = ranked[:cap], ranked[cap:]
+    when = dt.datetime.now().strftime("%H:%M")
+    head = "%s on %s, %s" % (who(cfg), socket.gethostname(), when)
+
+    if trk.get("live_alert_names", True):
+        lines = ["  %s - %s time today" % (d, ordinal(c)) for d, c in shown]
+        if rest:
+            lines.append("  ...and %d more" % len(rest))
+        body = ("%s\n\n%s\n\nRefused by the resolver. None of them loaded.\n"
+                % (head, "\n".join(lines)))
+    else:
+        body = ("%s\n\n  %d blocked %s asked for, and refused.\n"
+                % (head, len(ranked),
+                   "site was" if len(ranked) == 1 else "sites were"))
+
+    subject = ("A blocked site was just asked for" if len(ranked) == 1
+               else "%d blocked sites were just asked for" % len(ranked))
+    # force=True because the rate limiting that matters here is the gap and
+    # the per-site repeat window above, not the generic one on alert().
+    alert(cfg, st, "blocked_live", subject, body, force=True,
+          ping=bool(trk.get("live_alert_ping", False)))
+    return ["said in the channel: %s" % ", ".join(d for d, _c in shown[:3])]
 
 
 def summarise_day(cfg: dict, day: str) -> dict:
@@ -4119,6 +4348,339 @@ def cmd_activity(args) -> int:
 
 
 # ==========================================================================
+# Several of you, one server
+# ==========================================================================
+#
+# Everything above this line is one machine answering to the friends who
+# watch it. This is what happens when several of you are doing that at once
+# in the same Discord server - which is the shape this ends up in, because
+# the person who sets it up tells a friend, and the friend wants one.
+#
+# Nothing central runs, and that is deliberate. Each machine keeps enforcing
+# by itself, keeps its own approvers, keeps its own channel. What is added
+# is one shared channel - the lobby - that every machine posts a short line
+# to on a timer:
+#
+#     CWG1 {"v":1,"m":"<discord id>","s":"LOCKED","at":1758...}
+#
+# From those lines anyone can draw the roster. But the roster is not really
+# the point: what the lobby is for is the machines that STOP posting. A
+# member who uninstalls does not announce it, and in a group that is the
+# one failure that otherwise passes unnoticed. Here it cannot - going quiet
+# is itself the announcement, and one of the other machines says so out
+# loud, by name, in front of everybody.
+#
+# The honest limit, written here because it belongs beside the code: these
+# lines say who they are from, they do not prove it. If your group shares a
+# single bot then every line has the same author and a member could post one
+# claiming to be somebody else. What the lobby buys you is that absence is
+# visible. It does not stop somebody determined to fake being present. A bot
+# each closes most of that gap, and read_group_beats() below notices when a
+# member's line starts arriving from somewhere new.
+
+GROUP_MARKER = "CWG1 "
+
+
+def group_cfg(cfg: dict) -> dict:
+    return cfg.get("group") or {}
+
+
+def group_on(cfg: dict) -> bool:
+    """A group needs Discord, a lobby to post in, and a name to post under."""
+    g = group_cfg(cfg)
+    return bool(g.get("enabled") and is_discord(cfg)
+                and str(g.get("lobby_channel_id") or "").isdigit()
+                and str(g.get("member_id") or "").isdigit())
+
+
+def group_me(cfg: dict) -> str:
+    return str(group_cfg(cfg).get("member_id") or "").strip()
+
+
+def group_lobby(cfg: dict) -> str:
+    return str(group_cfg(cfg).get("lobby_channel_id") or "").strip()
+
+
+def group_my_name(cfg: dict) -> str:
+    g = group_cfg(cfg)
+    return (g.get("member_name") or cfg.get("owner_name")
+            or display_name(cfg, group_me(cfg)) or "someone")
+
+
+def validate_group(cfg: dict) -> list:
+    g = group_cfg(cfg)
+    if not g.get("enabled"):
+        return []
+    errs = []
+    if not is_discord(cfg):
+        errs.append("a group is one shared channel, so it needs the Discord "
+                    "transport - email has no such thing")
+    if not str(g.get("lobby_channel_id") or "").isdigit():
+        errs.append("group.lobby_channel_id is required - right-click the "
+                    "shared channel and use Copy Channel ID")
+    if not str(g.get("member_id") or "").isdigit():
+        errs.append("group.member_id is required - your own Discord user id, "
+                    "so the roster can tell the machines apart")
+    if float(g.get("heartbeat_minutes") or 0) <= 0:
+        errs.append("group.heartbeat_minutes must be > 0")
+    if float(g.get("silence_hours") or 0) * 3600 <= \
+            float(g.get("heartbeat_minutes") or 30) * 60 * 2:
+        errs.append("group.silence_hours is less than two heartbeats - one "
+                    "missed post would call somebody a quitter")
+    return errs
+
+
+def group_beat(cfg: dict, st: dict) -> dict:
+    """
+    The line this machine posts about itself.
+
+    Short on purpose. The lobby is somewhere to notice things, not a second
+    copy of everybody's activity report - that stays in each person's own
+    channel, where only their own approvers are reading.
+    """
+    mode = st.get("mode", "LOCKED")
+    body = {"v": 1, "m": group_me(cfg), "n": group_my_name(cfg)[:48],
+            "h": socket.gethostname()[:48], "s": mode, "at": int(now()),
+            "ver": VERSION}
+    req = st.get("request") or {}
+    if mode == "PENDING" and req:
+        body["e"] = int(float(req.get("eligible_at") or 0))
+        body["a"] = len(req.get("approvals") or {})
+        body["r"] = int(cfg.get("approvals_required") or 1)
+    elif mode == "UNLOCKED":
+        body["e"] = int(float((st.get("unlock") or {}).get("expires_at") or 0))
+    if group_cfg(cfg).get("share_counts", True):
+        with contextlib.suppress(Exception):
+            body["b"] = int(summarise_day(cfg, today_str()).get("blocked_hits") or 0)
+    with contextlib.suppress(Exception):
+        rows = phone_table(cfg, st)
+        if rows:
+            body["p"] = "%d/%d" % (sum(1 for r in rows if r[2]), len(rows))
+    return body
+
+
+def post_group_beat(cfg: dict, st: dict, post, force: bool = False) -> bool:
+    """
+    Say we are still here.
+
+    Never queued in the outbox on failure. A post that is hours late would
+    be a machine claiming it was running at a time when it was not, and the
+    one thing the lobby has to get right is what it says about silence.
+    """
+    if not group_on(cfg):
+        return False
+    grp = st.setdefault("group", {})
+    every = max(1.0, float(group_cfg(cfg).get("heartbeat_minutes") or 30)) * 60
+    if not force and (now() - float(grp.get("last_beat") or 0)) < every:
+        return False
+    line = GROUP_MARKER + json.dumps(group_beat(cfg, st), separators=(",", ":"))
+    try:
+        post.post("`%s`" % line, channel=group_lobby(cfg))
+    except MailError as exc:
+        log("group heartbeat failed: %s" % exc)
+        return False
+    grp["last_beat"] = now()
+    return True
+
+
+def read_group_beats(cfg: dict, st: dict, post) -> list:
+    """Take in everyone else's lines and remember where each of them got to."""
+    if not group_on(cfg):
+        return []
+    grp = st.setdefault("group", {})
+    members = grp.setdefault("members", {})
+    since = float(grp.get("cursor") or 0) or (now() - 86400)
+    me = group_me(cfg)
+    moves = []
+    for author, body, _mid in post.marked(group_lobby(cfg), since, GROUP_MARKER):
+        who_id = str(body.get("m") or "")
+        if not who_id.isdigit() or who_id == me:
+            continue                          # our own line tells us nothing
+        name = str(body.get("n") or who_id)[:48]
+        if str(body.get("s") or "") == "LEFT":
+            # They said so on the way out. Dropping them here is the whole
+            # point of saying it: otherwise the silence check would call
+            # somebody who left openly a quitter, twelve hours later.
+            if members.pop(who_id, None) is not None:
+                moves.append("%s: left the group" % name)
+            continue
+        row = members.setdefault(who_id, {})
+
+        # Trust whoever first published a member id, and say so if that ever
+        # changes. With a bot each, that is the difference between a member
+        # reporting and somebody reporting on their behalf. With one shared
+        # bot every line has the same author and this sees nothing, which is
+        # the trade the README spells out.
+        first = row.get("by") or ""
+        if first and author and author != first and not row.get("impostor"):
+            row["impostor"] = True
+            moves.append("%s: their line came from somewhere new" % name)
+            alert(cfg, st, "group_impostor_" + who_id,
+                  "%s's line in the lobby changed hands" % name,
+                  "Until now %s's own machine posted their line in the lobby. "
+                  "This one came from a different account.\n\n"
+                  "That is what it would look like if somebody were covering "
+                  "for a machine that has stopped running.\n" % name)
+        row["by"] = first or author
+
+        # When WE heard it, not when they say they sent it - clamped, so a
+        # machine cannot buy itself silence by claiming to be in the future.
+        claimed = float(body.get("at") or 0)
+        heard = min(now(), claimed) if claimed else now()
+        was_quiet = bool(row.get("quiet"))
+        row.update({
+            "name": name,
+            "host": str(body.get("h") or "")[:48],
+            "mode": str(body.get("s") or "?")[:16],
+            "version": str(body.get("ver") or "")[:16],
+            "last_seen": max(float(row.get("last_seen") or 0), heard),
+            "until": float(body.get("e") or 0),
+            "approvals": body.get("a"),
+            "required": body.get("r"),
+            "blocked": body.get("b"),
+            "phones": str(body.get("p") or "")[:16],
+            "quiet": False,
+        })
+        if was_quiet:
+            moves.append("%s: back in the lobby" % name)
+            if group_speaker(cfg, st) == me:
+                with contextlib.suppress(MailError):
+                    post.post("**%s is back.** Their machine is posting here "
+                              "again." % name, channel=group_lobby(cfg))
+    # A cursor a little behind the clock: a line that lands between the read
+    # and this is seen twice rather than never, and twice costs nothing.
+    grp["cursor"] = now() - 120
+    return moves
+
+
+def group_speaker(cfg: dict, st: dict) -> str:
+    """
+    Whose machine says the thing nobody wants to say.
+
+    Every machine watches the same lobby, so without this a member going
+    quiet would be announced once per machine - five people, five posts, and
+    a channel nobody reads. The lowest member id still being heard from does
+    the talking. There is no election and nothing to agree on, and if the
+    speaker is itself the machine that went quiet, the next id along has
+    already taken the job by the time it matters.
+    """
+    me = group_me(cfg)
+    limit = max(1.0, float(group_cfg(cfg).get("silence_hours") or 12)) * 3600
+    live = [me]
+    for mid, row in ((st.get("group") or {}).get("members") or {}).items():
+        if mid != me and (now() - float(row.get("last_seen") or 0)) <= limit:
+            live.append(mid)
+    return min(live, key=lambda m: (len(m), m))
+
+
+def group_silence(cfg: dict, st: dict, post) -> list:
+    """Notice a member whose machine has stopped posting, and say so once."""
+    g = group_cfg(cfg)
+    if not group_on(cfg):
+        return []
+    grp = st.setdefault("group", {})
+    limit = max(1.0, float(g.get("silence_hours") or 12)) * 3600
+    speaker = group_speaker(cfg, st)
+    me = group_me(cfg)
+    moves = []
+    for mid, row in (grp.get("members") or {}).items():
+        if mid == me or row.get("quiet"):
+            continue
+        gone = now() - float(row.get("last_seen") or 0)
+        if gone <= limit:
+            continue
+        row["quiet"] = True
+        name = row.get("name") or mid
+        moves.append("%s: gone quiet" % name)
+        if not g.get("announce_silence", True) or speaker != me:
+            continue                       # somebody else's machine says it
+        every = human_delta(float(g.get("heartbeat_minutes") or 30) * 60)
+        with contextlib.suppress(MailError):
+            post.post(
+                "**%s has gone quiet.**\n\n"
+                "Their machine has not posted here for %s. It normally does "
+                "every %s.\n\n"
+                "The blocker reports for itself, so this is what it looks "
+                "like when it has stopped running - uninstalled, switched "
+                "off, or the machine is simply away for a while. Worth "
+                "asking which.\n" % (name, human_delta(gone), every),
+                ping_ids=[mid], channel=group_lobby(cfg))
+    return moves
+
+
+def group_rows(cfg: dict, st: dict) -> list:
+    """One row per member: (name, ok, what to say about them)."""
+    g = group_cfg(cfg)
+    limit = max(1.0, float(g.get("silence_hours") or 12)) * 3600
+    me = group_me(cfg)
+    members = dict((st.get("group") or {}).get("members") or {})
+    members[me] = dict(members.get(me) or {})
+    rows = []
+    for mid, row in members.items():
+        mine = mid == me
+        if mine:
+            beat = group_beat(cfg, st)
+            row.update({"name": group_my_name(cfg), "mode": st.get("mode", "LOCKED"),
+                        "host": socket.gethostname(), "version": VERSION,
+                        "last_seen": now(), "until": float(beat.get("e") or 0),
+                        "approvals": beat.get("a"), "required": beat.get("r"),
+                        "blocked": beat.get("b"), "phones": beat.get("p") or ""})
+        name = (row.get("name") or display_name(cfg, mid) or mid)
+        if mine:
+            name += " (you)"
+        gone = now() - float(row.get("last_seen") or 0)
+        if gone > limit:
+            rows.append((name, False, "silent for %s - last heard from %s"
+                         % (human_delta(gone), short_stamp(row.get("last_seen")))))
+            continue
+        mode = row.get("mode") or "?"
+        bits = [mode.lower() if mode == "LOCKED" else mode]
+        if mode == "PENDING":
+            if row.get("required"):
+                bits.append("%s of %s approved"
+                            % (row.get("approvals") or 0, row["required"]))
+            if row.get("until"):
+                bits.append("earliest %s" % short_stamp(row["until"]))
+        elif mode == "UNLOCKED" and row.get("until"):
+            bits.append("until %s" % short_stamp(row["until"]))
+        if row.get("blocked") is not None:
+            bits.append("%d blocked today" % int(row["blocked"]))
+        if row.get("phones"):
+            bits.append("phones %s" % row["phones"])
+        if row.get("impostor"):
+            bits.append("LINE CHANGED HANDS")
+        rows.append((name, not row.get("impostor"), ", ".join(bits)))
+    return sorted(rows, key=lambda r: r[0].lower())
+
+
+def group_board(cfg: dict, st: dict) -> str:
+    """The roster, as plain text, for the terminal or for the lobby."""
+    g = group_cfg(cfg)
+    rows = group_rows(cfg, st)
+    head = "%s - who is still running it" % (g.get("name") or "ChristWatch")
+    out = [head, "=" * len(head), ""]
+    for name, ok, detail in rows:
+        out.append("  %s %-22s %s" % ("  " if ok else "!!", name, detail))
+    out += ["", "%d member%s. Drawn from what each machine posted here, %s."
+            % (len(rows), "" if len(rows) == 1 else "s", short_stamp(now()))]
+    return "\n".join(out)
+
+
+def tick_group(cfg: dict, st: dict, post) -> list:
+    """One pass over the lobby. Never fatal: the blocker outranks the group."""
+    if not group_on(cfg):
+        return []
+    moves = []
+    try:
+        moves += read_group_beats(cfg, st, post)
+        moves += group_silence(cfg, st, post)
+        post_group_beat(cfg, st, post)
+    except Exception as exc:
+        log("group tick failed: %r" % exc)
+    return moves
+
+
+# ==========================================================================
 # Public status snapshot -- what the desktop app reads
 # ==========================================================================
 
@@ -4156,6 +4718,18 @@ def public_status_doc(cfg: dict, st: dict) -> dict:
                          for d, m in phone_devices(cfg).items()),
         # an update is not allowed to quietly drop the extra nets either
         "hardened": bool((cfg.get("harden") or {}).get("enabled", False)),
+        # ...nor take this machine out of the group it reports to
+        "group_lobby": group_lobby(cfg) if group_on(cfg) else "",
+        "group": {
+            "enabled": group_on(cfg),
+            "name": group_cfg(cfg).get("name") or "",
+            "lobby": group_lobby(cfg),
+            "member_id": group_me(cfg),
+            "member_name": group_my_name(cfg) if group_on(cfg) else "",
+            "members": [{"name": gn, "ok": gok, "detail": gd}
+                        for gn, gok, gd in (group_rows(cfg, st)
+                                            if group_on(cfg) else [])],
+        },
         "approvals_required": int(cfg.get("approvals_required") or 1),
         "cooloff_hours": float(cfg.get("cooloff_hours") or 24),
         "unlock_minutes": int(cfg.get("unlock_minutes") or 60),
@@ -4312,6 +4886,10 @@ def health(cfg: dict, st: dict) -> list:
         add("watchdog timer", tact == "active", "%s / %s" % (tact or "?", tena or "?"))
     for name, kind, pok, detail in phone_table(cfg, st):
         add("phone: " + name, pok, detail)
+    if group_on(cfg):
+        for name, gok, detail in group_rows(cfg, st):
+            if not name.endswith("(you)"):     # the rows above are about us
+                add("group: " + name, gok, detail)
     if (cfg.get("harden") or {}).get("enabled", False):
         for name, hok, detail in harden_rows(cfg, st, advice=False):
             add("net: " + name, hok, detail)
@@ -4344,7 +4922,7 @@ def guess_provider(addr: str):
 
 
 def validate_config(cfg: dict) -> list:
-    errs = []
+    errs = validate_group(cfg)
     discord = is_discord(cfg)
     if not discord and not valid_email(cfg.get("owner_email", "")):
         errs.append("owner_email is not a valid address")
@@ -4854,6 +5432,150 @@ def cmd_phone(args) -> int:
         print("  %s %-22s %-8s %s" % (mark, name[:22], kind, detail))
     print("")
     print(dim("  Should be on:  %s" % FILTERS[cfg["filter"]]["dot_name"]))
+    print("")
+    return 0
+
+
+def cmd_group(args) -> int:
+    """The shared server: who else is running this, and who has stopped."""
+    require_root()
+    cfg = load_config()
+    if not cfg:
+        print(red("Not configured. Run: sudo %s setup" % PROG))
+        return 1
+    st = load_state()
+    g = cfg.setdefault("group", dict(DEFAULT_CONFIG["group"]))
+
+    if args.leave:
+        if not g.get("enabled"):
+            print(yellow("\n  This machine is not in a group.\n"))
+            return 0
+        if st.get("mode") != "UNLOCKED":
+            print(red("\n  Leaving the group means the people watching stop "
+                      "being able to\n  see whether this machine is still "
+                      "running. That is a loosening,\n  so it works like every "
+                      "other one: during an unlock.\n"))
+            print("  Ask for one first:  sudo %s request-unlock\n" % PROG)
+            return 1
+        post = courier(cfg)
+        with contextlib.suppress(MailError):
+            # The human sentence is for the channel; the line under it is
+            # what the other machines read, so they take this member off
+            # their rosters instead of waiting to call them silent.
+            farewell = dict(group_beat(cfg, st), s="LEFT")
+            post.post("**%s has left the group.** That machine will stop "
+                      "posting here. It is still blocking, and its own "
+                      "channel is unaffected.\n`%s`"
+                      % (group_my_name(cfg),
+                         GROUP_MARKER + json.dumps(farewell,
+                                                   separators=(",", ":"))),
+                      channel=group_lobby(cfg))
+        alert(cfg, st, "group_left", "This machine left the group",
+              "%s took this machine out of the %s group.\n\n"
+              "It still blocks, and it still answers to the approvers in this "
+              "channel. What has stopped is the line it posted in the shared "
+              "lobby, which is how the others could tell it was still "
+              "running.\n" % (who(cfg), g.get("name") or "shared"), force=True)
+        g["enabled"] = False
+        save_config(cfg)
+        history(st, "left the group")
+        save_state(st)
+        print(green("\n  Left the group. Everything else is unchanged.\n"))
+        return 0
+
+    changed = False
+    for key, val in (("lobby_channel_id", args.lobby), ("member_id", args.me),
+                     ("member_name", args.name), ("name", args.group_name)):
+        if val:
+            g[key] = val.strip()
+            changed = True
+    if args.join:
+        g["enabled"] = True
+        changed = True
+
+    if changed:
+        errs = validate_group(cfg)
+        if errs:
+            print("")
+            for e in errs:
+                print(red("  " + e))
+            print("")
+            return 1
+        save_config(cfg)
+        if not g.get("enabled"):
+            print(green("\n  Saved.\n"))
+            return 0
+        if group_lobby(cfg) == str((cfg.get("discord") or {}).get("channel_id") or ""):
+            print(yellow("\n  The lobby is the same channel this machine "
+                         "already posts to.\n  That works, but the roster and "
+                         "your own alerts will be mixed\n  together. A "
+                         "separate channel everyone can see reads better."))
+        post = courier(cfg)
+        if post_group_beat(cfg, st, post, force=True):
+            with contextlib.suppress(MailError):
+                post.post("**%s has joined.** Their machine will post here on "
+                          "a timer - so if it stops running, you will see it "
+                          "stop." % group_my_name(cfg),
+                          channel=group_lobby(cfg))
+            history(st, "joined the group %s" % (g.get("name") or "shared"))
+            print(green("\n  Joined, and said hello in the lobby.\n"))
+        else:
+            print(yellow("\n  Saved, but nothing could be posted to that "
+                         "channel.\n  Check the bot is in the server and can "
+                         "see it.\n"))
+        save_state(st)
+        return 0
+
+    if not group_on(cfg):
+        print("")
+        print(yellow("  This machine is not in a group."))
+        print(dim(
+            "\n  A group is one shared Discord channel that every member's\n"
+            "  machine posts a short line to on a timer. Nothing central\n"
+            "  runs and nobody gains any power over anybody else - it is\n"
+            "  there so that a machine which stops running the blocker\n"
+            "  stops posting, and is seen to stop.\n"))
+        print("  sudo %s group --join \\\n"
+              "      --lobby <shared channel id> --me <your discord id> \\\n"
+              "      --name \"<your name>\" --group \"<what you call yourselves>\"\n"
+              % PROG)
+        return 0
+
+    post = courier(cfg)
+    with contextlib.suppress(Exception):
+        read_group_beats(cfg, st, post)
+
+    if args.beat:
+        ok = post_group_beat(cfg, st, post, force=True)
+        print(green("\n  Posted.") if ok
+              else red("\n  Could not post to the lobby."))
+
+    if args.json:
+        save_state(st)
+        print(dump_json({
+            "enabled": True,
+            "name": g.get("name") or "",
+            "lobby": group_lobby(cfg),
+            "member_id": group_me(cfg),
+            "member_name": group_my_name(cfg),
+            "silence_hours": float(g.get("silence_hours") or 12),
+            "members": [{"name": nm, "ok": ok_, "detail": d}
+                        for nm, ok_, d in group_rows(cfg, st)],
+        }))
+        return 0
+
+    board = group_board(cfg, st)
+    if args.post:
+        with contextlib.suppress(MailError):
+            post.post("```\n%s\n```" % board, channel=group_lobby(cfg))
+        print(green("\n  Roster posted in the lobby."))
+    save_state(st)
+    print("")
+    for line in board.splitlines():
+        print("  " + line)
+    quiet = [nm for nm, ok_, _d in group_rows(cfg, st) if not ok_]
+    if quiet:
+        print(red("  %d to ask about: %s" % (len(quiet), ", ".join(quiet))))
     print("")
     return 0
 
@@ -5916,6 +6638,7 @@ def tick(cfg_override=None) -> dict:
 
     moves = advance(cfg, st, post)
     moves += poll_phones(cfg, st, post)
+    moves += tick_group(cfg, st, post)
     moves += watch_grub(cfg, st)
     apply = st.get("mode") != "UNLOCKED"
     quiet = bool(moves) or bool(notes) or bl == "refreshed" or not st.get("enforced_once")
@@ -5923,6 +6646,7 @@ def tick(cfg_override=None) -> dict:
     guard_units(cfg, st)
     try:
         sample_activity(cfg, st)
+        moves += flush_blocked_alerts(cfg, st, post)
         maybe_digest(cfg, st, post)
     except Exception as exc:                      # tracking must never wedge it
         log("activity sampling failed: %r" % exc)
@@ -6179,7 +6903,7 @@ def current_source_sha() -> str:
 ARRANGEMENT_KEYS = ("configured", "mode", "transport", "approvers",
                     "approvals_required", "cooloff_hours", "unlock_minutes",
                     "channel_id", "passphrase_set", "filter", "armed",
-                    "phones", "hardened")
+                    "phones", "hardened", "group_lobby")
 
 
 def arrangement(doc: dict) -> dict:
@@ -6793,6 +7517,27 @@ def build_parser() -> argparse.ArgumentParser:
                    help="have a friend set the boot menu password")
     s.add_argument("--json", action="store_true", help="machine-readable")
     s.set_defaults(fn=cmd_harden)
+
+    s = sub.add_parser("group",
+                       help="the shared server: who else is running this")
+    s.add_argument("--join", action="store_true",
+                   help="start posting to the shared lobby channel")
+    s.add_argument("--leave", action="store_true",
+                   help="stop (a loosening: only during an unlock)")
+    s.add_argument("--lobby", default="", metavar="ID",
+                   help="the channel id everyone in the group can see")
+    s.add_argument("--me", default="", metavar="ID",
+                   help="your own Discord user id")
+    s.add_argument("--name", default="", metavar="NAME",
+                   help="how the roster should name you")
+    s.add_argument("--group", dest="group_name", default="", metavar="NAME",
+                   help="what the group calls itself")
+    s.add_argument("--beat", action="store_true",
+                   help="post this machine's line right now")
+    s.add_argument("--post", action="store_true",
+                   help="put the roster in the lobby, not just on screen")
+    s.add_argument("--json", action="store_true", help="machine-readable")
+    s.set_defaults(fn=cmd_group)
 
     s = sub.add_parser("no-password",
                        help="stop asking for a password for these commands")

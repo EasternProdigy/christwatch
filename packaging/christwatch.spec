@@ -1,5 +1,5 @@
 Name:           christwatch
-Version:        1.7.2
+Version:        1.8.0
 Release:        1%{?dist}
 Summary:        Accountability-gated content blocker
 
@@ -67,6 +67,13 @@ cd %{_builddir}/%{name}-%{version} && python3 selftest.py
 %{_datadir}/%{name}/
 
 %changelog
+* Tue Sep 22 2026 William Mezitis <wmezitis@gmail.com> - 1.8.0-1
+- Name a blocked site in the channel as it is asked for, not only
+  in the evening's report.
+- Group mode: several people in one Discord server, one shared
+  lobby, and a machine that stops running the blocker is seen to.
+- SETUP.md: a linear first-time setup guide.
+
 * Tue Sep 22 2026 William Mezitis <wmezitis@gmail.com> - 1.5.0-1
 - Keep /etc/hosts small; the resolver does the blocking.
 - New: block a site by hand.

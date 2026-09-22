@@ -10,7 +10,17 @@ or quietly.
 
 Your friends can be reached **in a Discord channel** or **by email**. Discord
 is the default: no new mailbox, no app password, and approving happens in
-front of everyone, which is most of the point.
+front of everyone, which is most of the point. Blocked sites are named in
+that channel **as they are asked for**, not only in the evening's report.
+
+If several of you are doing this in the same server, [group
+mode](#several-of-you-one-server) adds one shared channel where every
+member's machine says it is still running - so somebody quietly uninstalling
+is something the group sees, rather than something it works out months later.
+
+**Setting it up for the first time?** [SETUP.md](SETUP.md) is the linear
+version of this document: half an hour, in order, with the mistakes called
+out. This file is the reference.
 
 ```
 LOCKED  --ask to unlock-->  PENDING  --24h timer            --.
@@ -287,6 +297,8 @@ sudo pornblock test-email       # re-verify the mail path
 sudo pornblock enforce          # force one enforcement pass now
 sudo pornblock phone            # what your phones are doing
 sudo pornblock harden           # what makes taking this off hard
+sudo pornblock activity         # what happened on this machine today
+sudo pornblock group            # who else is still running it
 ```
 
 ### How the desktop app is wired
@@ -521,6 +533,170 @@ served to the phone over your own network and never saved anywhere.
 
 ---
 
+## Several of you, one server
+
+This is what happens about a month in. You set it up, you tell a friend,
+they want one - and now there are four of you in the same Discord server
+running four blockers that know nothing about each other.
+
+Group mode adds one shared channel, the **lobby**, that every member's
+machine posts a short line to every half hour:
+
+```
+CWG1 {"v":1,"m":"216…","n":"Will","h":"will-laptop","s":"LOCKED","at":1758…}
+```
+
+Nothing central runs, and that is deliberate. Each machine still enforces by
+itself, still answers to its own approvers, still keeps its own channel.
+**Nobody gains any power over anybody else's blocker** - the lobby cannot
+approve anything, cannot unlock anything and cannot change anybody's
+settings. What it adds is the one thing four separate installs otherwise
+cannot see: who stopped.
+
+### Silence is the whole point
+
+Nobody announces that they uninstalled it. They stop mentioning it, and
+three weeks later nobody can quite remember whether Sam is still running it
+or quietly dropped out in July.
+
+A machine that is running posts every thirty minutes. A machine that is not,
+does not. After `group.silence_hours` - twelve by default - one of the other
+machines says so in the lobby, by name, and pings them:
+
+> **Jordan has gone quiet.**
+>
+> Their machine has not posted here for 14h 0m 0s. It normally does every 30m 0s.
+>
+> The blocker reports for itself, so this is what it looks like when it has
+> stopped running - uninstalled, switched off, or the machine is simply away
+> for a while. Worth asking which.
+
+Only one machine says it. Every member is watching the same lobby, so
+without that you would get one post per member and a channel nobody reads.
+The lowest member id still being heard from does the talking; there is no
+election and nothing to agree on, and if the speaker is itself the machine
+that went quiet, the next id along has already taken the job.
+
+**Leaving properly is not the same as walking out.** `group --leave` posts a
+farewell the other machines understand, and they take you off the roster
+instead of calling you a quitter twelve hours later. Leaving is a loosening
+like any other, so it only works during an unlock.
+
+### Laying the server out
+
+The layout that works:
+
+```
+#christwatch          the lobby. Everyone. Roster, and who went quiet.
+#cw-will              Will's requests, approvals, alerts, nightly report
+#cw-sam               Sam's
+#cw-jordan            Jordan's
+```
+
+Separate channels are the default because the nightly report is the
+*complete* list of domains that person's machine looked up, and four of
+those in one channel is unreadable as well as more exposure than anybody
+signed up for.
+
+You can all share one channel if you would rather - point everyone's
+`discord.channel_id` at it and use it as the lobby too. Every post is
+prefixed with whose machine is talking (`[ChristWatch: Will]`) so it stays
+readable, and approvals still cannot be confused between people because each
+request carries its own code. It is noisier and everyone reads everyone's
+detail. `group --join` warns you when you do this rather than refusing.
+
+**One bot or a bot each?** One bot for the server is much less setup and it
+is what most groups will do. A bot each is better, for one specific reason -
+see below.
+
+### Joining
+
+```bash
+sudo pornblock group --join \
+    --lobby  1234567890123456789 \
+    --me     9876543210987654321 \
+    --name   "Will" \
+    --group  "the lads"
+```
+
+`--lobby` is the shared channel's id; `--me` is your own Discord user id
+(Developer Mode on, right-click yourself → Copy User ID). Your machine posts
+its first line immediately and says hello in the lobby.
+
+### The roster
+
+```bash
+sudo pornblock group           # who is still running it
+sudo pornblock group --post    # ...and put that in the lobby
+sudo pornblock group --beat    # post this machine's line right now
+sudo pornblock group --json    # machine-readable
+sudo pornblock group --leave   # during an unlock only
+```
+
+```
+  the lads - who is still running it
+  ==================================
+
+  !! Jordan                 silent for 1d 6h 0m 0s - last heard from Mon 10:39
+     Sam                    PENDING, 1 of 2 approved, earliest Tue 17:39, 7 blocked today
+     Will (you)             locked, 0 blocked today
+
+  3 members. Drawn from what each machine posted here, Tue 16:39.
+  1 to ask about: Jordan
+```
+
+Everyone in the group shows up in `pornblock status` and in the app's health
+list too, so a member who went quiet is visible without going looking.
+
+### What the lobby does and does not prove
+
+**It carries state, not content.** Mode, timers, how many blocked lookups
+today, whether the phones are reporting. Nobody in the lobby sees anybody
+else's domains, apps or screen time - that stays in each person's own
+channel, in front of the people they chose.
+
+**A line says who it is from. It does not prove it.** If your group shares
+one bot then every line in the lobby has the same author, and a member could
+post one claiming to be somebody else - covering for a machine that is no
+longer running. What the lobby genuinely buys you is that *absence* is
+visible. It does not stop somebody determined to fake being present.
+
+**A bot each closes most of that.** With separate bots each member's line
+arrives from a different account, and the program records who first
+published each member id and says so in the channel if that ever changes:
+
+> **Sam's line in the lobby changed hands**
+>
+> Until now Sam's own machine posted their line in the lobby. This one came
+> from a different account.
+
+**Silence is also what a laptop on holiday looks like.** Twelve hours of
+nothing is a question, not a verdict, and the message says so. If your group
+travels a lot, raise `group.silence_hours`.
+
+### Settings
+
+In `/etc/pornblock/config.json`:
+
+| Setting | Default | What it does |
+|---|---|---|
+| `group.enabled` | `false` | whether this machine is in a group at all |
+| `group.name` | `""` | what you call yourselves; shown on the roster |
+| `group.lobby_channel_id` | `""` | the shared channel everyone can see |
+| `group.member_id` | `""` | your own Discord user id |
+| `group.member_name` | `""` | how the roster names you (defaults to `owner_name`) |
+| `group.heartbeat_minutes` | `30` | how often this machine posts its line |
+| `group.silence_hours` | `12` | how long of nothing before somebody is called quiet |
+| `group.announce_silence` | `true` | whether to say it in the lobby, or only record it |
+| `group.share_counts` | `true` | put today's blocked-lookup count in the line |
+
+Which lobby this machine answers to is pinned in the immutable install
+record, the same as the approver list and the channel. Editing yourself out
+of the group by hand is reverted and said out loud; leaving for real is
+`group --leave`, during an unlock.
+
+---
+
 ## Tuning
 
 Edit `/etc/pornblock/config.json`, then `sudo systemctl restart pornblock`.
@@ -596,6 +772,53 @@ show them without a password; the list of what you actually looked up is
 root-only, so seeing that costs an authentication prompt.
 
 Days are kept for `tracking.keep_days` (90) and then deleted.
+
+### Said as it happens, not just in the evening
+
+The report above arrives at eight. By then the afternoon it is describing is
+over, and there is nothing anybody can do about it but read.
+
+So the blocked part is also said straight away, in the channel:
+
+> **[ChristWatch] 2 blocked sites were just asked for**
+>
+> Will on will-laptop, 14:32
+>
+> &nbsp;&nbsp;pornhub.com - 3rd time today
+> &nbsp;&nbsp;xvideos.com - 1st time today
+>
+> Refused by the resolver. None of them loaded.
+
+Nothing extra is recorded to do this. It is the same resolver log the
+nightly report is built from, read as it arrives instead of at the end of
+the day.
+
+The cost is noise, and nearly all of the tuning here is about noise - a
+channel that buzzes forty times in an afternoon gets muted, and a muted
+channel is worth less than no channel at all.
+
+| Setting | Default | What it does |
+|---|---|---|
+| `live_alerts` | `true` | the whole thing |
+| `live_alert_names` | `true` | name the site; `false` posts only a count |
+| `live_alert_ping` | `false` | no phone buzz for these - being in the channel is enough |
+| `live_alert_gap_seconds` | `120` | never two posts closer together than this |
+| `live_alert_repeat_minutes` | `60` | the same site is not mentioned again inside this |
+| `live_alert_max_domains` | `8` | names per post; anything beyond is counted |
+| `live_alert_when_unlocked` | `false` | stay quiet during an unlock your friends approved |
+
+One page load fires a dozen lookups and a stubborn afternoon fires hundreds.
+With those defaults, that afternoon is a handful of messages naming the
+sites that actually mattered.
+
+**During an unlock it says nothing.** Your friends already agreed to that
+hour, so shouting through it is noise - and every line of it is still in the
+evening's report. Set `live_alert_when_unlocked` to `true` if you want it
+anyway.
+
+**It does not fire for sites the resolver never saw.** A browser doing its
+own encrypted DNS is caught by the firewall, not by this, and shows up as
+`dns bypass drops` in the daily report instead.
 
 ### Be clear about what this means
 
@@ -759,6 +982,28 @@ pornblock-watchdog.timer && chattr -i /etc/hosts && ...` works. The watchdog
 fires every 60s and puts it back, and mails your approvers that it had to -
 but a root user who keeps going, wins. This is friction and social cost, not
 security.
+
+**The lobby cannot prove who posted a line.**  If your group shares one bot,
+every heartbeat in the lobby has the same author, so a member could post one
+claiming to be somebody whose machine has actually stopped. The lobby makes
+*absence* visible, which is the failure nobody announces about themselves;
+it does not stop somebody determined to fake being present. A bot each
+closes most of it - then a member's line arriving from a new account is
+itself said out loud. See [Several of you, one
+server](#several-of-you-one-server).
+
+**A group member can simply not be in the group.**  Nothing about the lobby
+is enforced across machines, because nothing can be: each blocker is root on
+its own machine and answers to its own approvers. Somebody who edits
+themselves out has it reverted and said out loud on *their* machine - which
+is worth something, and is not the same as being unable to.
+
+**Live alerts are only as good as the resolver's view.**  They fire on what
+systemd-resolved was asked for. A browser with its own encrypted DNS is
+caught by the firewall instead and shows up as a bypass count, not a named
+site; an app using a VPN is not seen at all. They also need
+`tracking.dns_log`, so switching that off to keep your browsing private
+switches these off with it.
 
 **You can read the mailbox password.**  Your friend types it, but it is stored
 in `/etc/pornblock/secrets.json`, which root can read. Splitting it into its
