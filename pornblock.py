@@ -4484,7 +4484,17 @@ def cmd_phone(args) -> int:
             fetch_apk(cfg)
         if kind == "android":
             try:
-                phone_webhook(cfg, courier(cfg))
+                post = courier(cfg)
+                phone_webhook(cfg, post)
+                # probe() learns the channel's name; keeping it means the
+                # phone can say which channel it reports to by name instead
+                # of calling it "your channel".
+                with contextlib.suppress(MailError):
+                    post.probe()
+                    name = (post.d or {}).get("channel_name") or ""
+                    if name and name != (cfg["discord"].get("channel_name")):
+                        cfg["discord"]["channel_name"] = name
+                        save_config(cfg)
             except MailError as exc:
                 # Only a refusal is about permissions. A rejected token or a
                 # channel that has gone is a different problem, and the
