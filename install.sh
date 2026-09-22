@@ -71,7 +71,7 @@ elif [ -n "$REPO_URL" ]; then
   ok "fetched $REPO_URL ($BRANCH)"
 else
   die "pornblock.py is not next to this script. Run it from the unpacked
-     download, or set CHRISTWATCH_REPO=https://github.com/you/porn-block"
+     download, or set CHRISTWATCH_REPO=https://github.com/EasternProdigy/christwatch"
 fi
 
 # ---------------------------------------------------------- dependencies

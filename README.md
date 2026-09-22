@@ -86,7 +86,7 @@ Properties → Permissions), or run `./install.sh` from a terminal.
 **From a terminal:**
 
 ```bash
-git clone https://github.com/you/porn-block && cd porn-block
+git clone https://github.com/EasternProdigy/christwatch && cd porn-block
 ./install.sh
 ```
 
@@ -277,7 +277,7 @@ Point it at a repo once and it will pull new versions.
 ```json
 "updates": {
   "enabled": true,
-  "repo": "https://github.com/you/porn-block",
+  "repo": "https://github.com/EasternProdigy/christwatch",
   "branch": "main",
   "check_hours": 24,
   "auto_apply": false,

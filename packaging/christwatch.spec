@@ -4,7 +4,7 @@ Release:        1%{?dist}
 Summary:        Accountability-gated content blocker
 
 License:        MIT
-URL:            https://github.com/williammezitis/porn-block
+URL:            https://github.com/EasternProdigy/christwatch
 Source0:        %{name}-%{version}.tar.gz
 BuildArch:      noarch
 
