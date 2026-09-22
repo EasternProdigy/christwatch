@@ -107,6 +107,11 @@ def run(app):
         sv.p_phrase1.set_text("short")
         sv.p_phrase2.set_text("short")
         check("short passphrase rejected", bool(sv.validate(5)))
+        sv.p_phrase1.set_text("")
+        sv.p_phrase2.set_text("")
+        check("blank passphrase is allowed (set it later)", sv.validate(5) is None)
+        check("blank passphrase is omitted from the answers",
+              "partner_passphrase" not in sv.answers())
         sv.p_phrase1.set_text("secret-phrase")
         sv.p_phrase2.set_text("secret-phrase")
         check("friend page accepted", sv.validate(5) is None, sv.validate(5))
@@ -122,6 +127,20 @@ def run(app):
         d = G.Dashboard(Stub())
         d.update(doc("LOCKED"))
         check("locked state", d.l_mode.get_label() == "Locked")
+        nop = doc("LOCKED")
+        nop["passphrase_set"] = False
+        # a broken enforcement layer is more urgent, so clear it for this check
+        for h in nop["health"]:
+            h["ok"] = True
+        d.update(nop)
+        check("missing passphrase is nagged about",
+              d.banner.get_revealed() and "one gate short" in d.banner.get_title(),
+              d.banner.get_title())
+        nop["health"][1]["ok"] = False
+        d.update(nop)
+        check("a broken layer outranks the passphrase nag",
+              "Not fully enforced" in d.banner.get_title())
+        d.update(doc("LOCKED"))
         check("only the ask button shows",
               d.b_request.get_visible() and not d.b_cancel.get_visible())
         check("gates hidden when nothing is pending", not d.g_gates.get_visible())

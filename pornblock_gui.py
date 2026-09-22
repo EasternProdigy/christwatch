@@ -364,6 +364,16 @@ class SetupView(Gtk.Box):
             g.add(w)
         b.append(g)
 
+        note = Gtk.Label(
+            wrap=True, xalign=0,
+            label="No friend next to you today? Leave the passphrase blank "
+                  "and set it later \u2014 the app will keep reminding you. "
+                  "Everything else still works; you would just be one gate "
+                  "short.")
+        note.add_css_class("dim-label")
+        note.add_css_class("caption")
+        b.append(note)
+
         g2 = Adw.PreferencesGroup(
             title="If the passphrase is ever lost",
             description="Without a way back, a friend who moves away would "
@@ -453,10 +463,12 @@ class SetupView(Gtk.Box):
         if page == 5:
             if not self.p_mailpass.get_text():
                 return "Your friend needs to enter the mailbox password"
-            if self.p_phrase1.get_text() != self.p_phrase2.get_text():
-                return "The two passphrases do not match"
-            if len(self.p_phrase1.get_text()) < 8:
-                return "The passphrase needs at least 8 characters"
+            one, two = self.p_phrase1.get_text(), self.p_phrase2.get_text()
+            if one or two:
+                if one != two:
+                    return "The two passphrases do not match"
+                if len(one) < 8:
+                    return "The passphrase needs at least 8 characters"
         return None
 
     def answers(self):
@@ -473,7 +485,9 @@ class SetupView(Gtk.Box):
             "filter": FILTERS[self.c_filter.get_selected()][0],
             "require_passphrase": True,
             "passphrase_recovery": bool(self.sw_recovery.get_active()),
-            "partner_passphrase": self.p_phrase1.get_text(),
+            # left out entirely when blank, so the gate simply is not armed
+            **({"partner_passphrase": self.p_phrase1.get_text()}
+               if self.p_phrase1.get_text() else {}),
             "email": {
                 "address": self.e_mailbox.get_text().strip(),
                 "display_name": "ChristWatch",
@@ -729,6 +743,8 @@ class Dashboard(Gtk.Box):
     def _on_banner(self, *_):
         if self._banner_action == "update":
             self.window.do_update()
+        elif self._banner_action == "setphrase":
+            self.window.set_passphrase()
 
     # -- rendering --------------------------------------------------------
 
@@ -761,6 +777,11 @@ class Dashboard(Gtk.Box):
                                   % ", ".join(h["name"] for h in bad[:3]))
             self.banner.set_button_label(None)
             self._banner_action = None
+            self.banner.set_revealed(True)
+        elif not self.doc.get("passphrase_set"):
+            self.banner.set_title("No partner passphrase set \u2014 one gate short")
+            self.banner.set_button_label("Set it")
+            self._banner_action = "setphrase"
             self.banner.set_revealed(True)
         elif self.doc.get("queued_emails"):
             self.banner.set_title("%d alert email(s) still waiting to send"
@@ -980,7 +1001,8 @@ class MainWindow(Adw.ApplicationWindow):
         self.current = None
         self.dash = None
 
-        for name, fn in (("update", self.do_update),
+        for name, fn in (("setphrase", self.set_passphrase),
+                         ("update", self.do_update),
                          ("checkupdate", self.check_update),
                          ("testmail", self.do_test_email),
                          ("activity", self.show_activity),
@@ -991,6 +1013,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         menu = Gio.Menu()
         s1 = Gio.Menu()
+        s1.append("Set the partner passphrase", "win.setphrase")
         s1.append("Check for updates", "win.checkupdate")
         s1.append("Send a test email", "win.testmail")
         menu.append_section(None, s1)
@@ -1088,6 +1111,51 @@ class MainWindow(Adw.ApplicationWindow):
                            self.show_output("Update " + ("applied" if ok
                                                          else "failed"), out)
                            or self.refresh())
+        d.connect("response", resp)
+        d.present(self)
+
+    def set_passphrase(self):
+        doc = read_status() or {}
+        if doc.get("passphrase_set"):
+            self.show_output(
+                "Already set",
+                "A partner passphrase is already stored.\n\n"
+                "Changing it is only possible during a granted unlock window - "
+                "otherwise you could overwrite your friend's secret whenever "
+                "you felt like it.")
+            return
+        one = Adw.PasswordEntryRow(title="Partner passphrase")
+        two = Adw.PasswordEntryRow(title="Type it again")
+        box = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        box.add_css_class("boxed-list")
+        box.append(one)
+        box.append(two)
+        d = Adw.AlertDialog(
+            heading="Hand the keyboard to your friend",
+            body="They choose this and keep it. Once it is set, an unlock "
+                 "needs the cool-off, the approvals AND this typed in.\n\n"
+                 "It is stored only as a hash, and it can only be changed "
+                 "again during a granted unlock window - so this is a "
+                 "one-shot.")
+        d.set_extra_child(box)
+        d.add_response("no", "Later")
+        d.add_response("yes", "Set it")
+        d.set_response_appearance("yes", Adw.ResponseAppearance.SUGGESTED)
+        d.set_default_response("no")
+        d.set_close_response("no")
+
+        def resp(_d, r):
+            if r != "yes":
+                return
+            if one.get_text() != two.get_text():
+                self.toast("They did not match")
+                return
+            if len(one.get_text()) < 8:
+                self.toast("Use at least 8 characters")
+                return
+            run_privileged(["passphrase", "--set", "--stdin"],
+                           stdin_text=one.get_text() + "\n",
+                           on_done=self.after_action)
         d.connect("response", resp)
         d.present(self)
 
