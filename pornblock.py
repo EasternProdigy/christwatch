@@ -90,6 +90,9 @@ GUI_BIN_PATH = "/usr/local/bin/pornblock-gui"
 # state without asking for a password every two seconds.
 RUN_DIR = "/run/pornblock"
 PUBLIC_STATUS = RUN_DIR + "/status.json"
+# Where this copy came from, so the wizard can offer it as the update
+# source. World-readable; the GUI runs as you, not as root.
+SOURCE_HINT = RUN_DIR + "/source-hint.json"
 
 DESKTOP_PATH = "/usr/share/applications/christwatch.desktop"
 ICON_PATH = "/usr/share/icons/hicolor/scalable/apps/christwatch.svg"
@@ -1609,13 +1612,41 @@ def reconcile_record(cfg: dict, st: dict) -> tuple:
               % socket.gethostname())
 
     up = cfg.setdefault("updates", {})
-    if rec.get("update_repo") is not None and \
-            up.get("repo", "") != rec.get("update_repo", ""):
-        notes.append("update source was repointed (%s -> %s); reverted"
-                     % (rec.get("update_repo") or "none", up.get("repo") or "none"))
-        up["repo"] = rec.get("update_repo", "")
-        reverted = True
-    if rec.get("update_branch") and up.get("branch") != rec.get("update_branch"):
+    rec_repo = rec.get("update_repo") or ""
+    cfg_repo = (up.get("repo") or "").strip()
+    if rec_repo != cfg_repo:
+        if not rec_repo:
+            # Adopting a source for the first time. Allowed - otherwise
+            # anyone who set up without one could never enable updates - but
+            # it hands a repository the power to run code as root here, so
+            # it is recorded and everybody hears about it.
+            rec["update_repo"] = cfg_repo
+            rec["update_branch"] = (up.get("branch") or "main")
+            save_record(rec)
+            notes.append("update source set to %s; accepted and pinned" % cfg_repo)
+            alert(cfg, st, "update_source_added",
+                  "An update source was added",
+                  "%s pointed the blocker on %s at a code repository:\n\n"
+                  "  %s (%s)\n\n"
+                  "From now on it can pull new versions from there and run "
+                  "them as root. Candidates must pass the project's own "
+                  "self-test first, and you will be emailed on every update "
+                  "that is applied - but whoever controls that repository has "
+                  "a lot of power over this machine. If it is %s's own repo, "
+                  "that is worth knowing about.\n"
+                  % (who(cfg), socket.gethostname(), cfg_repo,
+                     rec["update_branch"], who(cfg)), force=True)
+        elif not cfg_repo:
+            rec["update_repo"] = ""
+            save_record(rec)
+            notes.append("update source removed; accepted")
+        else:
+            notes.append("update source was repointed (%s -> %s); reverted"
+                         % (rec_repo, cfg_repo))
+            up["repo"] = rec_repo
+            reverted = True
+    if rec.get("update_branch") and cfg_repo and rec_repo and \
+            up.get("branch") != rec.get("update_branch"):
         notes.append("update branch was changed (%s -> %s); reverted"
                      % (rec.get("update_branch"), up.get("branch")))
         up["branch"] = rec.get("update_branch")
@@ -2790,6 +2821,33 @@ def install_program_files(cfg: dict, immutable: bool) -> list:
     return msgs
 
 
+def detect_origin(src_dir: str) -> dict:
+    """If this copy is a git checkout, note its remote so the wizard can
+    offer it as the update source."""
+    r = run(["git", "-C", src_dir, "remote", "get-url", "origin"], timeout=20)
+    if not r.ok or not r.out.strip():
+        return {}
+    url = r.out.strip()
+    b = run(["git", "-C", src_dir, "rev-parse", "--abbrev-ref", "HEAD"], timeout=20)
+    branch = b.out.strip() if b.ok else ""
+    if branch in ("", "HEAD"):
+        branch = "main"
+    if url.startswith("git@github.com:"):
+        url = "https://github.com/" + url.split(":", 1)[1]
+    return {"repo": url.removesuffix(".git"), "branch": branch}
+
+
+def write_source_hint(hint: dict) -> None:
+    if not hint:
+        return
+    try:
+        os.makedirs(P(RUN_DIR), exist_ok=True)
+        os.chmod(P(RUN_DIR), 0o755)
+        atomic_write(P(SOURCE_HINT), dump_json(hint), 0o644)
+    except OSError as exc:
+        log("could not write the source hint: %s" % exc)
+
+
 def cmd_install_app(args) -> int:
     """
     Stage one: put the app on the machine. Nothing is blocked, nothing is
@@ -2802,6 +2860,11 @@ def cmd_install_app(args) -> int:
     cfg = load_config() or json.loads(json.dumps(DEFAULT_CONFIG))
     for m in install_program_files(cfg, immutable=False):
         print(green("  " + m))
+    hint = detect_origin(os.path.dirname(os.path.abspath(__file__)))
+    if hint:
+        write_source_hint(hint)
+        print(green("  update source offered to the wizard: %s (%s)"
+                    % (hint["repo"], hint["branch"])))
     if not SANDBOX:
         probe = run([sys.executable, "-c", "import gi;"
                      "gi.require_version('Gtk','4.0');"
@@ -3333,6 +3396,49 @@ def maybe_update(cfg: dict, st: dict) -> None:
         log("applying the update failed: %r" % exc)
 
 
+def cmd_update_source(args) -> int:
+    """Point the updater at a repo (or switch it off) without editing JSON."""
+    require_root()
+    cfg = load_config()
+    if not cfg:
+        print(red("No config. Run: sudo %s setup" % PROG))
+        return 1
+    st = load_state()
+    up = cfg.setdefault("updates", {})
+    if args.off:
+        up["repo"] = ""
+        up["enabled"] = False
+    else:
+        url = (args.url or "").strip()
+        if not re.match(r"(https?://|git@|/|file://)", url):
+            print(red("  that does not look like a git URL"))
+            return 1
+        up["repo"] = url
+        up["branch"] = args.branch
+        up["enabled"] = True
+    wanted = str(up.get("repo") or "")      # copy: reconcile mutates in place
+    save_config(cfg)
+    cfg, notes = reconcile_record(cfg, st)
+    save_config(cfg)
+    save_state(st)
+    write_public_status(cfg, st)
+    for n in notes:
+        print(("  " + n) if "accepted" in n else red("  " + n))
+    live = str((cfg.get("updates") or {}).get("repo") or "")
+    if live == wanted:
+        print(green("\n  Update source is now: %s (%s)\n"
+                    % (live or "(none)", cfg["updates"].get("branch") or "main")))
+        return 0
+    print(red("""
+  Refused. It is still %s.
+
+  The source is pinned in the immutable install record. Repointing it would
+  let you feed this machine any code you liked, so it only changes during a
+  granted unlock window.
+""" % (live or "(none)")))
+    return 1
+
+
 def cmd_update(args) -> int:
     require_root()
     cfg = load_config()
@@ -3597,6 +3703,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--no-roundtrip", action="store_true")
     s.add_argument("--wait", type=int, default=90, help="seconds to wait for round trip")
     s.set_defaults(fn=cmd_test_email)
+
+    s = sub.add_parser("update-source",
+                       help="set (once) or clear where updates come from")
+    s.add_argument("url", nargs="?", default="")
+    s.add_argument("--branch", default="main")
+    s.add_argument("--off", action="store_true", help="switch updates off")
+    s.set_defaults(fn=cmd_update_source)
 
     s = sub.add_parser("update", help="pull a newer version from the pinned repo")
     s.add_argument("--check", action="store_true",

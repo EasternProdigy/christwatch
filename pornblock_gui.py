@@ -32,6 +32,7 @@ def P(path):
 
 
 STATUS_PATH = P("/run/pornblock/status.json")
+SOURCE_HINT = P("/run/pornblock/source-hint.json")
 CORE_BIN = "/usr/local/bin/pornblock"
 
 PROVIDERS = {
@@ -81,6 +82,15 @@ def read_status():
             return json.load(fh)
     except (OSError, ValueError):
         return None
+
+
+def read_source_hint():
+    """Where this copy was installed from, so the wizard can offer it."""
+    try:
+        with open(SOURCE_HINT, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
 
 
 def human_delta(seconds):
@@ -291,6 +301,21 @@ class SetupView(Gtk.Box):
             model=Gtk.StringList.new([label for _k, label in FILTERS]))
         g2.add(self.c_filter)
         b.append(g2)
+
+        hint = read_source_hint()
+        g3 = Adw.PreferencesGroup(
+            title="Updates",
+            description="Where new versions are pulled from. Whoever controls "
+                        "this repository can run code as root here, so a "
+                        "friend's fork is safer than your own. Blank switches "
+                        "updates off; you can add one later, but only once.")
+        self.e_repo = Adw.EntryRow(title="Git repository URL")
+        self.e_repo.set_text(hint.get("repo") or "")
+        self.e_branch = Adw.EntryRow(title="Branch")
+        self.e_branch.set_text(hint.get("branch") or "main")
+        g3.add(self.e_repo)
+        g3.add(self.e_branch)
+        b.append(g3)
         return "friction", b
 
     def _p_mailbox(self):
@@ -483,6 +508,14 @@ class SetupView(Gtk.Box):
             "cooloff_hours": float(self.s_cooloff.get_value()),
             "unlock_minutes": int(self.s_window.get_value()),
             "filter": FILTERS[self.c_filter.get_selected()][0],
+            "updates": {
+                "enabled": bool(self.e_repo.get_text().strip()),
+                "repo": self.e_repo.get_text().strip(),
+                "branch": self.e_branch.get_text().strip() or "main",
+                "check_hours": 24,
+                "auto_apply": False,
+                "require_unlock": False,
+            },
             "require_passphrase": True,
             "passphrase_recovery": bool(self.sw_recovery.get_active()),
             # left out entirely when blank, so the gate simply is not armed
@@ -1001,7 +1034,8 @@ class MainWindow(Adw.ApplicationWindow):
         self.current = None
         self.dash = None
 
-        for name, fn in (("setphrase", self.set_passphrase),
+        for name, fn in (("setsource", self.set_update_source),
+                         ("setphrase", self.set_passphrase),
                          ("update", self.do_update),
                          ("checkupdate", self.check_update),
                          ("testmail", self.do_test_email),
@@ -1014,6 +1048,7 @@ class MainWindow(Adw.ApplicationWindow):
         menu = Gio.Menu()
         s1 = Gio.Menu()
         s1.append("Set the partner passphrase", "win.setphrase")
+        s1.append("Set the update source", "win.setsource")
         s1.append("Check for updates", "win.checkupdate")
         s1.append("Send a test email", "win.testmail")
         menu.append_section(None, s1)
@@ -1070,6 +1105,53 @@ class MainWindow(Adw.ApplicationWindow):
         self.refresh()
 
     # -- menu actions -----------------------------------------------------
+
+    def set_update_source(self):
+        doc = read_status() or {}
+        upd = doc.get("update") or {}
+        if upd.get("repo"):
+            self.show_output(
+                "Already pinned",
+                "Updates already come from:\n\n  %s (%s)\n\n"
+                "That is recorded in the immutable install record and cannot "
+                "be repointed while the blocker is locked - otherwise it "
+                "would be a way to feed this machine any code you liked."
+                % (upd["repo"], upd.get("branch", "main")))
+            return
+        hint = read_source_hint()
+        url = Adw.EntryRow(title="Git repository URL")
+        url.set_text(hint.get("repo") or "")
+        branch = Adw.EntryRow(title="Branch")
+        branch.set_text(hint.get("branch") or "main")
+        box = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        box.add_css_class("boxed-list")
+        box.append(url)
+        box.append(branch)
+        d = Adw.AlertDialog(
+            heading="Where should updates come from?",
+            body="You can only set this once without an unlock. Whoever "
+                 "controls the repository can run code as root on this "
+                 "machine - candidates have to pass the project's own "
+                 "self-test, and all of your approvers are emailed when one "
+                 "is applied.")
+        d.set_extra_child(box)
+        d.add_response("no", "Not now")
+        d.add_response("yes", "Pin it")
+        d.set_response_appearance("yes", Adw.ResponseAppearance.SUGGESTED)
+        d.set_default_response("no")
+        d.set_close_response("no")
+
+        def resp(_d, r):
+            if r != "yes":
+                return
+            if not url.get_text().strip():
+                self.toast("Nothing entered")
+                return
+            run_privileged(["update-source", url.get_text().strip(),
+                            "--branch", branch.get_text().strip() or "main"],
+                           on_done=self.after_action)
+        d.connect("response", resp)
+        d.present(self)
 
     def check_update(self):
         self.toast("Checking for updates…")

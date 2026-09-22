@@ -119,6 +119,17 @@ def run(app):
         check("answers carry the friend's secrets",
               a["partner_passphrase"] == "secret-phrase"
               and a["email"]["smtp_password"] == "app-pw")
+        sv.e_repo.set_text("https://github.com/me/porn-block")
+        sv.e_branch.set_text("main")
+        a = sv.answers()
+        check("wizard collects the update source",
+              a["updates"]["repo"] == "https://github.com/me/porn-block"
+              and a["updates"]["enabled"] is True, a.get("updates"))
+        sv.e_repo.set_text("")
+        check("blank repo switches updates off",
+              sv.answers()["updates"]["enabled"] is False)
+        sv.e_repo.set_text("https://github.com/me/porn-block")
+        a = sv.answers()
         check("answers carry the arrangement",
               a["approvals_required"] == 2 and len(a["approvers"]) == 3
               and a["require_passphrase"] is True)

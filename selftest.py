@@ -350,6 +350,33 @@ check("turning off updates-need-an-unlock is reverted",
       got["updates"]["require_unlock"] is True)
 check("all three were reported", len([n for n in notes if "update" in n]) >= 2, notes)
 
+# Adopting a source for the first time has to be possible, or anyone who
+# set up without one could never turn updates on at all.
+plain = base_cfg()
+plain["updates"] = dict(pb.DEFAULT_CONFIG["updates"])
+plain["_secrets"] = {}
+pb.save_config(plain)
+pb.save_record(pb.record_from_config(plain))
+check("a fresh record pins no source", pb.load_record()["update_repo"] == "")
+adopt = pb.deep_merge(plain, {"updates": {"repo": "https://github.com/me/pb",
+                                          "branch": "main"}})
+adopt["_secrets"] = {}
+got, notes = pb.reconcile_record(adopt, pb.deep_merge(pb.DEFAULT_STATE, {}))
+check("setting a source the first time is accepted",
+      got["updates"]["repo"] == "https://github.com/me/pb", notes)
+check("and it gets pinned", pb.load_record()["update_repo"] == "https://github.com/me/pb")
+check("adopting one is announced", any("set to" in n for n in notes), notes)
+again = pb.deep_merge(adopt, {"updates": {"repo": "https://github.com/evil/pb"}})
+again["_secrets"] = {}
+got, notes = pb.reconcile_record(again, pb.deep_merge(pb.DEFAULT_STATE, {}))
+check("changing it afterwards is reverted",
+      got["updates"]["repo"] == "https://github.com/me/pb", notes)
+drop = pb.deep_merge(adopt, {"updates": {"repo": ""}})
+drop["_secrets"] = {}
+got, notes = pb.reconcile_record(drop, pb.deep_merge(pb.DEFAULT_STATE, {}))
+check("removing it is allowed (that is strictly safer)",
+      got["updates"]["repo"] == "" and pb.load_record()["update_repo"] == "")
+
 print("\n== packaging (skipped when not shipped in the tarball) ==")
 HERE = os.path.dirname(os.path.abspath(__file__))
 import subprocess  # noqa: E402
