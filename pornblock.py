@@ -81,6 +81,7 @@ BLOCKLIST_PATH = STATE_DIR + "/blocklist-porn.hosts"
 # quietly remove the passphrase gate along with it.
 RECORD_BACKUP = STATE_DIR + "/install-record.json.bak"
 BACKUP_DIR = STATE_DIR + "/backups"
+ACTIVITY_DIR = STATE_DIR + "/activity"
 
 LOG_PATH = "/var/log/pornblock.log"
 BIN_PATH = "/usr/local/bin/pornblock"
@@ -214,6 +215,19 @@ DEFAULT_CONFIG = {
         "auto_apply": True,
         "require_unlock": False,
     },
+    # What gets recorded once the blocker is active. The daily digest goes
+    # to every approver, so "dns_log" means they see all of your browsing,
+    # not only the blocked parts. That is the trade you chose.
+    "tracking": {
+        "enabled": True,
+        "screen_time": True,
+        "apps": True,
+        "dns_log": True,
+        "keep_days": 90,
+        "digest_enabled": True,
+        "digest_hour": 20,
+        "top_n": 15,
+    },
     "blocklist_url": BLOCKLIST_URL,
     "blocklist_refresh_hours": 24,
     "alert_min_interval_seconds": 900,
@@ -265,6 +279,7 @@ DEFAULT_STATE = {
     "update": {"last_check": 0, "installed_sha": "", "available": None,
                "last_applied": 0, "last_error": "", "last_remote_sha": "",
                "rolled_back": ""},
+    "activity": {"journal_cursor": "", "last_sample": 0, "last_digest_day": ""},
     "alerts": {},
     "enforced_once": False,
     "history": [],
@@ -1308,10 +1323,10 @@ def nft_script(cfg: dict) -> str:
         L.append("\t\tip6 daddr @doh6 tcp dport 443 reject with tcp reset")
         L.append("\t\tip daddr @doh4 udp dport 443 drop")
         L.append("\t\tip6 daddr @doh6 udp dport 443 drop")
-    L.append("\t\tudp dport 53 drop")
-    L.append("\t\ttcp dport 53 drop")
-    L.append("\t\ttcp dport 853 drop")
-    L.append("\t\tudp dport 853 drop")
+    L.append("\t\tudp dport 53 counter drop")
+    L.append("\t\ttcp dport 53 counter drop")
+    L.append("\t\ttcp dport 853 counter drop")
+    L.append("\t\tudp dport 853 counter drop")
     L.append("\t}")
     L.append("}")
     return "\n".join(L) + "\n"
@@ -1490,6 +1505,7 @@ def enforce_all(cfg: dict, st: dict, apply: bool, quiet: bool = False) -> list:
             changes += enforce_nftables(cfg, st, apply)
         if enf.get("firefox_policy", True) or enf.get("chromium_policy", True):
             changes += enforce_browsers(cfg, st, apply)
+        changes += enforce_dns_logging(cfg, apply)
     except Exception as exc:                                  # never crash-loop
         log("enforcement error: %r" % exc)
         changes.append("ERROR during enforcement: %r" % exc)
@@ -2117,6 +2133,382 @@ def advance(cfg: dict, st: dict, mailer: Mailer) -> list:
 
 
 # ==========================================================================
+# Activity tracking
+# ==========================================================================
+
+# Long-running desktop plumbing lives in app.slice too. Counting it would
+# bury the things you actually used under a pile of always-on daemons.
+_BACKGROUND_APPS = re.compile(
+    r"^(xdg-|geoclue|at-spi|gvfs|pipewire|wireplumber|dconf|gcr|kaccess|"
+    r"polkit|obex|tracker|evolution|goa-|gsd-|kde-systemd|plasma-|kwin|"
+    r"ksmserver|kactivitymanagerd|baloo|kglobalaccel|kscreen|powerdevil|"
+    r"org\.kde\.kded|org\.freedesktop\.)", re.I)
+
+_BL_CACHE = {"mtime": 0, "set": frozenset()}
+
+
+def blocklist_set() -> frozenset:
+    """Cached set of blocked domains, reloaded when the file changes."""
+    path = P(BLOCKLIST_PATH)
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return frozenset()
+    if mtime != _BL_CACHE["mtime"]:
+        _BL_CACHE["set"] = frozenset(blocklist_domains())
+        _BL_CACHE["mtime"] = mtime
+    return _BL_CACHE["set"]
+
+
+def is_blocked_domain(domain: str) -> bool:
+    bl = blocklist_set()
+    if not bl:
+        return False
+    parts = domain.split(".")
+    for i in range(len(parts) - 1):
+        if ".".join(parts[i:]) in bl:
+            return True
+    return False
+
+
+def today_str() -> str:
+    return dt.date.today().isoformat()
+
+
+def activity_path(day: str) -> str:
+    return "%s/%s.json" % (ACTIVITY_DIR, day)
+
+
+def load_day(day: str) -> dict:
+    return load_json(activity_path(day), {
+        "day": day, "screen_seconds": 0, "apps": {}, "domains": {},
+        "blocked": {}, "bypass": {}, "updated_at": 0})
+
+
+def save_day(day: str, doc: dict) -> None:
+    doc["updated_at"] = now()
+    real = P(activity_path(day))
+    os.makedirs(os.path.dirname(real), exist_ok=True)
+    with contextlib.suppress(OSError):
+        os.chmod(os.path.dirname(real), 0o700)
+    atomic_write(real, dump_json(doc), 0o600)
+
+
+def graphical_session() -> tuple:
+    """(session id, uid) of the active graphical session, or ("", 0)."""
+    r = run(["loginctl", "list-sessions", "--no-legend"], timeout=20)
+    if not r.ok:
+        return "", 0
+    for line in r.out.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        sid = parts[0]
+        d = run(["loginctl", "show-session", sid, "-p", "Type", "-p", "Active",
+                 "-p", "User", "-p", "IdleHint"], timeout=20)
+        props = dict(x.split("=", 1) for x in d.out.splitlines() if "=" in x)
+        if props.get("Type") in ("wayland", "x11") and props.get("Active") == "yes":
+            try:
+                return sid, int(props.get("User") or 0)
+            except ValueError:
+                return sid, 0
+    return "", 0
+
+
+def session_is_busy(sid: str) -> bool:
+    if not sid:
+        return False
+    d = run(["loginctl", "show-session", sid, "-p", "IdleHint", "-p", "Active",
+             "-p", "LockedHint"], timeout=20)
+    props = dict(x.split("=", 1) for x in d.out.splitlines() if "=" in x)
+    return (props.get("Active") == "yes" and props.get("IdleHint") == "no"
+            and props.get("LockedHint") != "yes")
+
+
+def app_name_from_cgroup(entry: str) -> str:
+    n = entry
+    for suf in (".scope", ".service"):
+        if n.endswith(suf):
+            n = n[:-len(suf)]
+    if not n.startswith("app-"):
+        return ""
+    n = n[4:].split("@", 1)[0]
+    n = re.sub(r"-\d{3,}$", "", n)
+    if n.startswith("flatpak-"):
+        n = n[len("flatpak-"):]
+    return n.replace("\\x2d", "-").strip("-")
+
+
+def running_apps(uid: int) -> list:
+    base = ("/sys/fs/cgroup/user.slice/user-%d.slice/user@%d.service/app.slice"
+            % (uid, uid))
+    try:
+        entries = os.listdir(base)
+    except OSError:
+        return []
+    out = []
+    for e in entries:
+        if "@autostart.service" in e:
+            continue
+        name = app_name_from_cgroup(e)
+        if name and not _BACKGROUND_APPS.match(name):
+            out.append(name)
+    return sorted(set(out))
+
+
+_DNS_LOOKUP = re.compile(r"Looking up RR for (\S+) IN (?:A|AAAA|HTTPS|SVCB)\b")
+_SKIP_DOMAIN = re.compile(
+    r"(\.in-addr\.arpa$|\.ip6\.arpa$|\.local$|^_|\.arpa$|^localhost$)", re.I)
+
+
+def harvest_dns(cfg: dict, st: dict, doc: dict) -> int:
+    """Pull new resolved debug lines and count the domains looked up."""
+    act = st.setdefault("activity", {})
+    args = ["journalctl", "-u", "systemd-resolved", "-o", "cat", "--no-pager",
+            "-q", "--show-cursor"]
+    cursor = act.get("journal_cursor") or ""
+    args += (["--after-cursor", cursor] if cursor else ["-n", "500"])
+    r = run(args, timeout=90)
+    if not r.ok:
+        return 0
+    seen = 0
+    for line in r.out.splitlines():
+        if line.startswith("-- cursor:"):
+            act["journal_cursor"] = line.split(":", 1)[1].strip()
+            continue
+        m = _DNS_LOOKUP.search(line)
+        if not m:
+            continue
+        domain = m.group(1).rstrip(".").lower()
+        if not domain or _SKIP_DOMAIN.search(domain):
+            continue
+        doc["domains"][domain] = doc["domains"].get(domain, 0) + 1
+        seen += 1
+        if is_blocked_domain(domain):
+            doc["blocked"][domain] = doc["blocked"].get(domain, 0) + 1
+    return seen
+
+
+def enforce_dns_logging(cfg: dict, apply: bool) -> list:
+    """resolved only logs queries at debug level, and the setting is runtime
+    only - so it has to be re-asserted like everything else here."""
+    if SANDBOX:
+        return []
+    trk = cfg.get("tracking") or {}
+    want = "debug" if (apply and trk.get("enabled", True)
+                       and trk.get("dns_log", True)) else "info"
+    r = run(["resolvectl", "log-level"], timeout=20)
+    if r.ok and r.out.strip() == want:
+        return []
+    res = run(["resolvectl", "log-level", want], timeout=20)
+    if not res.ok:
+        return []
+    return ["systemd-resolved logging set to %s (domain tracking)" % want]
+
+
+def read_nft_counters() -> dict:
+    if SANDBOX:
+        return {}
+    r = run(["nft", "-j", "list", "table", "inet", "pornblock"], timeout=30)
+    if not r.ok:
+        return {}
+    try:
+        doc = json.loads(r.out)
+    except ValueError:
+        return {}
+    total = 0
+    for item in doc.get("nftables", []):
+        rule = item.get("rule")
+        if not rule:
+            continue
+        verdict = json.dumps(rule.get("expr", []))
+        if '"drop"' not in verdict and '"reject"' not in verdict:
+            continue
+        for expr in rule.get("expr", []):
+            c = expr.get("counter")
+            if isinstance(c, dict):
+                total += int(c.get("packets") or 0)
+    return {"dns_bypass_packets": total}
+
+
+def sample_activity(cfg: dict, st: dict) -> None:
+    """One sampling pass. Cheap, and never fatal."""
+    trk = cfg.get("tracking") or {}
+    if not trk.get("enabled", True):
+        return
+    act = st.setdefault("activity", {})
+    last = float(act.get("last_sample") or 0)
+    elapsed = min(300.0, max(0.0, now() - last)) if last else 0.0
+    act["last_sample"] = now()
+
+    day = today_str()
+    doc = load_day(day)
+    sid, uid = graphical_session()
+    busy = session_is_busy(sid)
+
+    if elapsed and busy and trk.get("screen_time", True):
+        doc["screen_seconds"] = int(doc.get("screen_seconds", 0) + elapsed)
+    if elapsed and busy and trk.get("apps", True) and uid:
+        for app in running_apps(uid):
+            doc["apps"][app] = int(doc["apps"].get(app, 0) + elapsed)
+    if trk.get("dns_log", True):
+        harvest_dns(cfg, st, doc)
+    counters = read_nft_counters()
+    if counters:
+        doc["bypass"] = counters
+    save_day(day, doc)
+    prune_activity(cfg)
+
+
+def prune_activity(cfg: dict) -> None:
+    keep = int((cfg.get("tracking") or {}).get("keep_days") or 90)
+    cutoff = dt.date.today() - dt.timedelta(days=keep)
+    try:
+        names = os.listdir(P(ACTIVITY_DIR))
+    except OSError:
+        return
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        try:
+            d = dt.date.fromisoformat(name[:-5])
+        except ValueError:
+            continue
+        if d < cutoff:
+            with contextlib.suppress(OSError):
+                os.unlink(os.path.join(P(ACTIVITY_DIR), name))
+
+
+def summarise_day(cfg: dict, day: str) -> dict:
+    doc = load_day(day)
+    top = int((cfg.get("tracking") or {}).get("top_n") or 15)
+    apps = sorted(doc.get("apps", {}).items(), key=lambda kv: -kv[1])[:top]
+    domains = sorted(doc.get("domains", {}).items(), key=lambda kv: -kv[1])[:top]
+    blocked = sorted(doc.get("blocked", {}).items(), key=lambda kv: -kv[1])[:top]
+    return {
+        "day": day,
+        "screen_seconds": int(doc.get("screen_seconds", 0)),
+        "apps": apps,
+        "domains": domains,
+        "blocked": blocked,
+        "unique_domains": len(doc.get("domains", {})),
+        "blocked_hits": sum(doc.get("blocked", {}).values()),
+        "blocked_unique": len(doc.get("blocked", {})),
+        "bypass": doc.get("bypass", {}),
+    }
+
+
+def digest_body(cfg: dict, day: str) -> tuple:
+    d = summarise_day(cfg, day)
+    trk = cfg.get("tracking") or {}
+    lines = [
+        "Daily report for %s on %s" % (who(cfg), socket.gethostname()),
+        "=" * 58,
+        "",
+        "  Screen time      : %s" % human_delta(d["screen_seconds"]),
+        "  Sites looked up  : %d unique domains" % d["unique_domains"],
+        "  Blocked attempts : %d hits across %d blocked domains"
+        % (d["blocked_hits"], d["blocked_unique"]),
+    ]
+    byp = (d.get("bypass") or {}).get("dns_bypass_packets")
+    if byp:
+        lines.append("  DNS bypass       : %d packets dropped trying to reach "
+                     "another resolver" % byp)
+    lines.append("")
+    if d["blocked"]:
+        lines += ["  Blocked domains that were requested:"]
+        lines += ["    %-45s %d" % (n, c) for n, c in d["blocked"]]
+        lines += ["",
+                  "  A request does not mean a page was seen - these were "
+                  "stopped. But",
+                  "  something asked for them.", ""]
+    else:
+        lines += ["  Nothing on the blocklist was requested today.", ""]
+    if d["apps"]:
+        lines += ["  Applications open while you were at the machine:"]
+        lines += ["    %-45s %s" % (n, human_delta(sec)) for n, sec in d["apps"]]
+        lines += [""]
+    if trk.get("dns_log", True) and d["domains"]:
+        lines += ["  Most looked-up domains (all browsing, not just blocked):"]
+        lines += ["    %-45s %d" % (n, c) for n, c in d["domains"]]
+        lines += [""]
+    lines += [
+        "-" * 58,
+        "You are getting this because %s asked you to hold them to it."
+        % who(cfg),
+        "App time is time the application was open while the screen was in",
+        "use - not time spent looking at it.",
+    ]
+    return ("Daily report for %s - %s" % (who(cfg), day), "\n".join(lines) + "\n")
+
+
+def maybe_digest(cfg: dict, st: dict, mailer) -> None:
+    trk = cfg.get("tracking") or {}
+    if not (trk.get("enabled", True) and trk.get("digest_enabled", True)):
+        return
+    act = st.setdefault("activity", {})
+    day = today_str()
+    if act.get("last_digest_day") == day:
+        return
+    if dt.datetime.now().hour < int(trk.get("digest_hour") or 20):
+        return
+    act["last_digest_day"] = day
+    subject, text = digest_body(cfg, day)
+    alert(cfg, st, "digest", subject, text, force=True)
+    history(st, "daily report sent for %s" % day)
+
+
+def cmd_activity(args) -> int:
+    require_root()
+    cfg = load_config()
+    if not cfg:
+        print(red("No config. Run: sudo %s setup" % PROG))
+        return 1
+    day = args.day or today_str()
+    if args.json:
+        print(dump_json(summarise_day(cfg, day)))
+        return 0
+    if args.send:
+        st = load_state()
+        subject, text = digest_body(cfg, day)
+        ok = alert(cfg, st, "digest_manual", subject, text, force=True)
+        save_state(st)
+        print(green("  report sent") if ok else yellow("  queued for retry"))
+        return 0
+    d = summarise_day(cfg, day)
+    print("")
+    print(bold("  Activity for %s" % day))
+    print("  " + "=" * 64)
+    print("  screen time      : %s" % human_delta(d["screen_seconds"]))
+    print("  domains looked up: %d unique" % d["unique_domains"])
+    print("  blocked attempts : %s"
+          % (red("%d hits / %d domains" % (d["blocked_hits"], d["blocked_unique"]))
+             if d["blocked_hits"] else green("none")))
+    byp = (d.get("bypass") or {}).get("dns_bypass_packets")
+    if byp:
+        print("  dns bypass drops : %d packets" % byp)
+    if d["blocked"]:
+        print("  " + "-" * 64)
+        print("  blocked domains requested")
+        for n, c in d["blocked"]:
+            print("      %-46s %d" % (n, c))
+    if d["apps"]:
+        print("  " + "-" * 64)
+        print("  applications open while you were at the machine")
+        for n, sec in d["apps"]:
+            print("      %-46s %s" % (n, human_delta(sec)))
+    if args.domains and d["domains"]:
+        print("  " + "-" * 64)
+        print("  most looked-up domains")
+        for n, c in d["domains"]:
+            print("      %-46s %d" % (n, c))
+    elif d["domains"]:
+        print("  " + dim("  (--domains to list what was looked up)"))
+    print("")
+    return 0
+
+
+# ==========================================================================
 # Public status snapshot -- what the desktop app reads
 # ==========================================================================
 
@@ -2155,6 +2547,10 @@ def public_status_doc(cfg: dict, st: dict) -> dict:
         "passphrase_fails": int((st.get("passphrase") or {}).get("fails") or 0),
         "recovery_enabled": bool(cfg.get("passphrase_recovery", True)),
         "queued_emails": len(st.get("outbox") or []),
+        "armed": bool(os.path.exists(P(UNIT_SERVICE)) and
+                      (SANDBOX or systemctl("is-enabled", "pornblock.service")
+                       .out.strip() == "enabled")),
+        "tracking": _public_activity(cfg),
         "update": {
             "enabled": bool((cfg.get("updates") or {}).get("enabled", True)),
             "repo": (cfg.get("updates") or {}).get("repo", ""),
@@ -2194,6 +2590,31 @@ def public_status_doc(cfg: dict, st: dict) -> dict:
     except Exception as exc:
         log("health probe failed: %r" % exc)
     return doc
+
+
+def _public_activity(cfg: dict) -> dict:
+    """Aggregates for the app. The full list of what you looked up stays
+    root-only; seeing that costs an authentication prompt."""
+    trk = cfg.get("tracking") or {}
+    if not trk.get("enabled", True):
+        return {"enabled": False}
+    try:
+        d = summarise_day(cfg, today_str())
+    except Exception:
+        return {"enabled": True, "error": True}
+    return {
+        "enabled": True,
+        "day": d["day"],
+        "screen_seconds": d["screen_seconds"],
+        "apps": d["apps"][:8],
+        "unique_domains": d["unique_domains"],
+        "blocked_hits": d["blocked_hits"],
+        "blocked_unique": d["blocked_unique"],
+        "blocked": d["blocked"][:8],
+        "bypass": d.get("bypass", {}),
+        "digest_hour": int(trk.get("digest_hour") or 20),
+        "dns_log": bool(trk.get("dns_log", True)),
+    }
 
 
 def write_public_status(cfg: dict, st: dict) -> None:
@@ -2472,6 +2893,7 @@ def cmd_setup(args) -> int:
     save_config(cfg)
     log("setup written by %s" % (os.environ.get("SUDO_USER") or "root"))
 
+    write_public_status(cfg, load_state())
     print(green("\n  Saved %s (0600)" % P(CONFIG_PATH)))
     print(green("  Secrets in %s (0600, immutable)" % P(SECRETS_PATH)))
     print("""
@@ -3056,6 +3478,11 @@ def tick(cfg_override=None) -> dict:
     quiet = bool(moves) or bool(notes) or bl == "refreshed" or not st.get("enforced_once")
     changes = enforce_all(cfg, st, apply, quiet=quiet)
     guard_units(cfg, st)
+    try:
+        sample_activity(cfg, st)
+        maybe_digest(cfg, st, mailer)
+    except Exception as exc:                      # tracking must never wedge it
+        log("activity sampling failed: %r" % exc)
     mailer.flush_outbox(st)
     write_public_status(cfg, st)
     save_state(st)
@@ -3774,6 +4201,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--no-roundtrip", action="store_true")
     s.add_argument("--wait", type=int, default=90, help="seconds to wait for round trip")
     s.set_defaults(fn=cmd_test_email)
+
+    s = sub.add_parser("activity", help="what has happened on this machine today")
+    s.add_argument("--day", help="YYYY-MM-DD (default today)")
+    s.add_argument("--domains", action="store_true", help="list looked-up domains")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--send", action="store_true", help="email the report now")
+    s.set_defaults(fn=cmd_activity)
 
     s = sub.add_parser("update-source",
                        help="set (once) or clear where updates come from")

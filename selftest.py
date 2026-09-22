@@ -2,6 +2,7 @@
 """Offline checks for pornblock. Runs entirely inside a throwaway sandbox."""
 
 import json
+import datetime as dt
 import os
 import re
 import shutil
@@ -94,7 +95,8 @@ script = pb.nft_script(cfg)
 check("only touches its own table", script.count("table inet pornblock") == 3
       and "flush ruleset" not in script)
 check("filter IPs allowed on 53/853", "@filter4 udp dport { 53, 853 } accept" in script)
-check("everything else on 53 dropped", "udp dport 53 drop" in script)
+check("everything else on 53 dropped and counted",
+      "udp dport 53 counter drop" in script)
 check("expected rule count matches the ruleset",
       pb.nft_expected_rules(cfg) == 15,
       str(pb.nft_expected_rules(cfg)))
@@ -376,6 +378,74 @@ drop["_secrets"] = {}
 got, notes = pb.reconcile_record(drop, pb.deep_merge(pb.DEFAULT_STATE, {}))
 check("removing it is allowed (that is strictly safer)",
       got["updates"]["repo"] == "" and pb.load_record()["update_repo"] == "")
+
+print("\n== activity tracking ==")
+check("flatpak scope -> app id",
+      pb.app_name_from_cgroup("app-flatpak-org.signal.Signal-3017974932.scope")
+      == "org.signal.Signal")
+check("plain scope -> app name",
+      pb.app_name_from_cgroup("app-code-4739.scope") == "code")
+check("templated service -> app id",
+      pb.app_name_from_cgroup("app-com.rtosta.zapzap@acdb378d.service")
+      == "com.rtosta.zapzap")
+check("non-app cgroup ignored", pb.app_name_from_cgroup("session-2.scope") == "")
+check("background plumbing is filtered",
+      bool(pb._BACKGROUND_APPS.match("xdg-desktop-portal"))
+      and bool(pb._BACKGROUND_APPS.match("pipewire"))
+      and not pb._BACKGROUND_APPS.match("org.mozilla.firefox"))
+
+LINE = "Looking up RR for news.example.com IN AAAA."
+check("resolved debug line is parsed",
+      pb._DNS_LOOKUP.search(LINE).group(1) == "news.example.com")
+check("reverse lookups are skipped",
+      bool(pb._SKIP_DOMAIN.search("1.0.168.192.in-addr.arpa")))
+check("service records are skipped", bool(pb._SKIP_DOMAIN.search("_ldap._tcp")))
+check("ordinary names are kept", not pb._SKIP_DOMAIN.search("news.example.com"))
+
+with open(pb.P(pb.BLOCKLIST_PATH), "w") as fh:
+    fh.write("0.0.0.0 badsite.example\n0.0.0.0 other.example\n")
+pb._BL_CACHE["mtime"] = 0
+check("exact blocked domain matches", pb.is_blocked_domain("badsite.example"))
+check("subdomain of a blocked domain matches",
+      pb.is_blocked_domain("cdn.img.badsite.example"))
+check("unrelated domain does not match", not pb.is_blocked_domain("example.com"))
+check("lookalike suffix does not match",
+      not pb.is_blocked_domain("notbadsite.example"))
+
+cfg = base_cfg()
+day = pb.today_str()
+pb.save_day(day, {"day": day, "screen_seconds": 3725,
+                  "apps": {"org.mozilla.firefox": 3600, "code": 1200},
+                  "domains": {"example.com": 12, "badsite.example": 3},
+                  "blocked": {"badsite.example": 3},
+                  "bypass": {"dns_bypass_packets": 7}, "updated_at": 0})
+d = pb.summarise_day(cfg, day)
+check("screen time summarised", d["screen_seconds"] == 3725)
+check("apps ranked by time", d["apps"][0][0] == "org.mozilla.firefox")
+check("blocked hits counted", d["blocked_hits"] == 3 and d["blocked_unique"] == 1)
+check("day file is root-only",
+      oct(os.stat(pb.P(pb.activity_path(day))).st_mode)[-3:] == "600")
+subject, text = pb.digest_body(cfg, day)
+check("digest names the day", day in subject)
+check("digest reports screen time", "1h 2m 5s" in text, text[:200])
+check("digest lists the blocked domain", "badsite.example" in text)
+check("digest reports bypass drops", "7 packets" in text)
+check("digest explains what app time means", "not time spent looking at it" in text)
+
+old_day = (dt.date.today() - dt.timedelta(days=400)).isoformat()
+pb.save_day(old_day, {"day": old_day, "screen_seconds": 1, "apps": {},
+                      "domains": {}, "blocked": {}, "bypass": {}})
+pb.prune_activity(cfg)
+check("old days are pruned", not os.path.exists(pb.P(pb.activity_path(old_day))))
+check("today survives pruning", os.path.exists(pb.P(pb.activity_path(day))))
+
+pubcfg = base_cfg()
+pubcfg["_secrets"] = {}
+pub = pb._public_activity(pubcfg)
+check("public summary has the aggregates",
+      pub["screen_seconds"] == 3725 and pub["blocked_hits"] == 3)
+check("public summary does NOT leak the browsing list",
+      "domains" not in pub and "example.com" not in json.dumps(pub))
 
 print("\n== packaging (skipped when not shipped in the tarball) ==")
 HERE = os.path.dirname(os.path.abspath(__file__))

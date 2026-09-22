@@ -52,6 +52,14 @@ def doc(mode, avail=False):
                     "last_check": t - 60, "last_error": "",
                     "available": ({"version": "1.1.0", "sha": "f02e8058d9c7",
                                    "subject": "new thing"} if avail else None)},
+         "armed": True,
+         "tracking": {"enabled": True, "day": "2026-09-21", "screen_seconds": 14820,
+                      "apps": [["org.mozilla.firefox", 9000], ["code", 5400],
+                               ["org.kde.konsole", 1800]],
+                      "unique_domains": 214, "blocked_hits": 4, "blocked_unique": 2,
+                      "blocked": [["badsite.example", 3], ["other.example", 1]],
+                      "bypass": {"dns_bypass_packets": 12},
+                      "digest_hour": 20, "dns_log": True},
          "request": None, "unlock": None, "history": []}
     if mode == "PENDING":
         d["request"] = {"token": "A1B2C3D4", "requested_at": t - 60,
@@ -187,6 +195,29 @@ def run(app):
         check("satisfied passphrase hides the button", not d.b_phrase.get_visible())
         check("health failure is surfaced", "Not fully enforced" in d.banner.get_title()
               or d.banner.get_revealed())
+        print("\n== today panel ==")
+        d.update(doc("LOCKED"))
+        check("today panel shown", d.g_today.get_visible())
+        titles0 = [w.get_title() for w in d._kids["today"]]
+        subs0 = [w.get_subtitle() or "" for w in d._kids["today"]]
+        check("digest time explained", any("20:00" in t for t in titles0), titles0)
+        check("says all browsing is included",
+              any("every domain looked up" in x.lower() for x in subs0), subs0)
+        check("today rows populated", len(d._kids["today"]) >= 6,
+              len(d._kids["today"]))
+        titles = [w.get_title() for w in d._kids["today"]]
+        check("screen time row", "Screen time" in titles)
+        check("blocked attempts row", "Blocked attempts" in titles)
+        check("blocked domains listed", any("badsite.example" in t for t in titles))
+        check("bypass attempts surfaced",
+              any("DNS bypass" in t for t in titles))
+        check("apps listed", any("firefox" in t for t in titles))
+        off = doc("LOCKED"); off["tracking"] = {"enabled": False}
+        d.update(off)
+        check("panel hides when tracking is off", not d.g_today.get_visible())
+        check("no stale rows left behind", len(d._kids["today"]) == 0)
+
+        print("\n== dashboard (continued) ==")
         d.update(doc("UNLOCKED"))
         d.tick()
         check("unlocked state", d.l_mode.get_label() == "Unlocked")

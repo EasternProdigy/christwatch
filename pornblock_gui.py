@@ -733,6 +733,14 @@ class Dashboard(Gtk.Box):
         self.g_people = Adw.PreferencesGroup(title="Your approvers")
         col.append(self.g_people)
 
+        self.g_today = Adw.PreferencesGroup(title="Today")
+        report = Gtk.Button(label="Full report", valign=Gtk.Align.CENTER)
+        report.add_css_class("flat")
+        report.set_tooltip_text("Everything looked up today (asks for your password)")
+        report.connect("clicked", lambda *_: self.window.full_report())
+        self.g_today.set_header_suffix(report)
+        col.append(self.g_today)
+
         # -- collapsible detail ---------------------------------------
         self.g_detail = Adw.PreferencesGroup()
         self.x_setup = Adw.ExpanderRow(title="The arrangement")
@@ -747,7 +755,8 @@ class Dashboard(Gtk.Box):
 
         sw.set_child(Adw.Clamp(maximum_size=620, child=col))
         self.append(sw)
-        self._kids = {"setup": [], "health": [], "people": [], "update": []}
+        self._kids = {"setup": [], "health": [], "people": [], "update": [],
+                      "today": []}
 
     # -- helpers ----------------------------------------------------------
 
@@ -859,6 +868,49 @@ class Dashboard(Gtk.Box):
                     img.add_css_class("success")
                     r.add_suffix(img)
             self._put("people", self.g_people, r)
+
+        # today
+        trk = self.doc.get("tracking") or {}
+        self._reset("today", self.g_today)
+        self.g_today.set_visible(bool(trk.get("enabled")))
+        if trk.get("enabled"):
+            self.g_today.set_description("What your approvers see tonight.")
+            self._put("today", self.g_today,
+                      row("Screen time", human_delta(trk.get("screen_seconds", 0)),
+                          "preferences-desktop-display-symbolic"))
+            hits = int(trk.get("blocked_hits") or 0)
+            r = Adw.ActionRow(
+                title="Blocked attempts",
+                subtitle=("%d request(s) to %d blocked domain(s)"
+                          % (hits, trk.get("blocked_unique", 0))) if hits
+                else "nothing on the blocklist was asked for")
+            img = Gtk.Image.new_from_icon_name(
+                "dialog-warning-symbolic" if hits else "object-select-symbolic")
+            img.add_css_class("warning" if hits else "success")
+            r.add_prefix(img)
+            self._put("today", self.g_today, r)
+            for name, count in (trk.get("blocked") or [])[:5]:
+                self._put("today", self.g_today,
+                          row("    " + name, "%d request(s)" % count))
+            self._put("today", self.g_today,
+                      row("Sites looked up",
+                          "%d unique domains" % trk.get("unique_domains", 0),
+                          "network-server-symbolic"))
+            byp = (trk.get("bypass") or {}).get("dns_bypass_packets")
+            if byp:
+                self._put("today", self.g_today,
+                          row("DNS bypass attempts", "%d packets dropped" % byp,
+                              "dialog-warning-symbolic"))
+            for name, secs in (trk.get("apps") or [])[:6]:
+                self._put("today", self.g_today,
+                          row(name, human_delta(secs),
+                              "application-x-executable-symbolic"))
+            self._put("today", self.g_today,
+                      row("Daily report at %02d:00" % int(trk.get("digest_hour", 20)),
+                          "Includes every domain looked up, not only blocked ones"
+                          if trk.get("dns_log") else
+                          "Screen time, apps and blocked attempts",
+                          "mail-send-symbolic"))
 
         # detail: the arrangement
         self._reset("setup", self.x_setup, True)
@@ -1034,7 +1086,8 @@ class MainWindow(Adw.ApplicationWindow):
         self.current = None
         self.dash = None
 
-        for name, fn in (("setsource", self.set_update_source),
+        for name, fn in (("fullreport", self.full_report),
+                         ("setsource", self.set_update_source),
                          ("setphrase", self.set_passphrase),
                          ("update", self.do_update),
                          ("checkupdate", self.check_update),
@@ -1053,6 +1106,7 @@ class MainWindow(Adw.ApplicationWindow):
         s1.append("Send a test email", "win.testmail")
         menu.append_section(None, s1)
         s2 = Gio.Menu()
+        s2.append("Today's full report", "win.fullreport")
         s2.append("Recent activity", "win.activity")
         s2.append("About ChristWatch", "win.about")
         menu.append_section(None, s2)
@@ -1247,6 +1301,13 @@ class MainWindow(Adw.ApplicationWindow):
                        self.show_output("Email test " + ("passed" if ok
                                                          else "failed"), out))
 
+    def full_report(self):
+        self.toast("Building today's report\u2026")
+        run_privileged(["activity", "--domains"], on_done=lambda ok, out:
+                       self.show_output("Today", out,
+                                        "This is what your approvers get "
+                                        "emailed tonight."))
+
     def show_activity(self):
         doc = read_status() or {}
         lines = ["%s  %s" % (stamp(h.get("at")), h.get("event"))
@@ -1286,6 +1347,35 @@ class MainWindow(Adw.ApplicationWindow):
                 self.current = "dash"
             self.title_w.set_subtitle(doc.get("hostname", ""))
             self.dash.update(doc)
+            return
+        if doc and doc.get("configured") and not doc.get("armed"):
+            if self.current != "arm":
+                sp = Adw.StatusPage(
+                    icon_name="security-medium-symbolic",
+                    title="Set up, but not switched on",
+                    description="Your approvers, the mailbox and the secrets "
+                                "are saved. Nothing is being blocked yet and "
+                                "nothing is being recorded yet.\n\n"
+                                "Switching it on starts the blocking, the "
+                                "watchdog and the daily report to your "
+                                "friends. Switching it back off needs the "
+                                "cool-off, their approval and the passphrase.")
+                b = Gtk.Button(label="Activate protection", halign=Gtk.Align.CENTER)
+                b.add_css_class("pill")
+                b.add_css_class("suggested-action")
+
+                def arm(*_):
+                    b.set_sensitive(False)
+                    self.toast("Activating\u2026")
+                    run_privileged(["install"], on_done=lambda ok, out:
+                                   (self.show_output(
+                                       "Activation " + ("complete" if ok
+                                                        else "failed"), out)
+                                    or self.refresh()))
+                b.connect("clicked", arm)
+                sp.set_child(b)
+                self.view.set_content(sp)
+                self.current = "arm"
             return
         if os.path.exists(P("/etc/systemd/system/pornblock.service")):
             if self.current != "wait":

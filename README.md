@@ -92,6 +92,11 @@ git clone https://github.com/EasternProdigy/christwatch && cd porn-block
 
 ### Stage 2 - open ChristWatch and go through the wizard
 
+If you set up from the terminal without arming it, the app opens on a
+**"Set up, but not switched on"** screen with a single **Activate
+protection** button. Nothing is blocked and nothing is recorded until you
+press it.
+
 Six pages: you, your approvers, the friction, the mailbox, **your friend's
 turn at the keyboard**, and install. It ends by writing the config, enabling
 the service and switching blocking on.
@@ -244,6 +249,11 @@ Edit `/etc/pornblock/config.json`, then `sudo systemctl restart pornblock`.
 | `loop_seconds` | `45` | How often everything is re-applied |
 | `blocklist_refresh_hours` | `24` | How often the list is re-downloaded |
 | `app_name` | `ChristWatch` | Name on the desktop icon |
+| `tracking.enabled` | `true` | Record anything at all |
+| `tracking.dns_log` | `true` | Log every domain looked up |
+| `tracking.digest_hour` | `20` | Local hour the daily report is emailed |
+| `tracking.keep_days` | `90` | How long daily logs are kept |
+| `tracking.top_n` | `15` | Rows per section in the report |
 | `updates.repo` | - | Git URL to pull new versions from |
 | `updates.branch` | `main` | Branch to track |
 | `updates.check_minutes` | `15` | How often the daemon looks (cheap: `git ls-remote`) |
@@ -269,6 +279,55 @@ compares the live config against it:
   sanctioned way to change your approvers: earn an unlock first.
 * Reinstalling does **not** reset the record. Deleting the record restores it
   from the spare copy in `/var/lib/pornblock/` and emails everyone.
+
+## What it records
+
+Once it is switched on, it keeps a daily log and emails your approvers a
+report every evening.
+
+| Recorded | How |
+|---|---|
+| **Screen time** | Seconds where your session was active, unlocked and not idle (logind) |
+| **Applications** | Time each app was *open* while you were at the machine, from its systemd cgroup |
+| **Every domain looked up** | Parsed from systemd-resolved's own query log |
+| **Blocked attempts** | Domains requested that are on the blocklist, counted separately |
+| **DNS bypass attempts** | nftables counters on the drop rules - something trying to reach another resolver |
+
+```bash
+sudo pornblock activity              # today
+sudo pornblock activity --domains    # ...including everything looked up
+sudo pornblock activity --day 2026-09-20
+sudo pornblock activity --send       # email the report now
+```
+
+The app shows a **Today** panel with the same numbers and a **Full report**
+button. Aggregates live in the world-readable status file so the app can
+show them without a password; the list of what you actually looked up is
+root-only, so seeing that costs an authentication prompt.
+
+Days are kept for `tracking.keep_days` (90) and then deleted.
+
+### Be clear about what this means
+
+**Your approvers get a list of every domain your machine looked up.** Not
+just the blocked ones - your banking, your health searches, your job
+hunting, the lot. That is what "core + every domain" buys: there is nowhere
+to hide, including places you might reasonably want to. Set
+`tracking.dns_log` to `false` to keep screen time, apps and blocked attempts
+without the full browsing list.
+
+**It does not record keystrokes or take screenshots**, and it will not be
+made to. That kind of capture sweeps up passwords, card numbers and other
+people's messages in your chats, and all of it would be emailed to your
+friends. The accountability value does not come close to justifying it.
+
+**App time is "open", not "looked at".** Wayland deliberately does not let a
+background process see which window is in front. A browser left open all day
+reads as all day.
+
+**Domain logging needs systemd-resolved at debug level**, which the daemon
+sets and re-asserts. That makes the journal considerably noisier; journald's
+own size caps still apply.
 
 ## Updating from GitHub
 
