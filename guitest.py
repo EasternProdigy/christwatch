@@ -137,9 +137,29 @@ def run(app):
         check("impossible quorum is rejected", bool(sv.validate(2)))
         sv.s_threshold.set_value(2)
         check("workable quorum accepted", sv.validate(2) is None)
-        sv.e_mailbox.set_text("bot@gmail.com")
-        check("provider autofill", sv.e_smtp_host.get_text() == "smtp.gmail.com"
+        check("the mailbox page starts on a real provider, already filled in",
+              sv.e_smtp_host.get_text() == "smtp.gmail.com"
+              and sv.e_imap_host.get_text() == "imap.gmail.com",
+              sv.e_smtp_host.get_text())
+        check("server settings start folded away", not sv.x_servers.get_expanded())
+        check("it says how to get an app password",
+              "app password" in sv.l_howto.get_label().lower())
+        sv.c_provider.set_selected(len(G.PROVIDER_CHOICES) - 1)   # something else
+        check("picking 'something else' opens the server settings",
+              sv.x_servers.get_expanded())
+        sv.c_provider.set_selected(2)                             # fastmail
+        check("picking a provider fills it in and folds them away",
+              sv.e_smtp_host.get_text() == "smtp.fastmail.com"
+              and not sv.x_servers.get_expanded(), sv.e_smtp_host.get_text())
+        check("a hand-picked provider is not overridden by the address",
+              (sv.e_mailbox.set_text("bot@gmail.com") or
+               sv.e_smtp_host.get_text()) == "smtp.fastmail.com")
+        sv._provider_manual = False
+        sv.e_mailbox.set_text("bot2@gmail.com")
+        check("but an untouched picker follows the address",
+              sv.e_smtp_host.get_text() == "smtp.gmail.com"
               and int(sv.s_imap_port.get_value()) == 993, sv.e_smtp_host.get_text())
+        sv.e_mailbox.set_text("bot@gmail.com")
         check("mailbox page accepted", sv.validate(4) is None, sv.validate(4))
         sv.p_mailpass.set_text("app-pw")
         sv.p_phrase1.set_text("secret-phrase")
@@ -149,6 +169,8 @@ def run(app):
         sv.p_phrase1.set_text("short")
         sv.p_phrase2.set_text("short")
         check("short passphrase rejected", bool(sv.validate(5)))
+        check("the mailbox can be tried before installing",
+              sv.b_check.get_sensitive() and not sv.l_check.get_visible())
         sv.p_phrase1.set_text("secret-phrase")
         sv.p_phrase2.set_text("secret-phrase")
         sv.s_threshold.set_value(3)          # 3 of 3 with recovery on

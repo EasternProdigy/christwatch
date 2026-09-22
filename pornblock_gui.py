@@ -49,6 +49,38 @@ def app_icon():
     return None
 
 
+PROVIDER_CHOICES = [
+    ("Gmail", "gmail.com",
+     "Make a fresh Gmail account for this, not your own. In that account turn "
+     "on 2-Step Verification, then go to myaccount.google.com/apppasswords and "
+     "create an app password. The 16-character password it shows you is what "
+     "your friend types on the next page."),
+    ("iCloud Mail", "icloud.com",
+     "Sign in at account.apple.com, open Sign-In and Security, and create an "
+     "app-specific password. That is what your friend types on the next page."),
+    ("Fastmail", "fastmail.com",
+     "Settings, then Privacy & Security, then App passwords. Give it access to "
+     "Mail (IMAP and SMTP). The password is shown once, so copy it then."),
+    ("Yahoo Mail", "yahoo.com",
+     "Account Security, then Generate app password. The password is shown "
+     "once, so copy it then."),
+    ("Zoho Mail", "zoho.com",
+     "Settings, then Security, then App passwords - and switch IMAP access on "
+     "in the Mail settings as well."),
+    ("Outlook or Hotmail", "outlook.com",
+     "Careful here: Microsoft has been moving personal accounts to sign-in-"
+     "with-Microsoft only, and plain app passwords are often refused. Use the "
+     "Check button on the next page before you rely on it. If it is refused, "
+     "Gmail is the safe choice."),
+    ("Proton Mail", "proton.me",
+     "Only works with Proton Mail Bridge running on this computer, which needs "
+     "a paid plan. These settings point at the Bridge; take the password from "
+     "Bridge itself."),
+    ("Something else", None,
+     "Open Server settings below and put in your provider's own SMTP and IMAP "
+     "details."),
+]
+
 PROVIDERS = {
     "gmail.com": ("smtp.gmail.com", 587, "starttls", "imap.gmail.com", 993, "ssl"),
     "googlemail.com": ("smtp.gmail.com", 587, "starttls", "imap.gmail.com", 993, "ssl"),
@@ -138,17 +170,21 @@ def stamp(epoch):
     return time.strftime("%a %d %b, %H:%M", time.localtime(epoch))
 
 
-def run_privileged(argv, stdin_text=None, on_done=None):
-    """pkexec the core asynchronously; on_done(ok, combined_output)."""
+def run_privileged(argv, stdin_text=None, on_done=None, as_root=True):
+    """Run the core asynchronously; on_done(ok, combined_output).
+
+    as_root=False skips pkexec entirely - used for the read-only commands that
+    touch nothing, so trying a mailbox password does not need an auth dialog.
+    """
     flags = Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE
     if stdin_text is not None:
         flags |= Gio.SubprocessFlags.STDIN_PIPE
-    full = ["pkexec"] + core_argv() + argv
+    full = (["pkexec"] if as_root else []) + core_argv() + argv
     try:
         proc = Gio.Subprocess.new(full, flags)
     except GLib.Error as exc:
         if on_done:
-            on_done(False, "could not launch pkexec: %s" % exc.message)
+            on_done(False, "could not launch the helper: %s" % exc.message)
         return
 
     def done(p, res):
@@ -361,14 +397,27 @@ class SetupView(Gtk.Box):
         b = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
         g = Adw.PreferencesGroup(
             title="The approval mailbox",
-            description="A dedicated account. It sends the alerts and watches "
-                        "for APPROVE replies. Common providers fill themselves in.")
+            description="One account used only for this. It sends your friends "
+                        "the alerts and reads their APPROVE replies. Your "
+                        "friend types its password, so it must not be an "
+                        "account you can get into.")
+        self.c_provider = Adw.ComboRow(
+            title="Who hosts it",
+            model=Gtk.StringList.new([p[0] for p in PROVIDER_CHOICES]))
         self.e_mailbox = Adw.EntryRow(title="Mailbox address")
         self.e_mailbox.connect("changed", self._autofill)
+        g.add(self.c_provider)
         g.add(self.e_mailbox)
         b.append(g)
 
-        adv = Adw.PreferencesGroup(title="Server settings")
+        self.l_howto = Gtk.Label(wrap=True, xalign=0)
+        self.l_howto.add_css_class("dim-label")
+        b.append(self.l_howto)
+
+        adv = Adw.PreferencesGroup()
+        self.x_servers = Adw.ExpanderRow(
+            title="Server settings",
+            subtitle="Filled in from the provider above")
         self.e_smtp_host = Adw.EntryRow(title="SMTP host")
         self.s_smtp_port = Adw.SpinRow.new_with_range(1, 65535, 1)
         self.s_smtp_port.set_title("SMTP port")
@@ -383,23 +432,50 @@ class SetupView(Gtk.Box):
                                        model=Gtk.StringList.new(["ssl", "starttls"]))
         for w in (self.e_smtp_host, self.s_smtp_port, self.c_smtp_sec,
                   self.e_imap_host, self.s_imap_port, self.c_imap_sec):
-            adv.add(w)
+            self.x_servers.add_row(w)
+        adv.add(self.x_servers)
         b.append(adv)
+
+        self._filling = True             # this first fill is not a choice
+        self._provider_manual = False
+        self.c_provider.connect("notify::selected", self._provider_chosen)
+        self._provider_chosen()          # start on Gmail, already filled in
+        self._filling = False
         return "mailbox", b
 
-    def _autofill(self, entry):
-        addr = entry.get_text().strip().lower()
-        dom = addr.split("@")[-1] if "@" in addr else ""
-        g = PROVIDERS.get(dom)
-        if not g:
-            return
-        sh, sp, ss, ih, ip_, isec = g
+    def _apply_provider(self, dom):
+        sh, sp, ss, ih, ip_, isec = PROVIDERS[dom]
         self.e_smtp_host.set_text(sh)
         self.s_smtp_port.set_value(sp)
         self.c_smtp_sec.set_selected(["starttls", "ssl", "plain"].index(ss))
         self.e_imap_host.set_text(ih)
         self.s_imap_port.set_value(ip_)
         self.c_imap_sec.set_selected(["ssl", "starttls"].index(isec))
+
+    def _provider_chosen(self, *_):
+        _label, dom, howto = PROVIDER_CHOICES[self.c_provider.get_selected()]
+        if not self._filling:
+            self._provider_manual = True
+        self.l_howto.set_label(howto)
+        if dom:
+            self._apply_provider(dom)
+            self.x_servers.set_expanded(False)
+        else:
+            self.x_servers.set_expanded(True)
+
+    def _autofill(self, entry):
+        """Typing a known address picks the provider, unless you picked one."""
+        if self._provider_manual:
+            return
+        dom = entry.get_text().strip().lower().split("@")[-1]
+        if dom not in PROVIDERS:
+            return
+        for i, (_label, pdom, _howto) in enumerate(PROVIDER_CHOICES):
+            if pdom and PROVIDERS[pdom] == PROVIDERS[dom]:
+                self._filling = True
+                self.c_provider.set_selected(i)
+                self._filling = False
+                return
 
     def _p_friend(self):
         b = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
@@ -428,6 +504,16 @@ class SetupView(Gtk.Box):
             g.add(w)
         self.p_phrase1.connect("changed", lambda *_: self.check_inert())
         b.append(g)
+
+        # catch a wrong app password now, while the friend is still here
+        check_box = Gtk.Box(spacing=10, halign=Gtk.Align.START)
+        self.b_check = Gtk.Button(label="Check the mailbox now")
+        self.b_check.connect("clicked", self.on_check_mailbox)
+        check_box.append(self.b_check)
+        b.append(check_box)
+        self.l_check = Gtk.Label(wrap=True, xalign=0, visible=False)
+        self.l_check.add_css_class("caption")
+        b.append(self.l_check)
 
         note = Gtk.Label(
             wrap=True, xalign=0,
@@ -604,6 +690,36 @@ class SetupView(Gtk.Box):
                 "imap_password": self.p_mailpass.get_text(),
             },
         }
+
+    def on_check_mailbox(self, *_):
+        """Log in to the mailbox with what has been typed. Sends nothing."""
+        if not self.p_mailpass.get_text():
+            self.window.toast("Your friend needs to type the password first")
+            return
+        err = self.validate(4)
+        if err:
+            self.window.toast(err)
+            self.show_page(4)
+            return
+        payload = json.dumps({"email": self.answers()["email"]})
+        self.b_check.set_sensitive(False)
+        self.b_check.set_label("Checking\u2026")
+        self.l_check.set_visible(False)
+
+        def done(ok, out):
+            self.b_check.set_sensitive(True)
+            self.b_check.set_label("Check the mailbox now")
+            for c in ("success", "error"):
+                self.l_check.remove_css_class(c)
+            self.l_check.add_css_class("success" if ok else "error")
+            self.l_check.set_label(
+                "This mailbox works. It can send and it can read replies."
+                if ok else (out or "").strip() or "The check did not run.")
+            self.l_check.set_visible(True)
+
+        # no pkexec: this writes nothing and needs no privilege
+        run_privileged(["check-mailbox", "--answers", "-"], stdin_text=payload,
+                       on_done=done, as_root=False)
 
     def do_install(self):
         payload = json.dumps(self.answers())

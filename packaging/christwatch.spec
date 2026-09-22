@@ -1,5 +1,5 @@
 Name:           christwatch
-Version:        1.0.2
+Version:        1.0.3
 Release:        1%{?dist}
 Summary:        Accountability-gated content blocker
 
@@ -67,6 +67,10 @@ cd %{_builddir}/%{name}-%{version} && python3 selftest.py
 %{_datadir}/%{name}/
 
 %changelog
+* Mon Sep 21 2026 William Mezitis <wmezitis@gmail.com> - 1.0.3-1
+- Pick your mail provider instead of typing SMTP and IMAP servers.
+- Check the mailbox password before installing anything.
+
 * Mon Sep 21 2026 William Mezitis <wmezitis@gmail.com> - 1.0.2-1
 - Warn when a unanimous quorum makes the passphrase gate inert.
 - Dashboard hero carries the lock state as colour.

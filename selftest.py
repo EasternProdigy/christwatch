@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline checks for pornblock. Runs entirely inside a throwaway sandbox."""
 
+import inspect
 import json
 import datetime as dt
 import os
@@ -307,6 +308,29 @@ check("snapshot has what the GUI needs",
 pb.write_public_status(cfg, st)
 check("snapshot is world readable",
       oct(os.stat(pb.P(pb.PUBLIC_STATUS)).st_mode)[-3:] == "644")
+
+print("\n== mailbox check (offline paths only) ==")
+import argparse  # noqa: E402
+_bad = os.path.join(tempfile.mkdtemp(prefix="pb-mail-"), "answers.json")
+open(_bad, "w").write("{not json")
+check("garbage answers are refused",
+      pb.cmd_check_mailbox(argparse.Namespace(answers=_bad)) == 2)
+open(_bad, "w").write(json.dumps({"email": {"smtp_host": "x"}}))
+check("a missing address is refused",
+      pb.cmd_check_mailbox(argparse.Namespace(answers=_bad)) == 2)
+check("checking the mailbox never needs root",
+      "require_root" not in inspect.getsource(pb.cmd_check_mailbox))
+check("and it writes nothing",
+      not re.search(r"save_(config|state|record)|write_managed",
+                    inspect.getsource(pb.cmd_check_mailbox)))
+check("a wrong password says so in plain words",
+      "app password" in pb.friendly_mail_error(
+          "error: [ALERT] Invalid credentials (Failure)"))
+check("a typo'd host says so in plain words",
+      "host spelling" in pb.friendly_mail_error(
+          "gaierror: [Errno -2] Name or service not known"))
+check("anything else is passed through",
+      pb.friendly_mail_error("weird thing") == "weird thing")
 
 print("\n== desktop integration ==")
 de = pb.desktop_entry(cfg)

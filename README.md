@@ -111,8 +111,19 @@ sudo pornblock install      # units, enable, lock down
 sudo pornblock status
 ```
 
-Setup asks for a **dedicated mailbox** (Gmail/Fastmail/whatever) with an
-**app password**. Common providers are auto-detected.
+Setup asks for a **dedicated mailbox** with an **app password**. Pick the
+provider from a list and the server settings fill themselves in - they stay
+folded away unless your provider is an unusual one. The page tells you where
+that provider hides its app passwords.
+
+On the next page, once your friend has typed the password, **Check the
+mailbox now** logs in to SMTP and IMAP and tells you whether it works, before
+anything is installed. It sends nothing, writes nothing and needs no root:
+
+```bash
+echo '{"email":{"address":"...","smtp_host":"...","imap_host":"..."}}' \
+    | pornblock check-mailbox
+```
 
 ### The step where you look away
 

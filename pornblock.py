@@ -47,7 +47,7 @@ import urllib.request
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 PROG = "pornblock"
 
 # --------------------------------------------------------------------------
@@ -806,6 +806,30 @@ class Mailer:
         except (smtplib.SMTPException, OSError, ssl.SSLError) as exc:
             raise MailError("%s: %s" % (type(exc).__name__, exc)) from exc
         log("email sent to %s :: %s" % (", ".join(to_list), subject))
+
+    def smtp_probe(self) -> str:
+        """Log in to SMTP and hang up. Sends nothing. Raises MailError."""
+        if not self.e.get("smtp_host"):
+            raise MailError("SMTP not configured")
+        host, port = self.e["smtp_host"], int(self.e["smtp_port"])
+        sec = (self.e.get("smtp_security") or "starttls").lower()
+        ctx = ssl.create_default_context()
+        try:
+            if sec == "ssl":
+                srv = smtplib.SMTP_SSL(host, port, timeout=30, context=ctx)
+            else:
+                srv = smtplib.SMTP(host, port, timeout=30)
+            with srv:
+                srv.ehlo()
+                if sec == "starttls":
+                    srv.starttls(context=ctx)
+                    srv.ehlo()
+                if self.e.get("smtp_password"):
+                    srv.login(self.e.get("smtp_user") or self.e["address"],
+                              self.e["smtp_password"])
+        except (smtplib.SMTPException, OSError, ssl.SSLError) as exc:
+            raise MailError("%s: %s" % (type(exc).__name__, exc)) from exc
+        return "signed in to %s:%d" % (host, port)
 
     def send(self, st: dict, to_list, subject, text, html=None,
              queue_on_fail: bool = True) -> bool:
@@ -2942,6 +2966,64 @@ def cmd_setup(args) -> int:
     return 0
 
 
+def friendly_mail_error(text: str) -> str:
+    """Turn a python exception string into something worth reading."""
+    t = (text or "").lower()
+    if "gaierror" in t or "name or service not known" in t:
+        return ("no server by that name - check the host spelling. " + text)
+    if "authenticationfailed" in t or "smtpauthenticationerror" in t \
+            or "invalid credentials" in t or "authentication failed" in t:
+        return ("the server refused that address and password. It has to be "
+                "an app password made for this mailbox, not the account's "
+                "normal one, and two-factor sign-in usually has to be on "
+                "first. " + text)
+    if "timeout" in t or "timed out" in t:
+        return ("no answer from the server - wrong port, or something is "
+                "blocking the connection. " + text)
+    if "connectionrefused" in t or "connection refused" in t:
+        return "the server refused the connection on that port. " + text
+    if "sslerror" in t or "wrong_version_number" in t:
+        return ("the secure connection failed - the security setting is "
+                "probably wrong for that port. " + text)
+    return text
+
+
+def cmd_check_mailbox(args) -> int:
+    """
+    Try a set of mailbox credentials and say whether they work.
+
+    Deliberately unprivileged and stateless: it reads the same JSON the setup
+    wizard would install, logs in to SMTP and IMAP, sends nothing and writes
+    nothing. The wizard calls it while the friend who knows the app password
+    is still sitting there.
+    """
+    try:
+        raw = sys.stdin.read() if args.answers == "-" else \
+            open(args.answers, encoding="utf-8").read()
+        ans = json.loads(raw)
+    except (OSError, ValueError) as exc:
+        print("could not read the answers: %s" % exc)
+        return 2
+    e = dict(DEFAULT_CONFIG["email"])
+    e.update(ans.get("email") or ans or {})
+    if not e.get("address"):
+        print("no mailbox address given")
+        return 2
+    m = Mailer({"email": e})
+    ok = True
+    try:
+        print("Sending (SMTP): ok, %s" % m.smtp_probe())
+    except MailError as exc:
+        print("Sending (SMTP) failed: %s" % friendly_mail_error(str(exc)))
+        ok = False
+    try:
+        print("Reading replies (IMAP): ok, %s" % m.probe())
+    except MailError as exc:
+        print("Reading replies (IMAP) failed: %s" % friendly_mail_error(str(exc)))
+        ok = False
+    return 0 if ok else 1
+
+
 def cmd_test_email(args) -> int:
     require_root()
     cfg = load_config()
@@ -4221,6 +4303,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("cancel", help="withdraw a request / end an unlock early")
     s.set_defaults(fn=cmd_cancel)
+
+    s = sub.add_parser("check-mailbox",
+                       help="try mailbox credentials (no root, writes nothing)")
+    s.add_argument("--answers", default="-",
+                   help="JSON file with an email block, or - for stdin")
+    s.set_defaults(fn=cmd_check_mailbox)
 
     s = sub.add_parser("test-email", help="prove SMTP and IMAP work")
     s.add_argument("--no-approvers", action="store_true",
