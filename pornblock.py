@@ -53,7 +53,7 @@ import urllib.request
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 HOMEPAGE = "https://github.com/EasternProdigy/christwatch"
 PROG = "pornblock"
 
@@ -6350,6 +6350,25 @@ def cmd_update_source(args) -> int:
         return 1
     st = load_state()
     up = cfg.setdefault("updates", {})
+
+    # Whether to apply by itself is not pinned in the install record, and
+    # deliberately so: it decides nothing about WHERE code comes from, only
+    # whether you are asked first. Where it comes from is the part that
+    # cannot be changed without an unlock.
+    if args.auto is not None and not args.off and not (args.url or "").strip():
+        up["auto_apply"] = bool(args.auto)
+        save_config(cfg)
+        write_public_status(cfg, st)
+        print(green("\n  Updates will now apply themselves.\n") if args.auto
+              else green("\n  Updates will wait for you.\n"))
+        if args.auto:
+            print(dim("  Every one still has to pass the project's own "
+                      "self-test first, keep your"))
+            print(dim("  setup intact, and start cleanly - or it is rolled "
+                      "back. Your approvers"))
+            print(dim("  are told either way.\n"))
+        return 0
+
     if args.off:
         up["repo"] = ""
         up["enabled"] = False
@@ -6361,6 +6380,8 @@ def cmd_update_source(args) -> int:
         up["repo"] = url
         up["branch"] = args.branch
         up["enabled"] = True
+        if args.auto is not None:
+            up["auto_apply"] = bool(args.auto)
     wanted = str(up.get("repo") or "")      # copy: reconcile mutates in place
     save_config(cfg)
     cfg, notes = reconcile_record(cfg, st)
@@ -6755,6 +6776,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("url", nargs="?", default="")
     s.add_argument("--branch", default="main")
     s.add_argument("--off", action="store_true", help="switch updates off")
+    s.add_argument("--auto", dest="auto", action="store_true", default=None,
+                   help="apply new versions by itself as the repo moves")
+    s.add_argument("--no-auto", dest="auto", action="store_false",
+                   help="only tell you one is ready; you press the button")
     s.set_defaults(fn=cmd_update_source)
 
     s = sub.add_parser("update", help="pull a newer version from the pinned repo")

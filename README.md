@@ -441,18 +441,42 @@ It posts when the setting changes, and once a day when it has not, so
 laptop notices within `phone.silence_hours` (36 by default) and tells your
 friends that the phone has gone quiet.
 
-Install it in **each profile** you use, from the same page and the same
-pairing link - you do not add the phone twice. Each profile reports for
-itself, so they show up separately:
+#### One setting covers every profile
+
+Private DNS lives in Android's `Settings.Global`, which every profile on the
+device shares. There is one copy of it and no way to have a different one per
+profile - DNS is resolved by a system service, not by each profile
+separately.
+
+So **set it once, in the owner profile, and your second profile is filtered
+too** - with nothing installed there at all. The app does not do the
+blocking and is not needed in both profiles for the blocking to work.
+
+Check it in ten seconds: switch to your second profile and try a site you
+know is blocked. It will fail to resolve, because the resolver it is asking
+is the one the owner profile pinned.
+
+There is a second effect worth knowing about. On a standard GrapheneOS
+setup a secondary profile is not an admin user, and the Private DNS screen
+is admin-only - so the profile you spend your time in usually *cannot* turn
+the filtering off even if you want it to. Worth confirming on your own
+phone: open Settings -> Network & internet in the second profile and see
+whether Private DNS is editable there.
+
+#### Why you might still install it twice
+
+Only one reason: noticing that the app was removed. Each copy reports for
+itself, so they show up separately -
 
 ```
 [ ok ] Pixel (owner)             android  filtering, last heard 34m ago
 [FAIL] Pixel (second profile)    android  silent for 2d 4h
 ```
 
-They all read the same setting, which is the point: the second row is there
-to notice the app disappearing from one profile while the other carries on
-saying "still on".
+- and a copy that disappears goes quiet, which the laptop notices within 36
+hours. One copy is enough for the blocking and enough to see the setting
+change. The second is there so that removing one does not go unmentioned.
+Same page, same pairing link, no need to add the phone twice.
 
 The setting itself, if you would rather type it:
 Settings → Network & internet → Private DNS → *Private DNS provider
@@ -609,6 +633,25 @@ install record. After that:
 sudo pornblock update --check   # is there a newer version?
 sudo pornblock update           # fetch, vet, install, restart
 ```
+
+Either way, without editing JSON:
+
+```bash
+sudo pornblock update-source --auto      # apply new versions by itself
+sudo pornblock update-source --no-auto   # tell me, and I will press the button
+```
+
+That switch is deliberately *not* pinned in the install record, because it
+decides nothing about where code comes from - only whether you are asked
+first. Where it comes from is pinned, and repointing it needs a granted
+unlock.
+
+**If you turn auto-apply on, `main` is a release channel.** Every commit
+that lands there runs as root on every machine tracking it, within about
+fifteen minutes. It has to pass the project's own self-test in a sandbox
+first, keep your arrangement intact, and start cleanly or it is rolled
+back - but half-finished work that happens to pass the tests will still
+ship. Do the work on a branch and fast-forward `main` when it is released.
 
 Set `auto_apply: false` if you would rather approve each one; the app then
 shows a banner with an **Install** button instead.

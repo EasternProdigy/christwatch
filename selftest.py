@@ -1400,6 +1400,26 @@ check("the code says plainly that none of this stops a root user",
 pb.remove_harden()
 
 
+print("\n== the auto-update switch ==")
+
+AUCFG = pb.deep_merge(base_cfg(), {"updates": {"repo": "https://x/y",
+                                               "branch": "main",
+                                               "auto_apply": False}})
+check("whether it applies itself is not pinned in the install record",
+      "auto_apply" not in pb.record_from_config(AUCFG))
+check("but where the code comes from is",
+      pb.record_from_config(AUCFG)["update_repo"] == "https://x/y"
+      and pb.record_from_config(AUCFG)["update_branch"] == "main")
+
+# a candidate still has to earn its way in, whether or not a human is asked
+SRC = open(os.path.join(HERE, "pornblock.py"), encoding="utf-8").read()
+VS = SRC[SRC.index("def verify_source"):SRC.index("def verify_source") + 2500]
+check("a candidate that does not compile is refused", "py_compile" in VS)
+check("a candidate that fails its own self-test is refused",
+      "selftest.py" in VS)
+check("auto-apply does not skip the self-test",
+      "auto_apply" not in VS)
+
 print("\n== packaging (skipped when not shipped in the tarball) ==")
 
 def _present(name):

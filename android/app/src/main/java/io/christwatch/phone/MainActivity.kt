@@ -109,7 +109,7 @@ class MainActivity : AppCompatActivity() {
                     else -> "Right now: Off"
                 }
             )
-            append("\nThis profile: $profileId")
+            append("\nProfile $profileId · covers all profiles")
         }
 
         val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)

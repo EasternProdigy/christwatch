@@ -111,9 +111,14 @@ fun Context.forget() {
 
 /**
  * Private DNS lives in Settings.Global, which is shared by every profile on
- * the device. That is the whole reason this approach works across both of
- * yours at once: there is only one copy of the setting to read, and only one
- * to change.
+ * the device. There is one copy of it and no way to have a different one per
+ * profile, because DNS is resolved by a system service rather than by each
+ * profile separately.
+ *
+ * So setting it once filters the whole phone, and this app reads the true
+ * state of the whole phone from whichever profile it happens to be in. A
+ * second copy in another profile blocks nothing extra - it is there only so
+ * that removing one of them is noticed.
  *
  * The constants are @hide in the SDK, so the names are spelled out here. They
  * have not moved since Android 9.
