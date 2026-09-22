@@ -102,16 +102,16 @@ if [ "$need_gui" = "1" ] || [ -n "$missing_tools" ]; then
   PKGS=""; PM=""
   if command -v dnf >/dev/null 2>&1; then
     PM="sudo dnf install -y"
-    PKGS="python3-gobject gtk4 libadwaita nftables e2fsprogs systemd-resolved polkit"
+    PKGS="python3-gobject gtk4 libadwaita adwaita-icon-theme nftables e2fsprogs systemd-resolved polkit"
   elif command -v apt-get >/dev/null 2>&1; then
     PM="sudo apt-get install -y"
-    PKGS="python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 nftables e2fsprogs systemd-resolved policykit-1"
+    PKGS="python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 adwaita-icon-theme nftables e2fsprogs systemd-resolved policykit-1"
   elif command -v pacman >/dev/null 2>&1; then
     PM="sudo pacman -S --needed --noconfirm"
-    PKGS="python-gobject gtk4 libadwaita nftables e2fsprogs polkit"
+    PKGS="python-gobject gtk4 libadwaita adwaita-icon-theme nftables e2fsprogs polkit"
   elif command -v zypper >/dev/null 2>&1; then
     PM="sudo zypper install -y"
-    PKGS="python3-gobject typelib-1_0-Gtk-4_0 typelib-1_0-Adw-1 nftables e2fsprogs polkit"
+    PKGS="python3-gobject typelib-1_0-Gtk-4_0 typelib-1_0-Adw-1 adwaita-icon-theme nftables e2fsprogs polkit"
   fi
   if [ -n "$PM" ]; then
     step "Installing what is missing"

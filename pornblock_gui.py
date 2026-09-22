@@ -585,7 +585,7 @@ class SetupView(Gtk.Box):
             self.back_btn.set_sensitive(True)
             self.next_btn.set_sensitive(True)
             if ok:
-                self.install_status.set_icon_name("emblem-ok-symbolic")
+                self.install_status.set_icon_name("object-select-symbolic")
                 self.install_status.set_title("Installed and locked")
                 self.install_status.set_description(
                     "Blocking is live and the watchdog is running.")
@@ -642,7 +642,7 @@ def gate_row(title, icon):
     r = Adw.ActionRow(title=title)
     img = Gtk.Image.new_from_icon_name(icon)
     r.add_prefix(img)
-    state = Gtk.Image.new_from_icon_name("emblem-ok-symbolic")
+    state = Gtk.Image.new_from_icon_name("object-select-symbolic")
     state.add_css_class("success")
     r.add_suffix(state)
     return r, state
@@ -740,7 +740,7 @@ class Dashboard(Gtk.Box):
         self.x_health = Adw.ExpanderRow(title="Enforcement")
         self.x_health.add_prefix(Gtk.Image.new_from_icon_name("channel-secure-symbolic"))
         self.x_update = Adw.ExpanderRow(title="Updates")
-        self.x_update.add_prefix(Gtk.Image.new_from_icon_name("system-software-update-symbolic"))
+        self.x_update.add_prefix(Gtk.Image.new_from_icon_name("folder-download-symbolic"))
         for x in (self.x_setup, self.x_health, self.x_update):
             self.g_detail.add(x)
         col.append(self.g_detail)
@@ -855,7 +855,7 @@ class Dashboard(Gtk.Box):
             if pending:
                 r.set_subtitle("approved" if done_ else "waiting")
                 if done_:
-                    img = Gtk.Image.new_from_icon_name("emblem-ok-symbolic")
+                    img = Gtk.Image.new_from_icon_name("object-select-symbolic")
                     img.add_css_class("success")
                     r.add_suffix(img)
             self._put("people", self.g_people, r)
@@ -885,7 +885,7 @@ class Dashboard(Gtk.Box):
         for h in health:
             r = Adw.ActionRow(title=h.get("name", "?"), subtitle=h.get("detail", ""))
             img = Gtk.Image.new_from_icon_name(
-                "emblem-ok-symbolic" if h.get("ok") else "dialog-warning-symbolic")
+                "object-select-symbolic" if h.get("ok") else "dialog-warning-symbolic")
             img.add_css_class("success" if h.get("ok") else "warning")
             r.add_prefix(img)
             self._put("health", self.x_health, r, True)

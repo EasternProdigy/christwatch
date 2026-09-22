@@ -12,6 +12,7 @@ Requires:       python3 >= 3.9
 Requires:       python3-gobject
 Requires:       gtk4
 Requires:       libadwaita
+Requires:       adwaita-icon-theme
 Requires:       nftables
 Requires:       e2fsprogs
 Requires:       systemd

@@ -71,12 +71,25 @@ class Stub:
 def run(app):
     try:
         print("\n== icon names ==")
-        theme = Gtk.IconTheme.get_for_display(Gdk.Display.get_default())
         src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "pornblock_gui.py"), encoding="utf-8").read()
         names = sorted(set(re.findall(r'"([a-z0-9-]+-symbolic)"', src)))
+        disp = Gdk.Display.get_default()
+        settings = Gtk.Settings.get_for_display(disp)
+        # Adwaita is the baseline every GTK install has. Checking only the
+        # local theme is how you ship icons that work on KDE (breeze has
+        # nearly everything) and render as broken squares on GNOME.
+        for theme_name in ("Adwaita", "hicolor+Adwaita"):
+            settings.set_property("gtk-icon-theme-name", theme_name.split("+")[0])
+            theme = Gtk.IconTheme.get_for_display(disp)
+            missing = [n for n in names if not theme.has_icon(n)]
+            check("all %d symbolic icons resolve in %s"
+                  % (len(names), theme_name.split("+")[0]), not missing, missing)
+            break
+        settings.set_property("gtk-icon-theme-name", "Adwaita")
+        theme = Gtk.IconTheme.get_for_display(disp)
         missing = [n for n in names if not theme.has_icon(n)]
-        check("all %d symbolic icons resolve" % len(names), not missing, missing)
+        check("no icon is breeze-only", not missing, missing)
 
         print("\n== setup wizard ==")
         sv = G.SetupView(Stub())

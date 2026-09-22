@@ -27,7 +27,7 @@ jobs:
     container: fedora:latest
     steps:
       - name: Toolkit
-        run: dnf install -y -q python3 python3-gobject gtk4 libadwaita git
+        run: dnf install -y -q python3 python3-gobject gtk4 libadwaita adwaita-icon-theme git
       - uses: actions/checkout@v4
       - name: Desktop app smoke test
         run: |

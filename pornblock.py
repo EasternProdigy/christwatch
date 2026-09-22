@@ -208,8 +208,10 @@ DEFAULT_CONFIG = {
         "enabled": True,
         "repo": "",
         "branch": "main",
-        "check_hours": 24,
-        "auto_apply": False,
+        # Cheap: this is a git ls-remote, not a clone. Nothing is downloaded
+        # until the branch head actually moves.
+        "check_minutes": 15,
+        "auto_apply": True,
         "require_unlock": False,
     },
     "blocklist_url": BLOCKLIST_URL,
@@ -261,7 +263,8 @@ DEFAULT_STATE = {
     "imap": {"uidvalidity": None, "seen_uids": []},
     "outbox": [],
     "update": {"last_check": 0, "installed_sha": "", "available": None,
-               "last_applied": 0, "last_error": ""},
+               "last_applied": 0, "last_error": "", "last_remote_sha": "",
+               "rolled_back": ""},
     "alerts": {},
     "enforced_once": False,
     "history": [],
@@ -1802,6 +1805,8 @@ def write_units() -> list:
 
 SELF_COPY = STATE_DIR + "/pornblock.py.installed"
 GUI_SELF_COPY = STATE_DIR + "/pornblock_gui.py.installed"
+# The version we are replacing, kept so a bad push can be undone.
+PREV_COPY = STATE_DIR + "/pornblock.py.previous"
 
 
 def protect_binary(cfg: dict, st: dict) -> list:
@@ -2154,7 +2159,9 @@ def public_status_doc(cfg: dict, st: dict) -> dict:
             "enabled": bool((cfg.get("updates") or {}).get("enabled", True)),
             "repo": (cfg.get("updates") or {}).get("repo", ""),
             "branch": (cfg.get("updates") or {}).get("branch", "main"),
-            "auto_apply": bool((cfg.get("updates") or {}).get("auto_apply", False)),
+            "auto_apply": bool((cfg.get("updates") or {}).get("auto_apply", True)),
+            "interval_minutes": int(update_interval_seconds(cfg) // 60),
+            "rolled_back": (st.get("update") or {}).get("rolled_back", ""),
             "installed_sha": (st.get("update") or {}).get("installed_sha", ""),
             "last_check": (st.get("update") or {}).get("last_check", 0),
             "last_applied": (st.get("update") or {}).get("last_applied", 0),
@@ -3180,6 +3187,26 @@ def _github_tarball_url(repo: str, branch: str):
         m.group(1), m.group(2), branch)
 
 
+def remote_head_sha(cfg: dict) -> str:
+    """The branch head, without downloading anything. Empty when unknown."""
+    up = cfg.get("updates") or {}
+    repo = (up.get("repo") or "").strip()
+    branch = (up.get("branch") or "main").strip()
+    if not repo or not shutil.which("git"):
+        return ""
+    r = run(["git", "ls-remote", "--heads", repo, branch], timeout=60)
+    if not r.ok or not r.out.strip():
+        return ""
+    return r.out.split()[0].strip()
+
+
+def update_interval_seconds(cfg: dict) -> float:
+    up = cfg.get("updates") or {}
+    if up.get("check_minutes") is not None:
+        return max(60.0, float(up["check_minutes"]) * 60.0)
+    return max(60.0, float(up.get("check_hours") or 24) * 3600.0)
+
+
 def fetch_source(cfg: dict, dest: str) -> tuple:
     """Download the pinned repo into `dest`. Returns (ok, sha, subject, err)."""
     up = cfg.get("updates") or {}
@@ -3269,8 +3296,43 @@ def apply_update(cfg: dict, st: dict, dest: str, sha: str, subject: str,
     done = []
     with open(os.path.join(dest, "pornblock.py"), encoding="utf-8") as fh:
         core = fh.read()
-    write_managed(SELF_COPY, core, 0o600, True, backup=False)
-    write_managed(BIN_PATH, core, 0o755, True, backup=False)
+
+    # Keep what we are replacing, and keep the current lock state.
+    imm = is_immutable(P(BIN_PATH)) if os.path.exists(P(BIN_PATH)) else True
+    previous = None
+    if os.path.exists(P(BIN_PATH)):
+        with open(P(BIN_PATH), encoding="utf-8", errors="replace") as fh:
+            previous = fh.read()
+        write_managed(PREV_COPY, previous, 0o600, imm, backup=False)
+
+    write_managed(SELF_COPY, core, 0o600, imm, backup=False)
+    write_managed(BIN_PATH, core, 0o755, imm, backup=False)
+
+    # The self-test proved the code is sane in a sandbox. This proves it can
+    # actually run on THIS machine before we hand the daemon over to it.
+    if previous is not None:
+        broken = ""
+        for probe in (["--version"], ["status", "--json"]):
+            r = run([P(BIN_PATH)] + probe, timeout=180)
+            if not r.ok:
+                broken = "%s exited %d: %s" % (" ".join(probe), r.rc,
+                                               (r.err or r.out).strip()[:200])
+                break
+        if broken:
+            write_managed(SELF_COPY, previous, 0o600, imm, backup=False)
+            write_managed(BIN_PATH, previous, 0o755, imm, backup=False)
+            st.setdefault("update", {})["rolled_back"] = "%s (%s)" % (newver, broken)
+            st["update"]["last_error"] = "rolled back %s: %s" % (newver, broken)
+            history(st, "rolled back %s - it would not run: %s" % (newver, broken))
+            alert(cfg, st, "update_rolled_back",
+                  "An update was rolled back",
+                  "%s pulled version %s onto %s. It passed the self-test but "
+                  "would not run here:\n\n  %s\n\nThe previous version has "
+                  "been put back and blocking is unaffected.\n"
+                  % (cfg.get("app_name") or PROG, newver, socket.gethostname(),
+                     broken), force=True)
+            save_state(st)
+            return ["rolled back %s - it would not run here" % newver]
     done.append("core updated to %s" % newver)
 
     gui_path = os.path.join(dest, "pornblock_gui.py")
@@ -3366,12 +3428,21 @@ def maybe_update(cfg: dict, st: dict) -> None:
         return
     if st.get("mode") == "PENDING":
         return
-    every = float(up.get("check_hours") or 24) * 3600
-    last = float((st.get("update") or {}).get("last_check") or 0)
+    every = update_interval_seconds(cfg)
+    upd = st.setdefault("update", {})
+    last = float(upd.get("last_check") or 0)
     if now() - last < every:
+        return
+    head = remote_head_sha(cfg)
+    if head and head == (upd.get("last_remote_sha") or "") \
+            and not upd.get("available"):
+        upd["last_check"] = now()          # nothing has moved; no download
+        save_state(st)
         return
     try:
         avail = check_for_update(cfg, st)
+        if head:
+            st.setdefault("update", {})["last_remote_sha"] = head
     except Exception as exc:                       # never take the loop down
         log("update check blew up: %r" % exc)
         st.setdefault("update", {})["last_error"] = repr(exc)

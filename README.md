@@ -246,8 +246,8 @@ Edit `/etc/pornblock/config.json`, then `sudo systemctl restart pornblock`.
 | `app_name` | `ChristWatch` | Name on the desktop icon |
 | `updates.repo` | - | Git URL to pull new versions from |
 | `updates.branch` | `main` | Branch to track |
-| `updates.check_hours` | `24` | How often the daemon looks |
-| `updates.auto_apply` | `false` | Install without asking |
+| `updates.check_minutes` | `15` | How often the daemon looks (cheap: `git ls-remote`) |
+| `updates.auto_apply` | `true` | Install new versions with no prompting |
 | `updates.require_unlock` | `false` | Only update inside an unlock window |
 | `enforce.*` | all on | Turn individual layers off |
 | `enforce.block_extensions` | `false` | Blanket block on browser extension installs |
@@ -279,11 +279,18 @@ Point it at a repo once and it will pull new versions.
   "enabled": true,
   "repo": "https://github.com/EasternProdigy/christwatch",
   "branch": "main",
-  "check_hours": 24,
-  "auto_apply": false,
+  "check_minutes": 15,
+  "auto_apply": true,
   "require_unlock": false
 }
 ```
+
+**Out of the box this behaves like a real application: you push, and within
+about fifteen minutes every machine running it is on the new version, with
+nobody touching anything.**
+
+The poll is cheap - a `git ls-remote` that returns one line. Nothing is
+downloaded until the branch head actually moves.
 
 Then `sudo pornblock install` once, which pins that source into the immutable
 install record. After that:
@@ -293,8 +300,8 @@ sudo pornblock update --check   # is there a newer version?
 sudo pornblock update           # fetch, vet, install, restart
 ```
 
-The daemon checks once a day on its own and the desktop app shows a banner
-with an **Install** button. `auto_apply: true` installs without asking.
+Set `auto_apply: false` if you would rather approve each one; the app then
+shows a banner with an **Install** button instead.
 
 **What happens before new code is allowed to run as root:**
 
@@ -307,7 +314,12 @@ with an **Install** button. `auto_apply: true` installs without asking.
    and be refused. This is a real gate, not a formality.
 5. Updates are refused while a request is `PENDING` - you do not get to
    update your way out mid-request.
-6. Applying one emails all approvers with the version, commit and subject.
+6. The new copy has to *run here* before the daemon is handed over to it:
+   it is installed, then probed with `--version` and `status --json`. If
+   either fails, the previous version is put straight back and everyone is
+   emailed. A push that passes the tests but dies on a real machine cannot
+   take your blocking down with it.
+7. Applying one emails all approvers with the version, commit and subject.
 
 Set `require_unlock: true` to only allow updates inside a granted unlock
 window. That closes the hole below completely, at the cost of needing 24
@@ -342,16 +354,31 @@ the status snapshot - it does not hide it from a determined you. The
 passphrase is different: only a hash is kept, so that one really does need
 your friend.
 
-**The updater runs code as root.**  If you own the repository it pulls from,
-you can push a "new version" that does whatever you like - that is a complete
-bypass, and the most convenient one on this list. Three things stand between
-you and it: the source is pinned in the immutable record and cannot be
-repointed while locked, the candidate has to pass the project's own self-test
-(so the obvious edits - removing the passphrase gate, dropping the quorum -
-get caught), and every applied update emails all of your approvers. If you
-want that hole shut: set `updates.require_unlock: true`, or set
-`updates.enabled: false`, or - best - have one of your approvers own the
-repository you track and pull from their fork.
+**The updater runs code as root, automatically.**  Be clear-eyed about what
+auto-apply means: if you own the repository, **you can switch off your own
+blocker by pushing a commit**, and within about fifteen minutes it will have
+happened, on every machine running your build, with no cool-off and no
+approvals. It is the single most convenient bypass here and it is on by
+default, because you asked for something that behaves like a real
+application. Those two wishes genuinely conflict.
+
+What still stands between you and it: the source is pinned in the immutable
+record and cannot be repointed while locked; the candidate has to pass the
+project's own self-test, so the obvious edits - removing the passphrase
+gate, dropping the quorum - are caught and refused; and every applied
+update emails all of your approvers with the version, the commit hash and
+its subject line. So it is loud. It is not prevented.
+
+If you want the blocker to genuinely hold against you, pick one:
+
+* **Have an approver own the repository** and track their fork. Then
+  auto-update is a feature rather than a hole - you can still send them pull
+  requests, and they decide what lands on your machine.
+* `updates.require_unlock: true` - updates only apply inside a granted
+  unlock window.
+* `updates.auto_apply: false` - you still have to press the button, which
+  at least means the bypass is not silent.
+* `updates.enabled: false` - no updater at all.
 
 **DNS-over-HTTPS from non-browser apps.**  The big technical one. DoH is HTTPS
 on port 443 and is indistinguishable from normal web traffic. Browsers are
