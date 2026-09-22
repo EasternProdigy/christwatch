@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Install ChristWatch
+GenericName=Installer
+Comment=Set up the accountability content blocker on this machine
+Exec=sh -c "cd \\"\\$(dirname \\"\\$1\\")\\" && ./install.sh; echo; echo 'Press Enter to close'; read x" sh %k
+Icon=system-software-install
+Terminal=true
+Categories=System;
+Keywords=accountability;blocker;install;

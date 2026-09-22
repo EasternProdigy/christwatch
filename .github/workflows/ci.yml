@@ -1,0 +1,36 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Offline self-test
+        run: python3 selftest.py
+      - name: Shell and desktop files
+        run: |
+          bash -n install.sh
+          bash -n packaging/build-rpm.sh
+          sudo apt-get update -qq && sudo apt-get install -y -qq desktop-file-utils
+          desktop-file-validate "Install ChristWatch.desktop"
+
+  gui:
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - name: Toolkit
+        run: dnf install -y -q python3 python3-gobject gtk4 libadwaita git
+      - uses: actions/checkout@v4
+      - name: Desktop app smoke test
+        run: |
+          gtk4-broadwayd :9 &
+          sleep 2
+          GDK_BACKEND=broadway BROADWAY_DISPLAY=:9 python3 guitest.py

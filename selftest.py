@@ -3,6 +3,7 @@
 
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -348,6 +349,55 @@ check("changing the branch is reverted", got["updates"]["branch"] == "main")
 check("turning off updates-need-an-unlock is reverted",
       got["updates"]["require_unlock"] is True)
 check("all three were reported", len([n for n in notes if "update" in n]) >= 2, notes)
+
+print("\n== packaging (skipped when not shipped in the tarball) ==")
+HERE = os.path.dirname(os.path.abspath(__file__))
+import subprocess  # noqa: E402
+
+def _present(name):
+    return os.path.exists(os.path.join(HERE, name))
+
+if _present("install.sh"):
+    r = subprocess.run(["bash", "-n", os.path.join(HERE, "install.sh")],
+                       capture_output=True, text=True)
+    check("install.sh parses", r.returncode == 0, r.stderr.strip())
+    body = open(os.path.join(HERE, "install.sh"), encoding="utf-8").read()
+    # it must call install-app, and must never call the arming `install`
+    arms = re.search(r"pornblock(?:\.py)?[\"']?\s+install(?!-app)", body)
+    check("install.sh runs install-app", "install-app" in body)
+    check("install.sh never arms the blocker itself", arms is None,
+          arms.group(0) if arms else "")
+else:
+    print("  --   install.sh not in this copy")
+
+if _present("Install ChristWatch.desktop"):
+    if shutil.which("desktop-file-validate"):
+        r = subprocess.run(["desktop-file-validate",
+                            os.path.join(HERE, "Install ChristWatch.desktop")],
+                           capture_output=True, text=True)
+        check("installer .desktop validates", r.returncode == 0 and not r.stdout.strip(),
+              r.stdout.strip())
+    else:
+        print("  --   desktop-file-validate not installed")
+else:
+    print("  --   installer .desktop not in this copy")
+
+if _present("packaging/christwatch.spec"):
+    spec = open(os.path.join(HERE, "packaging/christwatch.spec"), encoding="utf-8").read()
+    check("spec declares the runtime deps",
+          all(("Requires:" in spec and d in spec)
+              for d in ("python3-gobject", "gtk4", "libadwaita", "nftables",
+                        "e2fsprogs", "systemd-resolved")))
+    check("spec %post only does stage one", "install-app" in spec)
+    check("erasing the package does not unblock you",
+          "%postun" in spec and "uninstall" not in spec.split("%postun")[1].split("%files")[0]
+          .replace("pornblock uninstall", ""))
+else:
+    print("  --   packaging/ not in this copy")
+
+if _present("LICENSE"):
+    check("LICENSE present", "MIT License" in
+          open(os.path.join(HERE, "LICENSE"), encoding="utf-8").read())
 
 shutil.rmtree(SB, ignore_errors=True)
 print("\n%d checks failed" % len(FAILED))

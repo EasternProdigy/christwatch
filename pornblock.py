@@ -1672,7 +1672,7 @@ def desktop_entry(cfg: dict) -> str:
         "Exec=%s\n"
         "Icon=christwatch\n"
         "Terminal=false\n"
-        "Categories=Utility;Security;System;\n"
+        "Categories=Utility;Security;\n"
         "Keywords=accountability;blocker;filter;porn;\n"
         "StartupNotify=true\n"
         "StartupWMClass=christwatch\n" % (name, GUI_BIN_PATH))
@@ -2730,6 +2730,92 @@ def cmd_status(args) -> int:
     return 0
 
 
+def _vtuple(v: str) -> tuple:
+    nums = tuple(int(x) for x in re.findall(r"\d+", v or "")[:4])
+    return nums or (0,)
+
+
+def installed_version() -> str:
+    try:
+        with open(P(BIN_PATH), encoding="utf-8", errors="replace") as fh:
+            m = re.search(r'^VERSION\s*=\s*"([^"]+)"', fh.read(), re.M)
+        return m.group(1) if m else ""
+    except OSError:
+        return ""
+
+
+def install_program_files(cfg: dict, immutable: bool) -> list:
+    """
+    Put the program, the desktop app, its launcher and its icon in place.
+
+    Shared by `install-app` (just the files, nothing armed, nothing locked)
+    and `install` (same files, plus chattr +i once there is something worth
+    protecting).
+    """
+    msgs = []
+    src = os.path.abspath(__file__)
+    with open(src, encoding="utf-8") as fh:
+        core = fh.read()
+
+    # A package upgrade must not walk back over a newer in-app update.
+    have = installed_version()
+    if have and _vtuple(have) > _vtuple(VERSION):
+        msgs.append("kept the installed %s; this copy is only %s" % (have, VERSION))
+        with open(P(BIN_PATH), encoding="utf-8", errors="replace") as fh:
+            core = fh.read()
+
+    write_managed(SELF_COPY, core, 0o600, immutable, backup=False)
+    write_managed(BIN_PATH, core, 0o755, immutable, backup=False)
+    msgs.append("installed %s" % P(BIN_PATH))
+
+    gui_src = None
+    cand = os.path.join(os.path.dirname(src), "pornblock_gui.py")
+    for path in (cand, P(GUI_SELF_COPY)):
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as fh:
+                gui_src = fh.read()
+            break
+    if gui_src:
+        write_managed(GUI_SELF_COPY, gui_src, 0o600, immutable, backup=False)
+        write_managed(GUI_BIN_PATH, gui_src, 0o755, immutable, backup=False)
+        write_managed(DESKTOP_PATH, desktop_entry(cfg), 0o644, immutable, backup=False)
+        write_managed(ICON_PATH, icon_svg(), 0o644, immutable, backup=False)
+        msgs.append("desktop app '%s' installed" % (cfg.get("app_name") or PROG))
+        if not SANDBOX:
+            run(["update-desktop-database", os.path.dirname(DESKTOP_PATH)], timeout=60)
+            run(["gtk-update-icon-cache", "-f", "-t", "/usr/share/icons/hicolor"],
+                timeout=60)
+    else:
+        msgs.append("pornblock_gui.py not found - desktop app not installed")
+    return msgs
+
+
+def cmd_install_app(args) -> int:
+    """
+    Stage one: put the app on the machine. Nothing is blocked, nothing is
+    made immutable, no config is needed. Arming happens in the wizard.
+    """
+    require_root()
+    for d, mode in ((ETC_DIR, 0o700), (STATE_DIR, 0o700), (BACKUP_DIR, 0o700)):
+        os.makedirs(P(d), exist_ok=True)
+        os.chmod(P(d), mode)
+    cfg = load_config() or json.loads(json.dumps(DEFAULT_CONFIG))
+    for m in install_program_files(cfg, immutable=False):
+        print(green("  " + m))
+    if not SANDBOX:
+        probe = run([sys.executable, "-c", "import gi;"
+                     "gi.require_version('Gtk','4.0');"
+                     "gi.require_version('Adw','1');"
+                     "from gi.repository import Gtk, Adw"], timeout=30)
+        if not probe.ok:
+            print(yellow("\n  The desktop app needs GTK4 + libadwaita:"))
+            print(yellow("      sudo dnf install python3-gobject gtk4 libadwaita"))
+    print(green("\n  Installed. Nothing is blocked yet.\n"))
+    print("  Open '%s' from your app menu to set it up," % (cfg.get("app_name") or PROG))
+    print("  or run:  sudo %s setup\n" % PROG)
+    return 0
+
+
 def cmd_install(args) -> int:
     require_root()
     cfg = load_config()
@@ -2757,12 +2843,8 @@ def cmd_install(args) -> int:
             print(yellow("  install record wins: " + n))
     save_config(cfg)
 
-    src = os.path.abspath(__file__)
-    with open(src, "r", encoding="utf-8") as fh:
-        source = fh.read()
-    write_managed(SELF_COPY, source, 0o600, True, backup=False)
-    write_managed(BIN_PATH, source, 0o755, True, backup=False)
-    print(green("  installed %s" % P(BIN_PATH)))
+    for m in install_program_files(cfg, immutable=True):
+        print(green("  " + m))
 
     for ch in write_units():
         print(green("  " + ch))
@@ -2770,6 +2852,7 @@ def cmd_install(args) -> int:
 
     save_record(record_from_config(cfg))
     print(green("  install record written and made immutable"))
+    src = os.path.abspath(__file__)
     sha = current_source_sha()
     if sha:
         st.setdefault("update", {})["installed_sha"] = sha
@@ -2783,35 +2866,6 @@ def cmd_install(args) -> int:
     apply = st.get("mode") != "UNLOCKED"
     for ch in enforce_all(cfg, st, apply, quiet=True):
         print("  " + ch)
-
-    gui_src = None
-    cand = os.path.join(os.path.dirname(src), "pornblock_gui.py")
-    if os.path.exists(cand):
-        with open(cand, encoding="utf-8") as fh:
-            gui_src = fh.read()
-    elif os.path.exists(P(GUI_SELF_COPY)):
-        with open(P(GUI_SELF_COPY), encoding="utf-8") as fh:
-            gui_src = fh.read()
-    if gui_src:
-        write_managed(GUI_SELF_COPY, gui_src, 0o600, True, backup=False)
-        write_managed(GUI_BIN_PATH, gui_src, 0o755, True, backup=False)
-        write_managed(DESKTOP_PATH, desktop_entry(cfg), 0o644, True, backup=False)
-        write_managed(ICON_PATH, icon_svg(), 0o644, True, backup=False)
-        if not SANDBOX:
-            run(["update-desktop-database", os.path.dirname(DESKTOP_PATH)], timeout=60)
-            run(["gtk-update-icon-cache", "-f", "-t",
-                 "/usr/share/icons/hicolor"], timeout=60)
-            probe = run([sys.executable, "-c", "import gi;"
-                         "gi.require_version('Gtk','4.0');"
-                         "gi.require_version('Adw','1');"
-                         "from gi.repository import Gtk, Adw"], timeout=30)
-            if not probe.ok:
-                print(yellow("  GUI toolkit missing - run: sudo dnf install "
-                             "python3-gobject gtk4 libadwaita"))
-        print(green("  desktop app '%s' installed (%s)"
-                    % (cfg.get("app_name") or PROG, P(GUI_BIN_PATH))))
-    else:
-        print(yellow("  pornblock_gui.py not found - desktop app not installed"))
 
     systemctl("enable", "--now", "pornblock-watchdog.timer")
     systemctl("enable", "--now", "pornblock.service")
@@ -3496,6 +3550,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--install", action="store_true",
                    help="run install straight afterwards (one auth prompt)")
     s.set_defaults(fn=cmd_setup)
+
+    s = sub.add_parser("install-app",
+                       help="stage one: put the app on the machine, block nothing")
+    s.set_defaults(fn=cmd_install_app)
 
     s = sub.add_parser("install", help="install units, enable, lock everything down")
     s.add_argument("--refresh", action="store_true", help="force a blocklist download")

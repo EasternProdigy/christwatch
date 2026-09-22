@@ -1,0 +1,36 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  rpm:
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - name: Build tooling
+        run: dnf install -y -q rpm-build git python3 tar gzip
+      - uses: actions/checkout@v4
+      - name: Self-test before packaging
+        run: python3 selftest.py
+      - name: Build the RPM
+        run: ./packaging/build-rpm.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpm
+          path: dist/*.rpm
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.rpm
+          body: |
+            Download the `.rpm` and double-click it to install (Fedora).
+            Other distributions: unpack the source and run `./install.sh`.
+
+            Nothing is blocked until you open ChristWatch and finish setup.

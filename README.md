@@ -64,27 +64,49 @@ everything else in your ruleset are left alone.
 
 ## Install
 
-Needs `python3-gobject gtk4 libadwaita` for the desktop app (already present
-on a stock Fedora Workstation). The CLI itself is pure standard library.
+Installing happens in **two stages**, and they are deliberately separate:
 
-**Get a friend to sit with you for the last two minutes of this.**
+| Stage | What it does | Needs a friend? |
+|---|---|---|
+| **1. Get the app** | Puts ChristWatch in your app menu and `pornblock` on your PATH. **Nothing is blocked.** | No |
+| **2. Arm it** | The wizard: your details, your approvers, the mailbox, the secrets. Blocking goes live. | Yes, for the last page |
+
+### Stage 1 - pick whichever suits you
+
+**Fedora: download the `.rpm` and double-click it.** Grab it from the
+project's Releases page. Your software centre installs it and ChristWatch
+appears in the app grid. Dependencies are handled for you.
+
+**Any distribution: unpack the download and double-click `Install
+ChristWatch`.** It opens a terminal, checks what you are missing, offers to
+install it with your package manager, and puts the app in place. If your
+file manager will not run it, mark it executable first (right-click →
+Properties → Permissions), or run `./install.sh` from a terminal.
+
+**From a terminal:**
 
 ```bash
-git clone <this repo> && cd porn-block
-./pornblock_gui.py          # the wizard walks the whole thing
+git clone https://github.com/you/porn-block && cd porn-block
+./install.sh
 ```
 
-or entirely from the terminal:
+### Stage 2 - open ChristWatch and go through the wizard
+
+Six pages: you, your approvers, the friction, the mailbox, **your friend's
+turn at the keyboard**, and install. It ends by writing the config, enabling
+the service and switching blocking on.
+
+Terminal equivalent:
 
 ```bash
-sudo ./pornblock.py setup        # interactive wizard
-sudo ./pornblock.py test-email   # prove SMTP+IMAP work BEFORE you rely on them
-sudo ./pornblock.py install      # units, desktop app, lock down
+sudo pornblock setup        # same questions
+sudo pornblock test-email   # prove SMTP+IMAP work BEFORE you rely on them
+sudo pornblock install      # units, enable, lock down
 sudo pornblock status
 ```
 
-Setup asks for a **dedicated mailbox** (Gmail/Fastmail/whatever) with an **app
-password**. Common providers are auto-detected.
+Setup asks for a **dedicated mailbox** (Gmail/Fastmail/whatever) with an
+**app password**. Common providers are auto-detected.
 
 ### The step where you look away
 
@@ -97,6 +119,27 @@ things:
 2. **The partner passphrase.** Stored as a salted PBKDF2-SHA256 hash
    (600k iterations). Even after the timer expires and your friends approve,
    an unlock needs this typed in.
+
+No friend available today? Leave the passphrase blank and set it later - the
+app carries a "one gate short" banner until someone does. Everything else
+still works.
+
+### Removing the package does not unblock you
+
+`dnf remove christwatch` takes away the packaged copies and leaves the armed
+installation exactly where it is. That is on purpose. The only supported way
+out is `pornblock uninstall`, which refuses outside a granted unlock window.
+
+### Sharing it, and cutting a release
+
+```bash
+./packaging/build-rpm.sh     # -> dist/christwatch-<version>-1.fc*.noarch.rpm
+```
+
+Needs `rpm-build`. The spec runs `selftest.py` as its `%check`, so a package
+cannot be built from code that fails its own tests. Pushing a `v*` tag runs
+the same build in CI and attaches the `.rpm` to a GitHub Release, which is
+what your friends download and double-click.
 
 ### Files it creates
 
@@ -111,7 +154,8 @@ things:
 /var/lib/pornblock/backups/         originals of anything it took over
 /run/pornblock/status.json          0644, secret-free snapshot the GUI reads
 /var/log/pornblock.log              rotates at 5 MB, keeps 3
-/usr/local/bin/pornblock            immutable copy of the program
+/usr/share/christwatch/             the packaged copy, if installed by RPM
+/usr/local/bin/pornblock            the managed copy (immutable once armed)
 /usr/local/bin/pornblock-gui        the desktop app
 /usr/share/applications/christwatch.desktop
 /usr/share/icons/hicolor/scalable/apps/christwatch.svg
