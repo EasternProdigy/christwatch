@@ -30,7 +30,8 @@ def base_cfg():
         "email": {"address": "bot@example.com",
                   # deliberately unroutable: every send must fail gracefully
                   "smtp_host": "localhost", "smtp_port": 1,
-                  "imap_host": "localhost", "imap_port": 1},
+                  "imap_host": "localhost", "imap_port": 1,
+                  "smtp_password": "stub", "imap_password": "stub"},
     })
     return cfg
 
@@ -187,6 +188,118 @@ for mode, unlock, expect in (("LOCKED", None, False), ("PENDING", None, False),
     granted = (mode == "UNLOCKED" and pb.now() < float((unlock or {}).get("expires_at") or 0))
     check("uninstall allowed=%s when %s" % (expect, mode + ("/expired" if unlock and
           unlock["expires_at"] < pb.now() else "")), granted == expect)
+
+print("\n== secrets are kept out of config.json ==")
+cfg = base_cfg()
+cfg["email"]["smtp_password"] = "hunter2-smtp"
+cfg["email"]["imap_password"] = "hunter2-imap"
+pb.save_secrets({"smtp_password": "hunter2-smtp", "imap_password": "hunter2-imap",
+                 "partner_passphrase": pb.hash_passphrase("friend-secret")})
+pb.save_config(cfg)
+raw_cfg = open(pb.P(pb.CONFIG_PATH)).read()
+check("no password text in config.json", "hunter2" not in raw_cfg)
+check("config.json blanks the password fields",
+      json.loads(raw_cfg)["email"]["smtp_password"] == "")
+loaded = pb.load_config()
+check("load_config merges the secrets back in",
+      loaded["email"]["smtp_password"] == "hunter2-smtp")
+check("secrets.json is not world readable",
+      oct(os.stat(pb.P(pb.SECRETS_PATH)).st_mode)[-3:] == "600")
+
+print("\n== passphrase hashing ==")
+h = pb.hash_passphrase("correct horse battery")
+check("hash is pbkdf2 and salted", h["algo"] == "pbkdf2_sha256" and len(h["salt"]) == 32)
+check("the passphrase itself is never stored",
+      "correct horse battery" not in json.dumps(h))
+check("right passphrase verifies", pb.verify_passphrase(h, "correct horse battery"))
+check("wrong passphrase does not", not pb.verify_passphrase(h, "correct horse"))
+check("empty passphrase does not", not pb.verify_passphrase(h, ""))
+check("missing record does not", not pb.verify_passphrase(None, "anything"))
+
+print("\n== passphrase gate ==")
+cfg = base_cfg()
+cfg["_secrets"] = {"partner_passphrase": pb.hash_passphrase("friend-secret")}
+pb.save_config(cfg)
+pb.save_record(pb.record_from_config(cfg))
+st = pb.deep_merge(pb.DEFAULT_STATE, {})
+req = {"approvals": {}, "passphrase_ok": False}
+check("gate is required and unmet", pb.passphrase_gate(cfg, st, req) == (True, False))
+req["passphrase_ok"] = True
+check("gate satisfied once entered", pb.passphrase_gate(cfg, st, req) == (True, True))
+req = {"approvals": {"a@example.com": 1, "b@example.com": 1}, "passphrase_ok": False}
+check("quorum alone does not satisfy it", pb.passphrase_gate(cfg, st, req) == (True, False))
+req["approvals"]["c@example.com"] = 1
+check("unanimity substitutes for it", pb.passphrase_gate(cfg, st, req) == (True, True))
+cfg_norec = pb.deep_merge(cfg, {"passphrase_recovery": False})
+cfg_norec["_secrets"] = cfg["_secrets"]
+check("recovery off means unanimity is not enough",
+      pb.passphrase_gate(cfg_norec, st, req) == (True, False))
+gone = pb.deep_merge(cfg, {})
+gone["_secrets"] = {"partner_passphrase": None}
+check("deleting the hash does NOT remove the gate",
+      pb.passphrase_gate(gone, st, {"approvals": {}, "passphrase_ok": False})
+      == (True, False))
+
+print("\n== passphrase blocks the grant ==")
+cfg = base_cfg()
+cfg["_secrets"] = {"partner_passphrase": pb.hash_passphrase("friend-secret")}
+pb.save_config(cfg); pb.save_record(pb.record_from_config(cfg))
+st = pb.deep_merge(pb.DEFAULT_STATE, {"mode": "PENDING"})
+st["request"] = {"token": "TOKEN123", "requested_at": pb.now(),
+                 "eligible_at": pb.now() - 1, "last_poll": pb.now(),
+                 "approvals": {"a@example.com": pb.now(), "b@example.com": pb.now()},
+                 "denials": {}, "passphrase_ok": False, "ready_notified": False}
+pb.advance(cfg, st, pb.Mailer(cfg))
+check("timer done + quorum but no passphrase -> still PENDING", st["mode"] == "PENDING")
+st["request"]["passphrase_ok"] = True
+pb.advance(cfg, st, pb.Mailer(cfg))
+check("all three gates -> UNLOCKED", st["mode"] == "UNLOCKED")
+
+print("\n== passphrase policy is part of the contract ==")
+weak = pb.deep_merge(cfg, {"require_passphrase": False})
+weak["_secrets"] = cfg["_secrets"]
+got, notes = pb.reconcile_record(weak, pb.deep_merge(pb.DEFAULT_STATE, {}))
+check("turning the passphrase requirement off is reverted",
+      got["require_passphrase"] is True and any("passphrase" in n for n in notes))
+weak2 = pb.deep_merge(cfg, {"passphrase_recovery": True})
+weak2["_secrets"] = cfg["_secrets"]
+rec = pb.load_record(); rec["passphrase_recovery"] = False; pb.save_record(rec)
+got, notes = pb.reconcile_record(weak2, pb.deep_merge(pb.DEFAULT_STATE, {}))
+check("switching recovery on behind your own back is reverted",
+      got["passphrase_recovery"] is False)
+
+print("\n== public status snapshot ==")
+cfg = base_cfg()
+cfg["_secrets"] = {"smtp_password": "hunter2-smtp",
+                   "partner_passphrase": pb.hash_passphrase("friend-secret")}
+st = pb.deep_merge(pb.DEFAULT_STATE, {})
+doc = pb.public_status_doc(cfg, st)
+blob = json.dumps(doc)
+check("snapshot leaks no password", "hunter2" not in blob)
+check("snapshot leaks no passphrase hash", doc.get("passphrase_set") is True
+      and "pbkdf2" not in blob)
+check("snapshot has what the GUI needs",
+      all(k in doc for k in ("mode", "approvers", "approvals_required",
+                             "cooloff_hours", "passphrase_required", "health")))
+pb.write_public_status(cfg, st)
+check("snapshot is world readable",
+      oct(os.stat(pb.P(pb.PUBLIC_STATUS)).st_mode)[-3:] == "644")
+
+print("\n== desktop integration ==")
+de = pb.desktop_entry(cfg)
+check("desktop entry names the app", "Name=ChristWatch" in de)
+check("desktop entry launches the GUI", "Exec=/usr/local/bin/pornblock-gui" in de)
+check("desktop entry is a valid-looking entry", de.startswith("[Desktop Entry]")
+      and "Type=Application" in de)
+svg = pb.icon_svg()
+check("icon is well-formed svg", svg.lstrip().startswith("<?xml")
+      and svg.rstrip().endswith("</svg>"))
+import xml.etree.ElementTree as ET
+try:
+    ET.fromstring(svg.split("?>", 1)[1]); ok_svg = True
+except Exception as exc:
+    ok_svg = False
+check("icon parses as XML", ok_svg)
 
 shutil.rmtree(SB, ignore_errors=True)
 print("\n%d checks failed" % len(FAILED))

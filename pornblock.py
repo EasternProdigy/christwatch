@@ -25,6 +25,7 @@ import email.message
 import email.utils
 import getpass
 import hashlib
+import hmac
 import imaplib
 import json
 import os
@@ -68,15 +69,28 @@ def P(path: str) -> str:
 ETC_DIR = "/etc/pornblock"
 CONFIG_PATH = ETC_DIR + "/config.json"
 RECORD_PATH = ETC_DIR + "/install-record.json"
+SECRETS_PATH = ETC_DIR + "/secrets.json"
 NFT_CONF_PATH = ETC_DIR + "/nftables.conf"
 
 STATE_DIR = "/var/lib/pornblock"
 STATE_PATH = STATE_DIR + "/state.json"
 BLOCKLIST_PATH = STATE_DIR + "/blocklist-porn.hosts"
+# Second copy of the contract. Deleting the record in /etc would otherwise
+# quietly remove the passphrase gate along with it.
+RECORD_BACKUP = STATE_DIR + "/install-record.json.bak"
 BACKUP_DIR = STATE_DIR + "/backups"
 
 LOG_PATH = "/var/log/pornblock.log"
 BIN_PATH = "/usr/local/bin/pornblock"
+GUI_BIN_PATH = "/usr/local/bin/pornblock-gui"
+
+# Public, secret-free status snapshot so the desktop app can show live
+# state without asking for a password every two seconds.
+RUN_DIR = "/run/pornblock"
+PUBLIC_STATUS = RUN_DIR + "/status.json"
+
+DESKTOP_PATH = "/usr/share/applications/christwatch.desktop"
+ICON_PATH = "/usr/share/icons/hicolor/scalable/apps/christwatch.svg"
 
 HOSTS_PATH = "/etc/hosts"
 RESOLV_CONF = "/etc/resolv.conf"
@@ -162,6 +176,7 @@ BING_HOSTS = ["www.bing.com", "bing.com"]
 
 DEFAULT_CONFIG = {
     "version": 1,
+    "app_name": "ChristWatch",
     "owner_name": "",
     "owner_email": "",
     "approvers": [],
@@ -169,6 +184,13 @@ DEFAULT_CONFIG = {
     "cooloff_hours": 24.0,
     "unlock_minutes": 60,
     "request_ttl_hours": 168.0,
+    # A passphrase your friend sets and keeps. Third gate on top of the
+    # timer and the approvals.
+    "require_passphrase": True,
+    # If the friend who holds it is unreachable, UNANIMOUS approval from
+    # every approver substitutes for it. Without this a lost passphrase
+    # means the honest unlock path is closed for good.
+    "passphrase_recovery": True,
     "filter": "cloudflare_family",
     "youtube_restrict": "moderate",   # moderate | strict
     "loop_seconds": 45,
@@ -215,6 +237,7 @@ DEFAULT_CONFIG = {
 
 DEFAULT_STATE = {
     "mode": "LOCKED",
+    "passphrase": {"fails": 0, "locked_until": 0},
     "request": None,
     "unlock": None,
     "blocklist": {"fetched_at": 0, "domains": 0, "safesearch_ips": {}},
@@ -497,15 +520,76 @@ def deep_merge(base: dict, over: dict) -> dict:
     return out
 
 
-def load_config() -> dict:
+DEFAULT_SECRETS = {
+    "smtp_password": "",
+    "imap_password": "",
+    # {"algo","iter","salt","hash","set_at"} - never the passphrase itself
+    "partner_passphrase": None,
+}
+
+
+def load_secrets() -> dict:
+    sec = deep_merge(DEFAULT_SECRETS, load_json(SECRETS_PATH, {}) or {})
+    # migrate credentials that older configs kept inline
+    raw = load_json(CONFIG_PATH, None) or {}
+    inline = (raw.get("email") or {})
+    moved = False
+    for k in ("smtp_password", "imap_password"):
+        if not sec.get(k) and inline.get(k):
+            sec[k] = inline[k]
+            moved = True
+    if moved:
+        save_secrets(sec)
+        log("migrated mail credentials out of config.json into secrets.json")
+    return sec
+
+
+def save_secrets(sec: dict) -> None:
+    os.makedirs(P(ETC_DIR), exist_ok=True)
+    with contextlib.suppress(OSError):
+        os.chmod(P(ETC_DIR), 0o700)
+    write_managed(SECRETS_PATH, dump_json(sec), mode=0o600,
+                  immutable=True, backup=False)
+
+
+def hash_passphrase(phrase: str, iters: int = 600_000) -> dict:
+    salt = os.urandom(16)
+    dk = hashlib.pbkdf2_hmac("sha256", phrase.encode("utf-8"), salt, iters)
+    return {"algo": "pbkdf2_sha256", "iter": iters, "salt": salt.hex(),
+            "hash": dk.hex(), "set_at": now()}
+
+
+def verify_passphrase(rec: dict | None, phrase: str) -> bool:
+    if not rec or not phrase:
+        return False
+    try:
+        dk = hashlib.pbkdf2_hmac("sha256", phrase.encode("utf-8"),
+                                 bytes.fromhex(rec["salt"]), int(rec["iter"]))
+    except (KeyError, ValueError):
+        return False
+    return hmac.compare_digest(dk.hex(), rec.get("hash", ""))
+
+
+def load_config(with_secrets: bool = True) -> dict:
     raw = load_json(CONFIG_PATH, None)
     if raw is None:
         return None
-    return deep_merge(DEFAULT_CONFIG, raw)
+    cfg = deep_merge(DEFAULT_CONFIG, raw)
+    if with_secrets:
+        sec = load_secrets()
+        cfg["email"]["smtp_password"] = sec.get("smtp_password") or ""
+        cfg["email"]["imap_password"] = sec.get("imap_password") or ""
+        cfg["_secrets"] = sec
+    return cfg
 
 
 def save_config(cfg: dict) -> None:
-    write_managed(CONFIG_PATH, dump_json(cfg), mode=0o600,
+    """Write config.json with every secret stripped out."""
+    out = {k: v for k, v in cfg.items() if not k.startswith("_")}
+    out = json.loads(json.dumps(out))
+    out.setdefault("email", {})["smtp_password"] = ""
+    out["email"]["imap_password"] = ""
+    write_managed(CONFIG_PATH, dump_json(out), mode=0o600,
                   immutable=False, backup=False)
 
 
@@ -514,8 +598,10 @@ def load_record() -> dict | None:
 
 
 def save_record(rec: dict) -> None:
-    write_managed(RECORD_PATH, dump_json(rec), mode=0o600,
-                  immutable=True, backup=False)
+    body = dump_json(rec)
+    write_managed(RECORD_PATH, body, mode=0o600, immutable=True, backup=False)
+    os.makedirs(P(STATE_DIR), exist_ok=True)
+    write_managed(RECORD_BACKUP, body, mode=0o600, immutable=True, backup=False)
 
 
 def record_from_config(cfg: dict) -> dict:
@@ -526,6 +612,10 @@ def record_from_config(cfg: dict) -> dict:
         "cooloff_hours": float(cfg["cooloff_hours"]),
         "unlock_minutes": int(cfg["unlock_minutes"]),
         "filter": cfg["filter"],
+        "require_passphrase": bool(cfg.get("require_passphrase", True)),
+        "passphrase_recovery": bool(cfg.get("passphrase_recovery", True)),
+        "passphrase_set": bool((cfg.get("_secrets") or load_secrets()
+                                ).get("partner_passphrase")),
         "recorded_at": now(),
     }
 
@@ -824,7 +914,8 @@ def alert(cfg: dict, st: dict, key: str, subject: str, text: str,
         return False
     st.setdefault("alerts", {})[key] = now()
     recipients = to if to is not None else everyone(cfg)
-    prefix = "[pornblock DEMO] " if SANDBOX else "[pornblock] "
+    app = cfg.get("app_name") or PROG
+    prefix = "[%s DEMO] " % app if SANDBOX else "[%s] " % app
     return Mailer(cfg).send(st, recipients, prefix + subject, text, html)
 
 
@@ -1353,7 +1444,21 @@ def reconcile_record(cfg: dict, st: dict) -> tuple:
     """
     rec = load_record()
     if not rec:
-        return cfg, []
+        spare = load_json(RECORD_BACKUP, None)
+        if not spare:
+            return cfg, []
+        # The record was deleted. Put it back and make some noise.
+        save_record(spare)
+        rec = spare
+        log("install record was missing; restored from the spare copy")
+        alert(cfg, st, "tamper_record",
+              "The install record was deleted and has been restored",
+              "Someone deleted %s on %s - the file that pins the approver "
+              "list, the quorum, the cool-off and the passphrase requirement.\n\n"
+              "It has been restored from the spare copy. Deleting it is how "
+              "you would remove those gates, so it is worth asking about.\n"
+              % (RECORD_PATH, socket.gethostname()), force=True)
+        history(st, "install record deleted and restored from spare")
 
     notes = []
     reverted = False
@@ -1403,6 +1508,27 @@ def reconcile_record(cfg: dict, st: dict) -> tuple:
         rec["unlock_minutes"] = int(cfg["unlock_minutes"])
         save_record(rec)
 
+    if bool(rec.get("require_passphrase", False)) and \
+            not bool(cfg.get("require_passphrase", True)):
+        notes.append("partner passphrase requirement was switched off; reverted")
+        cfg["require_passphrase"] = True
+        reverted = True
+    if not bool(rec.get("passphrase_recovery", True)) and \
+            bool(cfg.get("passphrase_recovery", True)):
+        notes.append("passphrase recovery-by-unanimity was switched on; reverted")
+        cfg["passphrase_recovery"] = False
+        reverted = True
+    if rec.get("passphrase_set") and not (cfg.get("_secrets") or
+                                          load_secrets()).get("partner_passphrase"):
+        notes.append("the stored partner passphrase was DELETED - it cannot be "
+                     "restored, so this unlock path now needs unanimous approval")
+        alert(cfg, st, "tamper_passphrase",
+              "The partner passphrase was deleted",
+              "Someone removed the stored partner passphrase on %s.\n\n"
+              "It cannot be recovered. Until a new one is set during an unlock "
+              "window, the only way out is unanimous approval from all of you.\n"
+              % socket.gethostname())
+
     if cfg.get("filter") not in FILTERS:
         notes.append("unknown filter %r; reverted to %s"
                      % (cfg.get("filter"), rec.get("filter")))
@@ -1436,6 +1562,51 @@ def reconcile_record(cfg: dict, st: dict) -> tuple:
 # ==========================================================================
 # systemd units + self-protection of the binary
 # ==========================================================================
+
+def desktop_entry(cfg: dict) -> str:
+    name = cfg.get("app_name") or "ChristWatch"
+    return (
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        "Version=1.0\n"
+        "Name=%s\n"
+        "GenericName=Accountability blocker\n"
+        "Comment=Content blocking with a cool-off and friends who have to agree\n"
+        "Exec=%s\n"
+        "Icon=christwatch\n"
+        "Terminal=false\n"
+        "Categories=Utility;Security;System;\n"
+        "Keywords=accountability;blocker;filter;porn;\n"
+        "StartupNotify=true\n"
+        "StartupWMClass=christwatch\n" % (name, GUI_BIN_PATH))
+
+
+def icon_svg() -> str:
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" '
+        'width="128" height="128">\n'
+        '  <defs>\n'
+        '    <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">\n'
+        '      <stop offset="0" stop-color="#6ea8fe"/>\n'
+        '      <stop offset="1" stop-color="#2f52c9"/>\n'
+        '    </linearGradient>\n'
+        '    <linearGradient id="sheen" x1="0" y1="0" x2="1" y2="1">\n'
+        '      <stop offset="0" stop-color="#ffffff" stop-opacity=".28"/>\n'
+        '      <stop offset="0.6" stop-color="#ffffff" stop-opacity="0"/>\n'
+        '    </linearGradient>\n'
+        '  </defs>\n'
+        '  <path d="M64 7 L115 25 V65 c0 30-22 51-51 57 C35 116 13 95 13 65 '
+        'V25 Z" fill="url(#body)"/>\n'
+        '  <path d="M64 7 L115 25 V65 c0 30-22 51-51 57 C35 116 13 95 13 65 '
+        'V25 Z" fill="url(#sheen)"/>\n'
+        '  <path d="M64 15 L107 30 V65 c0 26-19 44-43 50 C40 109 21 91 21 65 '
+        'V30 Z" fill="none" stroke="#ffffff" stroke-opacity=".35" '
+        'stroke-width="2"/>\n'
+        '  <path d="M56 33 H72 V56 H95 V72 H72 V104 H56 V72 H33 V56 H56 Z" '
+        'fill="#ffffff" fill-opacity=".95"/>\n'
+        '</svg>\n')
+
 
 def unit_service() -> str:
     return (
@@ -1502,6 +1673,7 @@ def write_units() -> list:
 
 
 SELF_COPY = STATE_DIR + "/pornblock.py.installed"
+GUI_SELF_COPY = STATE_DIR + "/pornblock_gui.py.installed"
 
 
 def protect_binary(cfg: dict, st: dict) -> list:
@@ -1646,6 +1818,30 @@ def request_email(cfg: dict, st: dict) -> tuple:
     return subject, text, html
 
 
+def passphrase_gate(cfg: dict, st: dict, req: dict) -> tuple:
+    """
+    Returns (required, satisfied) for the partner passphrase.
+
+    Note what happens if the stored hash is deleted: the install record still
+    says a passphrase exists, so the gate stays shut and cannot be satisfied
+    by typing anything. That is deliberate - deleting the hash must not be a
+    way to remove a gate. Unanimous approval is then the way out.
+    """
+    rec = load_record() or {}
+    sec = cfg.get("_secrets") or load_secrets()
+    ever_set = bool(sec.get("partner_passphrase")) or bool(rec.get("passphrase_set"))
+    if not (bool(cfg.get("require_passphrase", True)) and ever_set):
+        return False, True
+    if req.get("passphrase_ok"):
+        return True, True
+    if cfg.get("passphrase_recovery", True):
+        wanted = {a.strip().lower() for a in (cfg.get("approvers") or [])}
+        have = {k.strip().lower() for k in (req.get("approvals") or {})}
+        if wanted and wanted <= have:
+            return True, True          # unanimity stands in for the passphrase
+    return True, False
+
+
 def classify_reply(subject: str, body: str, token: str):
     blob = (subject or "") + "\n" + (body or "")
     tok = re.escape(token)
@@ -1738,7 +1934,8 @@ def advance(cfg: dict, st: dict, mailer: Mailer) -> list:
         got = len(req.get("approvals") or {})
         need = int(cfg["approvals_required"])
         timer_done = now() >= float(req.get("eligible_at") or 0)
-        if timer_done and got >= need:
+        pass_req, pass_ok = passphrase_gate(cfg, st, req)
+        if timer_done and got >= need and pass_ok:
             mins = int(cfg["unlock_minutes"])
             st["unlock"] = {"granted_at": now(), "expires_at": now() + mins * 60,
                             "token": req.get("token"),
@@ -1759,14 +1956,18 @@ def advance(cfg: dict, st: dict, mailer: Mailer) -> list:
             moves.append("UNLOCKED for %d minutes" % mins)
         elif timer_done and not req.get("ready_notified"):
             req["ready_notified"] = True
-            alert(cfg, st, "cooloff_done", "Cool-off finished - still needs %d approval(s)"
-                  % (need - got),
-                  "%s's cool-off timer has finished. The blocker will stay on "
-                  "until %d more of you approve (code %s).\n\nApprove with: "
-                  "APPROVE %s\n%s\n"
-                  % (who(cfg), need - got, req.get("token"), req.get("token"),
-                     mailto_link(cfg, req.get("token"))), force=True)
-            moves.append("cool-off elapsed, waiting on approvals")
+            outstanding = []
+            if got < need:
+                outstanding.append("%d more approval(s)" % (need - got))
+            if pass_req and not pass_ok:
+                outstanding.append("the partner passphrase")
+            alert(cfg, st, "cooloff_done",
+                  "Cool-off finished - still waiting on %s" % " and ".join(outstanding),
+                  "%s's cool-off timer has finished. The blocker stays on until "
+                  "%s (code %s).\n\nApprove with: APPROVE %s\n%s\n"
+                  % (who(cfg), " and ".join(outstanding), req.get("token"),
+                     req.get("token"), mailto_link(cfg, req.get("token"))), force=True)
+            moves.append("cool-off elapsed, waiting on " + " and ".join(outstanding))
 
     elif mode == "UNLOCKED":
         unl = st.get("unlock") or {}
@@ -1780,6 +1981,82 @@ def advance(cfg: dict, st: dict, mailer: Mailer) -> list:
             moves.append("unlock window expired - re-locked")
 
     return moves
+
+
+# ==========================================================================
+# Public status snapshot -- what the desktop app reads
+# ==========================================================================
+
+def public_status_doc(cfg: dict, st: dict) -> dict:
+    rec = load_record() or {}
+    sec = cfg.get("_secrets") or {}
+    req = st.get("request") or {}
+    mode = st.get("mode", "LOCKED")
+    if mode == "PENDING":
+        pass_req, pass_ok = passphrase_gate(cfg, st, req)
+    else:
+        pass_req = bool(cfg.get("require_passphrase", True)) and bool(
+            sec.get("partner_passphrase") or rec.get("passphrase_set"))
+        pass_ok = False
+    doc = {
+        "schema": 1,
+        "version": VERSION,
+        "app_name": cfg.get("app_name") or PROG,
+        "generated_at": now(),
+        "hostname": socket.gethostname(),
+        "configured": True,
+        "installed": os.path.exists(P(BIN_PATH)),
+        "mode": mode,
+        "owner_name": cfg.get("owner_name") or "",
+        "owner_email": cfg.get("owner_email") or "",
+        "approvers": list(cfg.get("approvers") or []),
+        "approvals_required": int(cfg.get("approvals_required") or 1),
+        "cooloff_hours": float(cfg.get("cooloff_hours") or 24),
+        "unlock_minutes": int(cfg.get("unlock_minutes") or 60),
+        "filter": cfg.get("filter"),
+        "filter_label": FILTERS.get(cfg.get("filter"), {}).get("label", "?"),
+        "passphrase_required": pass_req,
+        "passphrase_satisfied": pass_ok,
+        "passphrase_set": bool(sec.get("partner_passphrase") or rec.get("passphrase_set")),
+        "passphrase_locked_until": float((st.get("passphrase") or {}).get("locked_until") or 0),
+        "passphrase_fails": int((st.get("passphrase") or {}).get("fails") or 0),
+        "recovery_enabled": bool(cfg.get("passphrase_recovery", True)),
+        "queued_emails": len(st.get("outbox") or []),
+        "blocklist": {"domains": (st.get("blocklist") or {}).get("domains", 0),
+                      "fetched_at": (st.get("blocklist") or {}).get("fetched_at", 0)},
+        "history": [dict(h) for h in (st.get("history") or [])[-8:]],
+        "request": None,
+        "unlock": None,
+        "health": [],
+    }
+    if mode == "PENDING" and req:
+        doc["request"] = {
+            "token": req.get("token"),
+            "requested_at": req.get("requested_at"),
+            "eligible_at": req.get("eligible_at"),
+            "reason": req.get("reason") or "",
+            "approvals": dict(req.get("approvals") or {}),
+            "denials": dict(req.get("denials") or {}),
+        }
+    if mode == "UNLOCKED":
+        doc["unlock"] = dict(st.get("unlock") or {})
+    try:
+        doc["health"] = [{"name": n, "ok": bool(o), "detail": d}
+                         for n, o, d in health(cfg, st)]
+    except Exception as exc:
+        log("health probe failed: %r" % exc)
+    return doc
+
+
+def write_public_status(cfg: dict, st: dict) -> None:
+    """World-readable so the GUI never needs a password just to look."""
+    try:
+        doc = public_status_doc(cfg, st)
+        os.makedirs(P(RUN_DIR), exist_ok=True)
+        os.chmod(P(RUN_DIR), 0o755)
+        atomic_write(P(PUBLIC_STATUS), dump_json(doc), 0o644)
+    except OSError as exc:
+        log("could not write public status: %s" % exc)
 
 
 # ==========================================================================
@@ -1885,6 +2162,10 @@ def validate_config(cfg: dict) -> list:
     for k in ("address", "smtp_host", "imap_host"):
         if not e.get(k):
             errs.append("email.%s is required" % k)
+    if not e.get("smtp_password"):
+        errs.append("no SMTP password stored - your friend needs to enter it")
+    if not e.get("imap_password"):
+        errs.append("no IMAP password stored - your friend needs to enter it")
     if e.get("address") and not valid_email(e["address"]):
         errs.append("email.address is not a valid address")
     return errs
@@ -1916,8 +2197,13 @@ def cmd_setup(args) -> int:
     cfg = deep_merge(DEFAULT_CONFIG, existing)
 
     if args.answers:
-        with open(args.answers, encoding="utf-8") as fh:
-            cfg = deep_merge(cfg, json.load(fh))
+        raw = (sys.stdin.read() if args.answers == "-"
+               else open(args.answers, encoding="utf-8").read())
+        try:
+            cfg = deep_merge(cfg, json.loads(raw))
+        except ValueError as exc:
+            print(red("  answers are not valid JSON: %s" % exc))
+            return 1
     else:
         print(bold("\n  pornblock setup\n  " + "-" * 60))
         print("  This asks for your details, your friends' emails, and a\n"
@@ -1960,7 +2246,11 @@ def cmd_setup(args) -> int:
                                              cfg["email"].get("smtp_security") or ss)
         cfg["email"]["smtp_user"] = _ask("SMTP username", cfg["email"].get("smtp_user")
                                          or cfg["email"]["address"])
-        cfg["email"]["smtp_password"] = _ask("SMTP app password", secret=True)
+        print(bold("\n  >>> HAND THE KEYBOARD TO YOUR FRIEND NOW <<<"))
+        print("  They type the mailbox app password. You should not know it -")
+        print("  if you do, you can log into the mailbox and approve yourself.")
+        cfg["email"]["smtp_password"] = _ask("Mailbox app password (friend types this)",
+                                             secret=True)
         cfg["email"]["imap_host"] = _ask("IMAP host", cfg["email"].get("imap_host") or ih or None)
         cfg["email"]["imap_port"] = _ask("IMAP port", cfg["email"].get("imap_port") or ip_, cast=int)
         cfg["email"]["imap_security"] = _ask("IMAP security (ssl/starttls)",
@@ -1970,6 +2260,21 @@ def cmd_setup(args) -> int:
         same = _ask("IMAP password same as SMTP? (y/n)", "y").lower().startswith("y")
         cfg["email"]["imap_password"] = (cfg["email"]["smtp_password"] if same
                                          else _ask("IMAP app password", secret=True))
+
+        print(bold("\n  Partner passphrase (still your friend typing)"))
+        print("  A third gate: even after the timer and the approvals, an")
+        print("  unlock needs this typed in. Only they should know it.")
+        while True:
+            one = _ask("Partner passphrase", secret=True)
+            two = _ask("Type it again", secret=True)
+            if one != two:
+                print(red("  they did not match"))
+                continue
+            if len(one) < 8:
+                print(red("  use at least 8 characters"))
+                continue
+            cfg["partner_passphrase"] = one
+            break
 
     errs = validate_config(cfg)
     if errs:
@@ -1982,10 +2287,27 @@ def cmd_setup(args) -> int:
     os.chmod(P(ETC_DIR), 0o700)
     os.makedirs(P(STATE_DIR), exist_ok=True)
     os.chmod(P(STATE_DIR), 0o700)
+
+    # Secrets never go into config.json.
+    sec = load_secrets()
+    if cfg["email"].get("smtp_password"):
+        sec["smtp_password"] = cfg["email"]["smtp_password"]
+    if cfg["email"].get("imap_password"):
+        sec["imap_password"] = cfg["email"]["imap_password"]
+    phrase = cfg.pop("partner_passphrase", None)
+    if phrase:
+        if len(phrase) < 8:
+            print(red("  partner passphrase must be at least 8 characters"))
+            return 1
+        sec["partner_passphrase"] = hash_passphrase(phrase)
+        del phrase
+    save_secrets(sec)
+    cfg["_secrets"] = sec
     save_config(cfg)
     log("setup written by %s" % (os.environ.get("SUDO_USER") or "root"))
 
     print(green("\n  Saved %s (0600)" % P(CONFIG_PATH)))
+    print(green("  Secrets in %s (0600, immutable)" % P(SECRETS_PATH)))
     print("""
   %s
     approvers        : %s
@@ -1993,13 +2315,19 @@ def cmd_setup(args) -> int:
     cool-off         : %s hours
     unlock window    : %s minutes
     resolver         : %s
+    partner passcode : %s
 
   Next:
     1. %s test-email      <- prove email works BEFORE you rely on it
     2. %s install         <- write units, enable, lock it down
 """ % (bold("Summary"), ", ".join(cfg["approvers"]), cfg["approvals_required"],
        cfg["cooloff_hours"], cfg["unlock_minutes"], FILTERS[cfg["filter"]]["label"],
+       "set by your friend" if sec.get("partner_passphrase") else "NOT SET",
        PROG, PROG))
+
+    if getattr(args, "install", False):
+        print(bold("  continuing straight into install...\n"))
+        return cmd_install(argparse.Namespace(refresh=False))
     return 0
 
 
@@ -2113,6 +2441,7 @@ def cmd_request(args) -> int:
         "requested_at": now(),
         "eligible_at": now() + float(cfg["cooloff_hours"]) * 3600.0,
         "approvals": {}, "denials": {}, "ready_notified": False, "last_poll": 0,
+        "passphrase_ok": False,
         "reason": args.reason or "",
     }
     st["mode"] = "PENDING"
@@ -2123,6 +2452,7 @@ def cmd_request(args) -> int:
         text = text.replace("\n\n  Cool-off", "\n\nTheir stated reason: %s\n\n  Cool-off"
                             % args.reason)
     sent = alert(cfg, st, "request", subj, text, html, force=True)
+    write_public_status(cfg, st)
     save_state(st)
 
     print(green("\n  Request sent.") if sent
@@ -2158,6 +2488,7 @@ def cmd_cancel(args) -> int:
           "back to LOCKED.\n\nThis is the good outcome. If you want to say "
           "something encouraging, now is the moment.\n"
           % (who(cfg), tok, socket.gethostname()), force=True)
+    write_public_status(cfg, st)
     save_state(st)
     print(green("""
   Cancelled. Back to LOCKED.
@@ -2173,10 +2504,19 @@ def cmd_status(args) -> int:
     require_root()
     cfg = load_config()
     if not cfg:
+        if getattr(args, "json", False):
+            print(dump_json({"schema": 1, "configured": False}))
+            return 0
         print(red("Not configured. Run: sudo %s setup" % PROG))
         return 1
     st = load_state()
     cfg, notes = reconcile_record(cfg, st)
+    if getattr(args, "json", False):
+        doc = public_status_doc(cfg, st)
+        write_public_status(cfg, st)
+        save_state(st)
+        print(dump_json(doc))
+        return 0
     mode = st["mode"]
     colour = {"LOCKED": green, "PENDING": yellow, "UNLOCKED": red}[mode]
 
@@ -2211,11 +2551,19 @@ def cmd_status(args) -> int:
             mark = green("  approved  ") if key in got else dim("  waiting   ")
             when = stamp(got[key]) if key in got else ""
             print("      %s %-34s %s" % (mark, a, dim(when)))
+        pass_req, pass_ok = passphrase_gate(cfg, st, req)
+        if pass_req:
+            print("  partner passphrase : %s"
+                  % (green("entered") if pass_ok else yellow("not entered yet")))
+            if pass_ok and not req.get("passphrase_ok"):
+                print("  " + dim("    (satisfied by unanimous approval)"))
         blockers = []
         if left > 0:
             blockers.append("the %s timer" % human_delta(left))
         if len(got) < need:
             blockers.append("%d more approval(s)" % (need - len(got)))
+        if pass_req and not pass_ok:
+            blockers.append("the partner passphrase")
         print("  still waiting on   : %s" % (yellow(" and ".join(blockers))
                                              if blockers else green("nothing - unlocking")))
     elif mode == "UNLOCKED":
@@ -2249,6 +2597,7 @@ def cmd_status(args) -> int:
         for h in st["history"][-5:]:
             print("      %s  %s" % (dim(stamp(h["at"])), h["event"]))
     print("")
+    write_public_status(cfg, st)
     save_state(st)
     return 0
 
@@ -2303,12 +2652,44 @@ def cmd_install(args) -> int:
     for ch in enforce_all(cfg, st, apply, quiet=True):
         print("  " + ch)
 
+    gui_src = None
+    cand = os.path.join(os.path.dirname(src), "pornblock_gui.py")
+    if os.path.exists(cand):
+        with open(cand, encoding="utf-8") as fh:
+            gui_src = fh.read()
+    elif os.path.exists(P(GUI_SELF_COPY)):
+        with open(P(GUI_SELF_COPY), encoding="utf-8") as fh:
+            gui_src = fh.read()
+    if gui_src:
+        write_managed(GUI_SELF_COPY, gui_src, 0o600, True, backup=False)
+        write_managed(GUI_BIN_PATH, gui_src, 0o755, True, backup=False)
+        write_managed(DESKTOP_PATH, desktop_entry(cfg), 0o644, True, backup=False)
+        write_managed(ICON_PATH, icon_svg(), 0o644, True, backup=False)
+        if not SANDBOX:
+            run(["update-desktop-database", os.path.dirname(DESKTOP_PATH)], timeout=60)
+            run(["gtk-update-icon-cache", "-f", "-t",
+                 "/usr/share/icons/hicolor"], timeout=60)
+            probe = run([sys.executable, "-c", "import gi;"
+                         "gi.require_version('Gtk','4.0');"
+                         "gi.require_version('Adw','1');"
+                         "from gi.repository import Gtk, Adw"], timeout=30)
+            if not probe.ok:
+                print(yellow("  GUI toolkit missing - run: sudo dnf install "
+                             "python3-gobject gtk4 libadwaita"))
+        print(green("  desktop app '%s' installed (%s)"
+                    % (cfg.get("app_name") or PROG, P(GUI_BIN_PATH))))
+    else:
+        print(yellow("  pornblock_gui.py not found - desktop app not installed"))
+
     systemctl("enable", "--now", "pornblock-watchdog.timer")
     systemctl("enable", "--now", "pornblock.service")
+    write_public_status(cfg, st)
     save_state(st)
 
     print(green("\n  Installed and enabled.\n"))
     print("  Check it with:   sudo %s status" % PROG)
+    print("  Or open '%s' from your app menu."
+          % (cfg.get("app_name") or PROG))
     print("  Ask to unlock:   sudo %s request-unlock" % PROG)
     print(dim("\n  Restart your browser once so the new policies load.\n"))
     return 0
@@ -2371,8 +2752,13 @@ def cmd_uninstall(args) -> int:
 
     for path in (RESOLVED_DROPIN, NM_DROPIN, FIREFOX_POLICY, CHROMIUM_POLICY,
                  CHROME_POLICY, NFT_CONF_PATH, RECORD_PATH, CONFIG_PATH,
-                 SELF_COPY, BIN_PATH):
+                 SECRETS_PATH, SELF_COPY, GUI_SELF_COPY, BIN_PATH,
+                 GUI_BIN_PATH, DESKTOP_PATH, ICON_PATH, PUBLIC_STATUS):
         remove_managed(path)
+    if not SANDBOX:
+        run(["update-desktop-database", os.path.dirname(DESKTOP_PATH)], timeout=60)
+        run(["gtk-update-icon-cache", "-f", "-t", "/usr/share/icons/hicolor"],
+            timeout=60)
 
     bdir = P(BACKUP_DIR)
     if os.path.isdir(bdir):
@@ -2415,6 +2801,7 @@ def tick(cfg_override=None) -> dict:
     changes = enforce_all(cfg, st, apply, quiet=quiet)
     guard_units(cfg, st)
     mailer.flush_outbox(st)
+    write_public_status(cfg, st)
     save_state(st)
     return {"moves": moves, "changes": changes, "blocklist": bl, "mode": st["mode"]}
 
@@ -2497,6 +2884,7 @@ def cmd_enforce(args) -> int:
         refresh_safesearch_ips(cfg, st)
     apply = st.get("mode") != "UNLOCKED"
     changes = enforce_all(cfg, st, apply, quiet=args.quiet)
+    write_public_status(cfg, st)
     save_state(st)
     print("\n".join("  " + c for c in changes) if changes
           else green("  already exactly as it should be (no changes)"))
@@ -2530,6 +2918,144 @@ def cmd_simulate_approval(args) -> int:
     return 0
 
 
+def _read_phrase(args, prompt: str, confirm: bool = False):
+    """Read a passphrase from stdin (GUI) or a TTY (terminal)."""
+    if getattr(args, "stdin", False):
+        data = sys.stdin.read()
+        return data.split("\n", 1)[0]
+    try:
+        one = getpass.getpass(prompt + ": ")
+    except EOFError:
+        return None
+    if confirm:
+        try:
+            two = getpass.getpass("Type it again: ")
+        except EOFError:
+            return None
+        if one != two:
+            print(red("  they did not match"))
+            return None
+    return one
+
+
+def cmd_passphrase(args) -> int:
+    require_root()
+    cfg = load_config()
+    if not cfg:
+        print(red("No config. Run: sudo %s setup" % PROG))
+        return 1
+    st = load_state()
+    sec = cfg["_secrets"]
+    rec = load_record() or {}
+
+    if args.set:
+        already = bool(sec.get("partner_passphrase") or rec.get("passphrase_set"))
+        unl = st.get("unlock") or {}
+        unlocked = (st.get("mode") == "UNLOCKED"
+                    and now() < float(unl.get("expires_at") or 0))
+        if already and not unlocked:
+            print(red("""
+  REFUSED.
+
+  A partner passphrase is already set. Changing it is only possible during a
+  granted unlock window - otherwise you could just overwrite your friend's
+  secret whenever you felt like it.
+"""))
+            alert(cfg, st, "passphrase_change_refused",
+                  "Someone tried to change the partner passphrase",
+                  "A change to the partner passphrase was attempted on %s while "
+                  "the blocker was %s. It was refused.\n"
+                  % (socket.gethostname(), st.get("mode")))
+            save_state(st)
+            return 1
+        phrase = _read_phrase(args, "New partner passphrase", confirm=not args.stdin)
+        if not phrase:
+            print(red("  nothing set"))
+            return 1
+        if len(phrase) < 8:
+            print(red("  use at least 8 characters"))
+            return 1
+        sec["partner_passphrase"] = hash_passphrase(phrase)
+        save_secrets(sec)
+        if rec:
+            rec["passphrase_set"] = True
+            rec["require_passphrase"] = bool(cfg.get("require_passphrase", True))
+            save_record(rec)
+        history(st, "partner passphrase set")
+        alert(cfg, st, "passphrase_set", "A partner passphrase was set",
+              "A partner passphrase was set on %s. From now on an unlock needs "
+              "the cool-off, %s approval(s) AND this passphrase typed in.\n\n"
+              "Whoever set it should be the only one who knows it.%s\n"
+              % (socket.gethostname(), cfg.get("approvals_required"),
+                 ("\n\nIf it is ever lost, unanimous approval from all %d of you "
+                  "unlocks without it." % len(cfg.get("approvers") or []))
+                 if cfg.get("passphrase_recovery", True) else ""), force=True)
+        cfg["_secrets"] = sec
+        write_public_status(cfg, st)
+        save_state(st)
+        print(green("\n  Partner passphrase stored (hashed, never in plain text).\n"))
+        return 0
+
+    # --- verifying against an open request -------------------------------
+    if st.get("mode") != "PENDING":
+        print(yellow("  No open unlock request, so there is nothing to unlock "
+                     "with a passphrase. Current mode: %s" % st.get("mode")))
+        return 1
+    pp = st.setdefault("passphrase", {"fails": 0, "locked_until": 0})
+    if now() < float(pp.get("locked_until") or 0):
+        print(red("  Too many wrong attempts. Try again in %s."
+                  % human_delta(float(pp["locked_until"]) - now())))
+        return 1
+    req = st["request"]
+    if req.get("passphrase_ok"):
+        print(green("  Already entered for this request."))
+        return 0
+    if not sec.get("partner_passphrase"):
+        print(red("""
+  The stored passphrase is gone, so nothing you type can match it.
+
+  This cannot be repaired from here - that is the point. The remaining route
+  is unanimous approval from every approver.
+"""))
+        return 1
+
+    phrase = _read_phrase(args, "Partner passphrase")
+    if verify_passphrase(sec.get("partner_passphrase"), phrase or ""):
+        req["passphrase_ok"] = True
+        pp["fails"] = 0
+        history(st, "partner passphrase accepted for %s" % req.get("token"))
+        alert(cfg, st, "passphrase_ok", "The partner passphrase was entered",
+              "The partner passphrase for request %s on %s has been entered.\n\n"
+              "If you did not give it to %s, say so now.\n"
+              % (req.get("token"), socket.gethostname(), who(cfg)), force=True)
+        print(green("\n  Accepted. The passphrase gate is now satisfied.\n"))
+        rc = 0
+    else:
+        pp["fails"] = int(pp.get("fails") or 0) + 1
+        history(st, "WRONG partner passphrase (attempt %d)" % pp["fails"])
+        if pp["fails"] >= 5:
+            pp["locked_until"] = now() + 900
+            pp["fails"] = 0
+            alert(cfg, st, "passphrase_lockout",
+                  "Five wrong partner-passphrase attempts",
+                  "There have been five wrong partner-passphrase attempts on "
+                  "%s. Entry is locked for 15 minutes.\n\nIf %s is guessing at "
+                  "it, that is worth knowing.\n"
+                  % (socket.gethostname(), who(cfg)), force=True)
+            print(red("\n  Wrong. Locked out for 15 minutes; your approvers "
+                      "have been told.\n"))
+        else:
+            alert(cfg, st, "passphrase_fail",
+                  "Wrong partner passphrase entered",
+                  "A wrong partner passphrase was entered on %s (attempt %d of "
+                  "5 before lockout).\n" % (socket.gethostname(), pp["fails"]))
+            print(red("\n  Wrong passphrase. Attempt %d of 5.\n" % pp["fails"]))
+        rc = 1
+    write_public_status(cfg, st)
+    save_state(st)
+    return rc
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog=PROG,
@@ -2542,7 +3068,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("setup", help="interactive configuration wizard")
-    s.add_argument("--answers", help="JSON file of answers (non-interactive)")
+    s.add_argument("--answers",
+                   help="JSON file of answers, or '-' for stdin (non-interactive)")
+    s.add_argument("--install", action="store_true",
+                   help="run install straight afterwards (one auth prompt)")
     s.set_defaults(fn=cmd_setup)
 
     s = sub.add_parser("install", help="install units, enable, lock everything down")
@@ -2561,7 +3090,17 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(fn=cmd_watchdog)
 
     s = sub.add_parser("status", help="show mode, approvals, timers, health")
+    s.add_argument("--json", action="store_true",
+                   help="print the machine-readable snapshot instead")
     s.set_defaults(fn=cmd_status)
+
+    s = sub.add_parser("passphrase",
+                       help="enter the partner passphrase, or --set a new one")
+    s.add_argument("--set", action="store_true",
+                   help="set it (only when none exists, or during an unlock)")
+    s.add_argument("--stdin", action="store_true",
+                   help="read the passphrase from stdin instead of prompting")
+    s.set_defaults(fn=cmd_passphrase)
 
     s = sub.add_parser("request-unlock", help="start the cool-off and email your friends")
     s.add_argument("--yes", action="store_true", help="skip the typed confirmation")
