@@ -16,7 +16,9 @@ LOCKED  --ask to unlock-->  PENDING  --24h timer            --.
 ```
 
 * **`pornblock`** - the CLI and the root daemon that does the work.
-* **ChristWatch** - the GTK desktop app in your app grid. Same thing, friendlier.
+* **ChristWatch** - the GTK4/libadwaita app in your app grid. It shows the
+  three gates as a checklist, counts down the cool-off, and takes you through
+  first-time setup including the step where your friend types the secrets.
 
 ---
 
@@ -198,6 +200,11 @@ Edit `/etc/pornblock/config.json`, then `sudo systemctl restart pornblock`.
 | `loop_seconds` | `45` | How often everything is re-applied |
 | `blocklist_refresh_hours` | `24` | How often the list is re-downloaded |
 | `app_name` | `ChristWatch` | Name on the desktop icon |
+| `updates.repo` | - | Git URL to pull new versions from |
+| `updates.branch` | `main` | Branch to track |
+| `updates.check_hours` | `24` | How often the daemon looks |
+| `updates.auto_apply` | `false` | Install without asking |
+| `updates.require_unlock` | `false` | Only update inside an unlock window |
 | `enforce.*` | all on | Turn individual layers off |
 | `enforce.block_extensions` | `false` | Blanket block on browser extension installs |
 | `blocked_extension_ids` | empty | Specific add-on IDs to block, per browser |
@@ -205,7 +212,8 @@ Edit `/etc/pornblock/config.json`, then `sudo systemctl restart pornblock`.
 ### The catch: the config is not fully yours any more
 
 `install-record.json` is immutable and holds the approvers, the quorum, the
-cool-off, the window and the passphrase policy. On every pass the daemon
+cool-off, the window, the passphrase policy and the update source. On every
+pass the daemon
 compares the live config against it:
 
 * **Weakening** a setting (different approvers, lower quorum, shorter
@@ -217,6 +225,49 @@ compares the live config against it:
   sanctioned way to change your approvers: earn an unlock first.
 * Reinstalling does **not** reset the record. Deleting the record restores it
   from the spare copy in `/var/lib/pornblock/` and emails everyone.
+
+## Updating from GitHub
+
+Point it at a repo once and it will pull new versions.
+
+```json
+"updates": {
+  "enabled": true,
+  "repo": "https://github.com/you/porn-block",
+  "branch": "main",
+  "check_hours": 24,
+  "auto_apply": false,
+  "require_unlock": false
+}
+```
+
+Then `sudo pornblock install` once, which pins that source into the immutable
+install record. After that:
+
+```bash
+sudo pornblock update --check   # is there a newer version?
+sudo pornblock update           # fetch, vet, install, restart
+```
+
+The daemon checks once a day on its own and the desktop app shows a banner
+with an **Install** button. `auto_apply: true` installs without asking.
+
+**What happens before new code is allowed to run as root:**
+
+1. It is fetched from the **pinned** repo and branch. Repointing `repo` or
+   `branch` in the config while locked is reverted and emailed to everyone.
+2. If it is byte-identical to what is installed, nothing happens.
+3. The new `pornblock.py` must compile and must declare a `VERSION`.
+4. **The candidate must pass its own `selftest.py`** in a throwaway sandbox.
+   A version that quietly removed the passphrase gate would fail those checks
+   and be refused. This is a real gate, not a formality.
+5. Updates are refused while a request is `PENDING` - you do not get to
+   update your way out mid-request.
+6. Applying one emails all approvers with the version, commit and subject.
+
+Set `require_unlock: true` to only allow updates inside a granted unlock
+window. That closes the hole below completely, at the cost of needing 24
+hours to take a security fix.
 
 ### Turning it off for good
 
@@ -246,6 +297,17 @@ own immutable 0600 file keeps it out of casual sight and out of the GUI and
 the status snapshot - it does not hide it from a determined you. The
 passphrase is different: only a hash is kept, so that one really does need
 your friend.
+
+**The updater runs code as root.**  If you own the repository it pulls from,
+you can push a "new version" that does whatever you like - that is a complete
+bypass, and the most convenient one on this list. Three things stand between
+you and it: the source is pinned in the immutable record and cannot be
+repointed while locked, the candidate has to pass the project's own self-test
+(so the obvious edits - removing the passphrase gate, dropping the quorum -
+get caught), and every applied update emails all of your approvers. If you
+want that hole shut: set `updates.require_unlock: true`, or set
+`updates.enabled: false`, or - best - have one of your approvers own the
+repository you track and pull from their fork.
 
 **DNS-over-HTTPS from non-browser apps.**  The big technical one. DoH is HTTPS
 on port 443 and is indistinguishable from normal web traffic. Browsers are
@@ -331,9 +393,23 @@ no files outside the prefix. `simulate-approval` **only** works there - real
 approvals must arrive by email.
 
 ```bash
-python3 selftest.py     # 74 offline checks, no network, no root
+python3 selftest.py     # 86 offline checks, no network, no root, no display
 ```
 
 Covers reply parsing (including that a quoted APPROVE in a reply must not
 approve anything), enforcement idempotency, drift reversion, the three-gate
-state machine, passphrase hashing, secret hygiene and the desktop files.
+state machine, passphrase hashing, secret hygiene, the desktop files and the
+update-candidate vetting. It deliberately needs no display, because the
+updater runs it to vet a candidate version.
+
+The desktop app has its own suite, which does need a display:
+
+```bash
+gtk4-broadwayd :9 &
+GDK_BACKEND=broadway BROADWAY_DISPLAY=:9 python3 guitest.py   # 30 checks
+```
+
+That one also asserts every symbolic icon name resolves in the icon theme -
+a missing name renders as a broken-image square, and `checkbox-symbolic`
+draws a tick rather than an empty box, which is exactly the sort of thing
+that makes a careful UI look sloppy.

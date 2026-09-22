@@ -54,12 +54,8 @@ FILTERS = [
     ("cleanbrowsing_adult", "CleanBrowsing Adult Filter"),
 ]
 
-CSS = b"""
-.mode-pill { font-size: 26px; font-weight: 800; padding: 14px 8px; }
-.mode-locked   { color: #2ec27e; }
-.mode-pending  { color: #e5a50a; }
-.mode-unlocked { color: #e01b24; }
-.big-timer { font-size: 34px; font-weight: 800; font-feature-settings: "tnum"; }
+CSS = """
+.hero { padding: 26px 18px; }
 .dim { opacity: 0.65; }
 .logview { font-family: monospace; font-size: 12px; }
 """
@@ -567,14 +563,42 @@ class SetupView(Gtk.Box):
 # Dashboard
 # ---------------------------------------------------------------------------
 
-MODE_TEXT = {
-    "LOCKED": ("LOCKED", "mode-locked",
-               "Blocking is on. Nothing is pending."),
-    "PENDING": ("WAITING", "mode-pending",
+# ---------------------------------------------------------------------------
+# Dashboard
+# ---------------------------------------------------------------------------
+
+# Symbolic icons for "not done yet" are a minefield: checkbox-symbolic draws
+# a tick and radio-symbolic draws an actual radio set. So an unmet gate shows
+# no marker at all - the row's subtitle already says what is outstanding, and
+# the group is titled "What still has to happen".
+
+MODES = {
+    "LOCKED": ("Locked", "security-high-symbolic", "success",
+               "Blocking is on and nothing is pending."),
+    "PENDING": ("Waiting", "alarm-symbolic", "warning",
                 "You have asked to unlock. The clock is running."),
-    "UNLOCKED": ("UNLOCKED", "mode-unlocked",
-                 "Blocking is OFF. It re-arms itself automatically."),
+    "UNLOCKED": ("Unlocked", "security-low-symbolic", "error",
+                 "Blocking is off. It re-arms itself automatically."),
 }
+
+
+def card(*classes):
+    b = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    b.add_css_class("card")
+    b.add_css_class("hero")
+    for c in classes:
+        b.add_css_class(c)
+    return b
+
+
+def gate_row(title, icon):
+    r = Adw.ActionRow(title=title)
+    img = Gtk.Image.new_from_icon_name(icon)
+    r.add_prefix(img)
+    state = Gtk.Image.new_from_icon_name("emblem-ok-symbolic")
+    state.add_css_class("success")
+    r.add_suffix(state)
+    return r, state
 
 
 class Dashboard(Gtk.Box):
@@ -583,194 +607,293 @@ class Dashboard(Gtk.Box):
         self.window = window
         self.doc = {}
 
-        sw = Gtk.ScrolledWindow(vexpand=True,
-                                hscrollbar_policy=Gtk.PolicyType.NEVER)
-        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18,
-                        margin_top=8, margin_bottom=24, margin_start=16,
-                        margin_end=16)
-
         self.banner = Adw.Banner()
+        self.banner.connect("button-clicked", self._on_banner)
+        self._banner_action = None
         self.append(self.banner)
 
-        hero = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2,
-                       margin_top=10)
-        self.l_mode = Gtk.Label(label="…")
-        self.l_mode.add_css_class("mode-pill")
-        self.l_sub = Gtk.Label(wrap=True, justify=Gtk.Justification.CENTER)
-        self.l_sub.add_css_class("dim")
-        self.l_timer = Gtk.Label(label="")
-        self.l_timer.add_css_class("big-timer")
-        self.l_timer_cap = Gtk.Label(label="")
-        self.l_timer_cap.add_css_class("dim")
-        for w in (self.l_mode, self.l_sub, self.l_timer, self.l_timer_cap):
-            hero.append(w)
-        outer.append(hero)
+        sw = Gtk.ScrolledWindow(vexpand=True,
+                                hscrollbar_policy=Gtk.PolicyType.NEVER)
+        col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18,
+                      margin_top=18, margin_bottom=28,
+                      margin_start=14, margin_end=14)
 
-        btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10,
-                       halign=Gtk.Align.CENTER, margin_top=6)
+        # -- hero -----------------------------------------------------
+        hero = card()
+        self.i_mode = Gtk.Image.new_from_icon_name("security-high-symbolic")
+        self.i_mode.set_pixel_size(56)
+        self.l_mode = Gtk.Label()
+        self.l_mode.add_css_class("title-1")
+        self.l_sub = Gtk.Label(wrap=True, justify=Gtk.Justification.CENTER)
+        self.l_sub.add_css_class("dim-label")
+        for w in (self.i_mode, self.l_mode, self.l_sub):
+            hero.append(w)
+
+        self.act_box = Gtk.Box(halign=Gtk.Align.CENTER, spacing=10, margin_top=14)
         self.b_request = Gtk.Button(label="Ask to unlock")
+        self.b_request.add_css_class("pill")
         self.b_request.connect("clicked", self.on_request)
         self.b_cancel = Gtk.Button(label="Cancel and stay locked")
+        self.b_cancel.add_css_class("pill")
         self.b_cancel.add_css_class("suggested-action")
         self.b_cancel.connect("clicked", self.on_cancel)
-        self.b_phrase = Gtk.Button(label="Enter passphrase")
+        self.act_box.append(self.b_request)
+        self.act_box.append(self.b_cancel)
+        hero.append(self.act_box)
+        col.append(hero)
+
+        # -- countdown ------------------------------------------------
+        self.count_card = card()
+        self.l_count = Gtk.Label()
+        self.l_count.add_css_class("title-1")
+        self.l_count.add_css_class("numeric")
+        self.l_count_cap = Gtk.Label()
+        self.l_count_cap.add_css_class("dim-label")
+        self.bar = Gtk.ProgressBar(margin_top=12, margin_start=20,
+                                   margin_end=20, show_text=False)
+        for w in (self.l_count, self.l_count_cap, self.bar):
+            self.count_card.append(w)
+        col.append(self.count_card)
+
+        # -- the three gates ------------------------------------------
+        self.g_gates = Adw.PreferencesGroup(
+            title="What still has to happen",
+            description="All three. Missing any one of them means no unlock.")
+        self.r_timer, self.s_timer = gate_row("Cool-off timer", "alarm-symbolic")
+        self.r_appr, self.s_appr = gate_row("Approvals from your friends",
+                                            "system-users-symbolic")
+        self.r_pass, self.s_pass = gate_row("Partner passphrase",
+                                            "dialog-password-symbolic")
+        self.b_phrase = Gtk.Button(label="Enter", valign=Gtk.Align.CENTER)
         self.b_phrase.connect("clicked", self.on_passphrase)
-        for w in (self.b_request, self.b_phrase, self.b_cancel):
-            btns.append(w)
-        outer.append(btns)
+        self.r_pass.add_suffix(self.b_phrase)
+        self.r_code = Adw.ActionRow(title="Code your friends reply with")
+        self.r_code.add_prefix(Gtk.Image.new_from_icon_name("mail-send-symbolic"))
+        self.l_code = Gtk.Label()
+        self.l_code.add_css_class("title-3")
+        self.l_code.add_css_class("monospace")
+        self.r_code.add_suffix(self.l_code)
+        b_copy = Gtk.Button(icon_name="edit-copy-symbolic", valign=Gtk.Align.CENTER)
+        b_copy.add_css_class("flat")
+        b_copy.set_tooltip_text("Copy the code")
+        b_copy.connect("clicked", self._copy_code)
+        self.r_code.add_suffix(b_copy)
+        for r in (self.r_timer, self.r_appr, self.r_pass, self.r_code):
+            self.g_gates.add(r)
+        col.append(self.g_gates)
 
-        self.g_request = Adw.PreferencesGroup(title="Your open request")
-        outer.append(self.g_request)
-        self.g_setup = Adw.PreferencesGroup(title="The arrangement")
-        outer.append(self.g_setup)
-        self.g_health = Adw.PreferencesGroup(
-            title="Enforcement",
-            description="Re-applied every 45 seconds, whatever you do to it.")
-        outer.append(self.g_health)
+        # -- who ------------------------------------------------------
+        self.g_people = Adw.PreferencesGroup(title="Your approvers")
+        col.append(self.g_people)
 
-        foot = Gtk.Box(spacing=10, halign=Gtk.Align.CENTER, margin_top=6)
-        b_mail = Gtk.Button(label="Test email")
-        b_mail.connect("clicked", self.on_test_email)
-        foot.append(b_mail)
-        outer.append(foot)
+        # -- collapsible detail ---------------------------------------
+        self.g_detail = Adw.PreferencesGroup()
+        self.x_setup = Adw.ExpanderRow(title="The arrangement")
+        self.x_setup.add_prefix(Gtk.Image.new_from_icon_name("document-properties-symbolic"))
+        self.x_health = Adw.ExpanderRow(title="Enforcement")
+        self.x_health.add_prefix(Gtk.Image.new_from_icon_name("channel-secure-symbolic"))
+        self.x_update = Adw.ExpanderRow(title="Updates")
+        self.x_update.add_prefix(Gtk.Image.new_from_icon_name("system-software-update-symbolic"))
+        for x in (self.x_setup, self.x_health, self.x_update):
+            self.g_detail.add(x)
+        col.append(self.g_detail)
 
-        sw.set_child(Adw.Clamp(maximum_size=640, child=outer))
+        sw.set_child(Adw.Clamp(maximum_size=620, child=col))
         self.append(sw)
+        self._kids = {"setup": [], "health": [], "people": [], "update": []}
 
-        self._rows = {"request": [], "setup": [], "health": []}
+    # -- helpers ----------------------------------------------------------
+
+    def _copy_code(self, *_):
+        tok = ((self.doc.get("request") or {}).get("token") or "")
+        if tok:
+            self.get_clipboard().set(tok)
+            self.window.toast("Code %s copied" % tok)
+
+    def _reset(self, key, parent, expander=False):
+        for w in self._kids[key]:
+            parent.remove(w)
+        self._kids[key] = []
+
+    def _put(self, key, parent, w, expander=False):
+        if expander:
+            parent.add_row(w)
+        else:
+            parent.add(w)
+        self._kids[key].append(w)
+
+    @staticmethod
+    def _mark(img, ok):
+        img.set_visible(bool(ok))
+
+    def _on_banner(self, *_):
+        if self._banner_action == "update":
+            self.window.do_update()
 
     # -- rendering --------------------------------------------------------
-
-    def _clear(self, key, group):
-        for r in self._rows[key]:
-            group.remove(r)
-        self._rows[key] = []
-
-    def _add(self, key, group, widget):
-        group.add(widget)
-        self._rows[key].append(widget)
 
     def update(self, doc):
         self.doc = doc or {}
         mode = self.doc.get("mode", "LOCKED")
-        label, css, sub = MODE_TEXT.get(mode, ("?", "dim", ""))
-        self.l_mode.set_label(label)
-        for c in ("mode-locked", "mode-pending", "mode-unlocked"):
-            self.l_mode.remove_css_class(c)
-        self.l_mode.add_css_class(css)
-        self.l_sub.set_label(sub)
+        title, icon, style, sub = MODES.get(mode, MODES["LOCKED"])
 
+        self.i_mode.set_from_icon_name(icon)
+        for w in (self.i_mode, self.l_mode):
+            for c in ("success", "warning", "error"):
+                w.remove_css_class(c)
+            w.add_css_class(style)
+        self.l_mode.set_label(title)
+        self.l_sub.set_label(sub)
         self.b_request.set_visible(mode == "LOCKED")
         self.b_cancel.set_visible(mode in ("PENDING", "UNLOCKED"))
-        self.b_phrase.set_visible(
-            mode == "PENDING" and self.doc.get("passphrase_required")
-            and not self.doc.get("passphrase_satisfied"))
 
+        # banner: updates first, then enforcement problems
+        upd = self.doc.get("update") or {}
+        avail = upd.get("available")
         bad = [h for h in self.doc.get("health") or [] if not h.get("ok")]
-        if mode != "UNLOCKED" and bad:
+        if avail:
+            self.banner.set_title("Version %s is available" % avail.get("version"))
+            self.banner.set_button_label("Install")
+            self._banner_action = "update"
+            self.banner.set_revealed(True)
+        elif mode != "UNLOCKED" and bad:
             self.banner.set_title("Not fully enforced: %s"
                                   % ", ".join(h["name"] for h in bad[:3]))
+            self.banner.set_button_label(None)
+            self._banner_action = None
             self.banner.set_revealed(True)
         elif self.doc.get("queued_emails"):
-            self.banner.set_title("%d alert email(s) could not be sent yet"
+            self.banner.set_title("%d alert email(s) still waiting to send"
                                   % self.doc["queued_emails"])
+            self.banner.set_button_label(None)
+            self._banner_action = None
             self.banner.set_revealed(True)
         else:
             self.banner.set_revealed(False)
 
-        self.g_request.set_visible(mode == "PENDING")
-        self._clear("request", self.g_request)
+        pending = mode == "PENDING"
+        self.g_gates.set_visible(pending)
+        self.count_card.set_visible(mode in ("PENDING", "UNLOCKED"))
         req = self.doc.get("request") or {}
-        if mode == "PENDING" and req:
-            got = {k.lower() for k in (req.get("approvals") or {})}
-            need = self.doc.get("approvals_required", 1)
-            r = row("Code your friends reply with", req.get("token", "?"),
-                    "dialog-password-symbolic")
-            self._add("request", self.g_request, r)
-            self._add("request", self.g_request,
-                      row("Approvals", "%d of %d" % (len(got), need),
-                          "emblem-ok-symbolic" if len(got) >= need
-                          else "content-loading-symbolic"))
-            for a in self.doc.get("approvers") or []:
-                done_ = a.strip().lower() in got
-                self._add("request", self.g_request,
-                          row(a, "approved" if done_ else "waiting",
-                              "emblem-ok-symbolic" if done_
-                              else "content-loading-symbolic"))
-            if self.doc.get("passphrase_required"):
-                ok_ = self.doc.get("passphrase_satisfied")
-                self._add("request", self.g_request,
-                          row("Partner passphrase",
-                              "entered" if ok_ else "not entered yet",
-                              "emblem-ok-symbolic" if ok_
-                              else "dialog-password-symbolic"))
+        need = int(self.doc.get("approvals_required") or 1)
+        got = {k.lower() for k in (req.get("approvals") or {})}
 
-        self._clear("setup", self.g_setup)
-        self._add("setup", self.g_setup,
-                  row("Approvers", ", ".join(self.doc.get("approvers") or []) or "-",
-                      "system-users-symbolic"))
-        self._add("setup", self.g_setup,
-                  row("Approvals needed",
-                      "%s of %s" % (self.doc.get("approvals_required"),
-                                    len(self.doc.get("approvers") or [])),
-                      "object-select-symbolic"))
-        self._add("setup", self.g_setup,
-                  row("Cool-off", "%g hours" % self.doc.get("cooloff_hours", 24),
-                      "alarm-symbolic"))
-        self._add("setup", self.g_setup,
-                  row("Unlock window", "%s minutes" % self.doc.get("unlock_minutes"),
-                      "preferences-system-time-symbolic"))
-        self._add("setup", self.g_setup,
-                  row("Resolver", self.doc.get("filter_label", "?"),
-                      "network-server-symbolic"))
-        self._add("setup", self.g_setup,
-                  row("Partner passphrase",
-                      ("set by your friend" if self.doc.get("passphrase_set")
-                       else "not set"),
-                      "dialog-password-symbolic"))
-        bl = self.doc.get("blocklist") or {}
-        self._add("setup", self.g_setup,
-                  row("Blocklist", "%s domains, updated %s"
-                      % (bl.get("domains", 0), stamp(bl.get("fetched_at"))),
-                      "view-list-symbolic"))
+        if pending:
+            self.r_appr.set_subtitle("%d of %d received" % (len(got), need))
+            self._mark(self.s_appr, len(got) >= need)
+            p_req = bool(self.doc.get("passphrase_required"))
+            p_ok = bool(self.doc.get("passphrase_satisfied"))
+            self.r_pass.set_visible(p_req)
+            if p_req:
+                self.r_pass.set_subtitle("entered" if p_ok
+                                         else "ask your friend for it")
+                self._mark(self.s_pass, p_ok)
+                self.b_phrase.set_visible(not p_ok)
+            self.l_code.set_label(req.get("token") or "-")
 
-        self._clear("health", self.g_health)
-        for h in self.doc.get("health") or []:
-            self._add("health", self.g_health,
-                      row(h.get("name", "?"), h.get("detail", ""),
-                          "emblem-ok-symbolic" if h.get("ok")
-                          else "dialog-warning-symbolic"))
+        # approvers
+        self._reset("people", self.g_people)
+        self.g_people.set_visible(True)
+        for a in self.doc.get("approvers") or []:
+            done_ = a.strip().lower() in got
+            r = Adw.ActionRow(title=a)
+            r.add_prefix(Gtk.Image.new_from_icon_name("avatar-default-symbolic"))
+            if pending:
+                r.set_subtitle("approved" if done_ else "waiting")
+                if done_:
+                    img = Gtk.Image.new_from_icon_name("emblem-ok-symbolic")
+                    img.add_css_class("success")
+                    r.add_suffix(img)
+            self._put("people", self.g_people, r)
+
+        # detail: the arrangement
+        self._reset("setup", self.x_setup, True)
+        for t, v in (
+                ("Approvals needed", "%s of %s" % (need, len(self.doc.get("approvers") or []))),
+                ("Cool-off", "%g hours" % self.doc.get("cooloff_hours", 24)),
+                ("Unlock window", "%s minutes" % self.doc.get("unlock_minutes")),
+                ("Resolver", self.doc.get("filter_label", "?")),
+                ("Partner passphrase", "set by your friend"
+                 if self.doc.get("passphrase_set") else "not set"),
+                ("Unanimity can replace it", "yes"
+                 if self.doc.get("recovery_enabled") else "no"),
+                ("Blocklist", "%s domains, updated %s"
+                 % ((self.doc.get("blocklist") or {}).get("domains", 0),
+                    stamp((self.doc.get("blocklist") or {}).get("fetched_at")))),
+        ):
+            self._put("setup", self.x_setup, row(t, v), True)
+
+        # detail: enforcement
+        self._reset("health", self.x_health, True)
+        health = self.doc.get("health") or []
+        oks = sum(1 for h in health if h.get("ok"))
+        self.x_health.set_subtitle("%d of %d layers healthy" % (oks, len(health)))
+        for h in health:
+            r = Adw.ActionRow(title=h.get("name", "?"), subtitle=h.get("detail", ""))
+            img = Gtk.Image.new_from_icon_name(
+                "emblem-ok-symbolic" if h.get("ok") else "dialog-warning-symbolic")
+            img.add_css_class("success" if h.get("ok") else "warning")
+            r.add_prefix(img)
+            self._put("health", self.x_health, r, True)
+
+        # detail: updates
+        self._reset("update", self.x_update, True)
+        if upd.get("enabled") and upd.get("repo"):
+            self.x_update.set_subtitle(
+                "%s available" % avail["version"] if avail else "up to date")
+            self._put("update", self.x_update,
+                      row("Source", "%s (%s)" % (upd["repo"], upd.get("branch"))), True)
+            self._put("update", self.x_update,
+                      row("Installed commit",
+                          (upd.get("installed_sha") or "unknown")[:12]), True)
+            self._put("update", self.x_update,
+                      row("Last checked", stamp(upd.get("last_check"))), True)
+            if upd.get("last_error"):
+                self._put("update", self.x_update,
+                          row("Last problem", upd["last_error"].splitlines()[0]), True)
+        else:
+            self.x_update.set_subtitle("switched off")
+            self._put("update", self.x_update,
+                      row("Updates", "No repo configured in config.json"), True)
         self.tick()
 
     def tick(self):
-        """Once a second: just the countdown."""
         mode = self.doc.get("mode")
         if mode == "PENDING":
             req = self.doc.get("request") or {}
-            left = float(req.get("eligible_at") or 0) - time.time()
+            start = float(req.get("requested_at") or 0)
+            end = float(req.get("eligible_at") or 0)
+            left = end - time.time()
+            span = max(1.0, end - start)
+            self.bar.set_fraction(min(1.0, max(0.0, 1.0 - left / span)))
             if left > 0:
-                self.l_timer.set_label(human_delta(left))
-                self.l_timer_cap.set_label("until the cool-off is over")
+                self.l_count.set_label(human_delta(left))
+                self.l_count_cap.set_label("until the cool-off is over")
+                self.r_timer.set_subtitle("%s left" % human_delta(left))
+                self._mark(self.s_timer, False)
             else:
-                self.l_timer.set_label("timer done")
-                need = self.doc.get("approvals_required", 1)
-                got = len(req.get("approvals") or {})
+                self.l_count.set_label("Timer done")
+                self.r_timer.set_subtitle("elapsed %s" % stamp(end))
+                self._mark(self.s_timer, True)
+                need = int(self.doc.get("approvals_required") or 1)
+                got = len((req.get("approvals") or {}))
                 waiting = []
                 if got < need:
                     waiting.append("%d more approval(s)" % (need - got))
                 if self.doc.get("passphrase_required") and \
                         not self.doc.get("passphrase_satisfied"):
                     waiting.append("the partner passphrase")
-                self.l_timer_cap.set_label("waiting on " + (" and ".join(waiting)
+                self.l_count_cap.set_label("waiting on " + (" and ".join(waiting)
                                                             or "nothing"))
         elif mode == "UNLOCKED":
             unl = self.doc.get("unlock") or {}
-            self.l_timer.set_label(human_delta(float(unl.get("expires_at") or 0)
-                                               - time.time()))
-            self.l_timer_cap.set_label("until blocking switches back on")
-        else:
-            self.l_timer.set_label("")
-            self.l_timer_cap.set_label("")
+            start = float(unl.get("granted_at") or 0)
+            end = float(unl.get("expires_at") or 0)
+            left = end - time.time()
+            span = max(1.0, end - start)
+            self.bar.set_fraction(min(1.0, max(0.0, left / span)))
+            self.l_count.set_label(human_delta(left))
+            self.l_count_cap.set_label("until blocking switches back on")
 
     # -- actions ----------------------------------------------------------
 
@@ -791,7 +914,6 @@ class Dashboard(Gtk.Box):
         d.set_close_response("no")
         d.connect("response", lambda _d, r: on_yes() if r == "yes" else None)
         d.present(self.window)
-        return d
 
     def on_request(self, *_):
         entry = Adw.EntryRow(title="Why? (they will read this)")
@@ -802,9 +924,8 @@ class Dashboard(Gtk.Box):
 
         def send():
             args = ["request-unlock", "--yes"]
-            reason = entry.get_text().strip()
-            if reason:
-                args += ["--reason", reason]
+            if entry.get_text().strip():
+                args += ["--reason", entry.get_text().strip()]
             self.window.toast("Sending…")
             run_privileged(args, on_done=self.window.after_action)
 
@@ -820,42 +941,31 @@ class Dashboard(Gtk.Box):
         def do():
             self.window.toast("Cancelling…")
             run_privileged(["cancel"], on_done=self.window.after_action)
-        mode = self.doc.get("mode")
+        pending = self.doc.get("mode") == "PENDING"
         self._dialog(
-            "Back out and stay locked?" if mode == "PENDING"
-            else "End the unlock window now?",
-            "Your approvers get told that you withdrew it yourself. That is a "
-            "much better email for them to receive than the other one."
-            if mode == "PENDING" else
-            "Blocking switches straight back on.",
+            "Back out and stay locked?" if pending else "End the unlock now?",
+            "Your approvers get told you withdrew it yourself. That is a much "
+            "better email for them to receive than the other one."
+            if pending else "Blocking switches straight back on.",
             "Yes, stay locked", False, None, do)
 
     def on_passphrase(self, *_):
         entry = Adw.PasswordEntryRow(title="Partner passphrase")
 
         def submit():
-            phrase = entry.get_text()
-            if not phrase:
+            if not entry.get_text():
                 self.window.toast("Nothing entered")
                 return
             self.window.toast("Checking…")
-            run_privileged(["passphrase", "--stdin"], stdin_text=phrase + "\n",
+            run_privileged(["passphrase", "--stdin"],
+                           stdin_text=entry.get_text() + "\n",
                            on_done=self.window.after_action)
 
         self._dialog(
             "Enter the partner passphrase",
-            "Your friend set this. Five wrong tries locks entry for 15 "
-            "minutes and emails all of your approvers.",
+            "Your friend set this. Five wrong tries locks entry for 15 minutes "
+            "and emails all of your approvers.",
             "Check it", False, entry, submit)
-
-    def on_test_email(self, *_):
-        self.window.toast("Sending test email…")
-
-        def done(ok, out):
-            self.window.show_output(
-                "Email test " + ("passed" if ok else "failed"), out)
-            self.window.refresh()
-        run_privileged(["test-email", "--no-roundtrip"], on_done=done)
 
 
 # ---------------------------------------------------------------------------
@@ -865,9 +975,29 @@ class Dashboard(Gtk.Box):
 class MainWindow(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="ChristWatch",
-                         default_width=660, default_height=840)
+                         default_width=660, default_height=860)
+        self.set_icon_name("christwatch")
         self.current = None
         self.dash = None
+
+        for name, fn in (("update", self.do_update),
+                         ("checkupdate", self.check_update),
+                         ("testmail", self.do_test_email),
+                         ("activity", self.show_activity),
+                         ("about", self.show_about)):
+            act = Gio.SimpleAction.new(name, None)
+            act.connect("activate", lambda *_a, f=fn: f())
+            self.add_action(act)
+
+        menu = Gio.Menu()
+        s1 = Gio.Menu()
+        s1.append("Check for updates", "win.checkupdate")
+        s1.append("Send a test email", "win.testmail")
+        menu.append_section(None, s1)
+        s2 = Gio.Menu()
+        s2.append("Recent activity", "win.activity")
+        s2.append("About ChristWatch", "win.about")
+        menu.append_section(None, s2)
 
         self.toasts = Adw.ToastOverlay()
         self.view = Adw.ToolbarView()
@@ -877,7 +1007,9 @@ class MainWindow(Adw.ApplicationWindow):
         rb = Gtk.Button(icon_name="view-refresh-symbolic")
         rb.set_tooltip_text("Refresh now")
         rb.connect("clicked", lambda *_: self.refresh())
-        hb.pack_end(rb)
+        hb.pack_start(rb)
+        hb.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic",
+                                   menu_model=menu, tooltip_text="Menu"))
         self.view.add_top_bar(hb)
         self.toasts.set_child(self.view)
         self.set_content(self.toasts)
@@ -891,14 +1023,17 @@ class MainWindow(Adw.ApplicationWindow):
     def toast(self, text):
         self.toasts.add_toast(Adw.Toast.new(text))
 
-    def show_output(self, title, text):
+    def show_output(self, title, text, body=None):
         buf = Gtk.TextBuffer()
         buf.set_text(text or "(no output)")
         tv = Gtk.TextView(buffer=buf, editable=False, monospace=True,
-                          wrap_mode=Gtk.WrapMode.WORD_CHAR)
-        sw = Gtk.ScrolledWindow(min_content_height=300, min_content_width=520)
+                          wrap_mode=Gtk.WrapMode.WORD_CHAR,
+                          top_margin=8, bottom_margin=8,
+                          left_margin=8, right_margin=8)
+        sw = Gtk.ScrolledWindow(min_content_height=320, min_content_width=520)
         sw.set_child(tv)
-        d = Adw.AlertDialog(heading=title)
+        sw.add_css_class("card")
+        d = Adw.AlertDialog(heading=title, body=body or "")
         d.set_extra_child(sw)
         d.add_response("ok", "Close")
         d.set_close_response("ok")
@@ -910,6 +1045,85 @@ class MainWindow(Adw.ApplicationWindow):
         elif out and out.strip():
             self.toast(out.strip().splitlines()[-1][:80])
         self.refresh()
+
+    # -- menu actions -----------------------------------------------------
+
+    def check_update(self):
+        self.toast("Checking for updates…")
+
+        def done(ok, out):
+            self.refresh()
+            line = (out or "").strip().splitlines()
+            self.toast(line[-1].strip()[:90] if line else
+                       ("Check finished" if ok else "Check failed"))
+        run_privileged(["update", "--check"], on_done=done)
+
+    def do_update(self):
+        doc = read_status() or {}
+        upd = doc.get("update") or {}
+        avail = upd.get("available") or {}
+        d = Adw.AlertDialog(
+            heading="Install version %s?" % (avail.get("version") or "?"),
+            body="This replaces the program that enforces your blocking, and "
+                 "it runs as root.\n\n"
+                 "Source: %s (%s)\nCommit: %s\n%s\n\n"
+                 "The candidate has already passed the project's own "
+                 "self-test. Every applied update emails all of your "
+                 "approvers — because whoever controls that repository "
+                 "controls what runs as root here."
+                 % (upd.get("repo", "?"), upd.get("branch", "?"),
+                    (avail.get("sha") or "?")[:12],
+                    avail.get("subject") or ""))
+        d.add_response("no", "Not now")
+        d.add_response("yes", "Install it")
+        d.set_response_appearance("yes", Adw.ResponseAppearance.SUGGESTED)
+        d.set_default_response("no")
+        d.set_close_response("no")
+
+        def resp(_d, r):
+            if r != "yes":
+                return
+            self.toast("Updating…")
+            run_privileged(["update"], on_done=lambda ok, out:
+                           self.show_output("Update " + ("applied" if ok
+                                                         else "failed"), out)
+                           or self.refresh())
+        d.connect("response", resp)
+        d.present(self)
+
+    def do_test_email(self):
+        self.toast("Sending test email…")
+        run_privileged(["test-email", "--no-roundtrip"], on_done=lambda ok, out:
+                       self.show_output("Email test " + ("passed" if ok
+                                                         else "failed"), out))
+
+    def show_activity(self):
+        doc = read_status() or {}
+        lines = ["%s  %s" % (stamp(h.get("at")), h.get("event"))
+                 for h in (doc.get("history") or [])]
+        self.show_output("Recent activity", "\n".join(reversed(lines))
+                         or "Nothing has happened yet.",
+                         "Everything below was also emailed to your approvers.")
+
+    def show_about(self):
+        doc = read_status() or {}
+        upd = doc.get("update") or {}
+        about = Adw.AboutDialog(
+            application_name="ChristWatch",
+            application_icon="christwatch",
+            version=doc.get("version", ""),
+            developer_name="Accountability, self-hosted",
+            comments="Content blocking you cannot quietly switch off.\n\n"
+                     "An unlock needs three things at once: a cool-off timer, "
+                     "approval by email from your friends, and a passphrase "
+                     "only they know. Every request, approval, denial and "
+                     "tamper attempt is emailed to all of them.\n\n"
+                     "It is friction and social cost, not cryptography. You "
+                     "are root on this machine and could take it apart — "
+                     "but not quietly, and not quickly.",
+            website=upd.get("repo") or "")
+        about.add_credit_section("Held by", doc.get("approvers") or [])
+        about.present(self)
 
     # -- view switching ---------------------------------------------------
 
@@ -970,9 +1184,9 @@ class App(Adw.Application):
         Adw.Application.do_startup(self)
         provider = Gtk.CssProvider()
         try:
-            provider.load_from_string(CSS.decode("utf-8"))
+            provider.load_from_string(CSS)
         except AttributeError:
-            provider.load_from_data(CSS)
+            provider.load_from_data(CSS.encode("utf-8"))
         Gtk.StyleContext.add_provider_for_display(
             Gdk.Display.get_default(), provider,
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)

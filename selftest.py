@@ -301,6 +301,54 @@ except Exception as exc:
     ok_svg = False
 check("icon parses as XML", ok_svg)
 
+print("\n== update source handling ==")
+check("github url -> codeload tarball",
+      pb._github_tarball_url("https://github.com/me/porn-block", "main")
+      == "https://codeload.github.com/me/porn-block/tar.gz/refs/heads/main")
+check("non-github url has no tarball fallback",
+      pb._github_tarball_url("git@gitlab.com:me/x.git", "main") is None)
+
+cand = tempfile.mkdtemp(prefix="pb-cand-")
+ok_, ver, err = pb.verify_source(cand)
+check("a download with no pornblock.py is refused", not ok_ and "no pornblock.py" in err)
+open(os.path.join(cand, "pornblock.py"), "w").write("def broken(:\n")
+ok_, ver, err = pb.verify_source(cand)
+check("code that does not compile is refused", not ok_ and "compile" in err)
+open(os.path.join(cand, "pornblock.py"), "w").write("x = 1\n")
+ok_, ver, err = pb.verify_source(cand)
+check("code with no VERSION is refused", not ok_ and "VERSION" in err)
+# no selftest.py in the candidate, so the self-test gate is skipped here --
+# running the real one would recurse into this file
+open(os.path.join(cand, "pornblock.py"), "w").write('VERSION = "9.9.9"\nx = 1\n')
+ok_, ver, err = pb.verify_source(cand)
+check("a sane candidate is accepted", ok_ and ver == "9.9.9", err)
+open(os.path.join(cand, "selftest.py"), "w").write("import sys; sys.exit(3)\n")
+ok_, ver, err = pb.verify_source(cand)
+check("a candidate failing its own self-test is refused",
+      not ok_ and "self-test" in err)
+shutil.rmtree(cand, ignore_errors=True)
+
+print("\n== the update source is pinned too ==")
+cfg = base_cfg()
+cfg["updates"] = {"enabled": True, "repo": "https://github.com/me/porn-block",
+                  "branch": "main", "check_hours": 24, "auto_apply": False,
+                  "require_unlock": True}
+cfg["_secrets"] = {"partner_passphrase": pb.hash_passphrase("friend-secret")}
+pb.save_config(cfg)
+pb.save_record(pb.record_from_config(cfg))
+rec = pb.load_record()
+check("record pins the repo", rec["update_repo"] == "https://github.com/me/porn-block")
+evil = pb.deep_merge(cfg, {"updates": {"repo": "https://github.com/evil/x",
+                                       "branch": "pwn", "require_unlock": False}})
+evil["_secrets"] = cfg["_secrets"]
+got, notes = pb.reconcile_record(evil, pb.deep_merge(pb.DEFAULT_STATE, {}))
+check("repointing the update source is reverted",
+      got["updates"]["repo"] == "https://github.com/me/porn-block")
+check("changing the branch is reverted", got["updates"]["branch"] == "main")
+check("turning off updates-need-an-unlock is reverted",
+      got["updates"]["require_unlock"] is True)
+check("all three were reported", len([n for n in notes if "update" in n]) >= 2, notes)
+
 shutil.rmtree(SB, ignore_errors=True)
 print("\n%d checks failed" % len(FAILED))
 if FAILED:

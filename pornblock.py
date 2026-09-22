@@ -27,6 +27,7 @@ import getpass
 import hashlib
 import hmac
 import imaplib
+import io
 import json
 import os
 import re
@@ -37,6 +38,7 @@ import socket
 import ssl
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import urllib.error
@@ -195,6 +197,18 @@ DEFAULT_CONFIG = {
     "youtube_restrict": "moderate",   # moderate | strict
     "loop_seconds": 45,
     "imap_poll_seconds": 60,
+    # Pulling code from a repo and running it as root is, honestly, a way
+    # round all of this if you control the repo. The source is pinned in the
+    # install record, every applied update emails your approvers, and a
+    # candidate that fails its own self-test is refused.
+    "updates": {
+        "enabled": True,
+        "repo": "",
+        "branch": "main",
+        "check_hours": 24,
+        "auto_apply": False,
+        "require_unlock": False,
+    },
     "blocklist_url": BLOCKLIST_URL,
     "blocklist_refresh_hours": 24,
     "alert_min_interval_seconds": 900,
@@ -243,6 +257,8 @@ DEFAULT_STATE = {
     "blocklist": {"fetched_at": 0, "domains": 0, "safesearch_ips": {}},
     "imap": {"uidvalidity": None, "seen_uids": []},
     "outbox": [],
+    "update": {"last_check": 0, "installed_sha": "", "available": None,
+               "last_applied": 0, "last_error": ""},
     "alerts": {},
     "enforced_once": False,
     "history": [],
@@ -311,11 +327,12 @@ class Result:
         return self.rc == 0
 
 
-def run(cmd, timeout: int = 90, input_text: str | None = None) -> Result:
+def run(cmd, timeout: int = 90, input_text: str | None = None,
+        env=None, cwd=None) -> Result:
     """Run a command, never raise.  Returns Result."""
     try:
         p = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=timeout, input=input_text)
+                           timeout=timeout, input=input_text, env=env, cwd=cwd)
         return Result(p.returncode, p.stdout or "", p.stderr or "")
     except FileNotFoundError:
         return Result(127, "", "not found: %s" % cmd[0])
@@ -612,6 +629,10 @@ def record_from_config(cfg: dict) -> dict:
         "cooloff_hours": float(cfg["cooloff_hours"]),
         "unlock_minutes": int(cfg["unlock_minutes"]),
         "filter": cfg["filter"],
+        "update_repo": (cfg.get("updates") or {}).get("repo", ""),
+        "update_branch": (cfg.get("updates") or {}).get("branch", "main"),
+        "update_require_unlock": bool((cfg.get("updates") or {}
+                                       ).get("require_unlock", False)),
         "require_passphrase": bool(cfg.get("require_passphrase", True)),
         "passphrase_recovery": bool(cfg.get("passphrase_recovery", True)),
         "passphrase_set": bool((cfg.get("_secrets") or load_secrets()
@@ -1123,6 +1144,61 @@ def nm_dropin(cfg: dict) -> str:
         "ipv6.ignore-auto-dns=true\n")
 
 
+def _links() -> list:
+    r = run(["ip", "-o", "link", "show"], timeout=15)
+    names = []
+    for line in r.out.splitlines():
+        parts = line.split(":", 2)
+        if len(parts) < 2:
+            continue
+        name = parts[1].strip().split("@")[0].strip()
+        if name and name != "lo":
+            names.append(name)
+    return names
+
+
+def _links_with_foreign_dns(cfg: dict) -> list:
+    """Links whose per-link resolvers are not our filter."""
+    f = FILTERS[cfg["filter"]]
+    allowed = {ip.lower() for ip in f["ipv4"] + f["ipv6"]}
+    r = run(["resolvectl", "dns"], timeout=20)
+    if not r.ok:
+        return []
+    bad = []
+    for line in r.out.splitlines():
+        m = re.match(r"\s*Link\s+\d+\s+\(([^)]+)\):(.*)$", line)
+        if not m:
+            continue
+        iface, servers = m.group(1).strip(), m.group(2).split()
+        if iface == "lo":
+            continue
+        for srv in servers:
+            if srv.split("%")[0].lower() not in allowed:
+                bad.append(iface)
+                break
+    return bad
+
+
+def enforce_link_dns(cfg: dict, apply: bool) -> list:
+    if SANDBOX:
+        return []
+    changes = []
+    f = FILTERS[cfg["filter"]]
+    if apply:
+        bad = _links_with_foreign_dns(cfg)
+        for iface in bad:
+            run(["resolvectl", "dns", iface] + f["ipv4"] + f["ipv6"], timeout=20)
+            run(["resolvectl", "domain", iface, "~."], timeout=20)
+            changes.append("link %s was using another resolver; pinned to the "
+                           "filter" % iface)
+    else:
+        for iface in _links():
+            run(["resolvectl", "revert", iface], timeout=20)
+        if _links():
+            changes.append("per-link DNS reverted to DHCP (unlock window)")
+    return changes
+
+
 def _ensure_resolv_symlink() -> list:
     if SANDBOX:
         return []
@@ -1166,11 +1242,14 @@ def enforce_resolved(cfg: dict, st: dict, apply: bool) -> list:
         changes += _ensure_resolv_symlink()
         if changes:
             systemctl("restart", "systemd-resolved")
+        # after any restart the links need re-pinning, so this comes last
+        changes += enforce_link_dns(cfg, True)
     else:
         if remove_managed(RESOLVED_DROPIN):
             changes.append("systemd-resolved: drop-in removed (unlock window)")
         if remove_managed(NM_DROPIN):
             changes.append("NetworkManager: dns drop-in removed (unlock window)")
+        changes += enforce_link_dns(cfg, False)
         if changes:
             systemctl("reload-or-restart", "NetworkManager")
             systemctl("restart", "systemd-resolved")
@@ -1528,6 +1607,24 @@ def reconcile_record(cfg: dict, st: dict) -> tuple:
               "It cannot be recovered. Until a new one is set during an unlock "
               "window, the only way out is unanimous approval from all of you.\n"
               % socket.gethostname())
+
+    up = cfg.setdefault("updates", {})
+    if rec.get("update_repo") is not None and \
+            up.get("repo", "") != rec.get("update_repo", ""):
+        notes.append("update source was repointed (%s -> %s); reverted"
+                     % (rec.get("update_repo") or "none", up.get("repo") or "none"))
+        up["repo"] = rec.get("update_repo", "")
+        reverted = True
+    if rec.get("update_branch") and up.get("branch") != rec.get("update_branch"):
+        notes.append("update branch was changed (%s -> %s); reverted"
+                     % (rec.get("update_branch"), up.get("branch")))
+        up["branch"] = rec.get("update_branch")
+        reverted = True
+    if bool(rec.get("update_require_unlock", False)) and \
+            not bool(up.get("require_unlock", False)):
+        notes.append("updates-need-an-unlock was switched off; reverted")
+        up["require_unlock"] = True
+        reverted = True
 
     if cfg.get("filter") not in FILTERS:
         notes.append("unknown filter %r; reverted to %s"
@@ -2022,9 +2119,22 @@ def public_status_doc(cfg: dict, st: dict) -> dict:
         "passphrase_fails": int((st.get("passphrase") or {}).get("fails") or 0),
         "recovery_enabled": bool(cfg.get("passphrase_recovery", True)),
         "queued_emails": len(st.get("outbox") or []),
+        "update": {
+            "enabled": bool((cfg.get("updates") or {}).get("enabled", True)),
+            "repo": (cfg.get("updates") or {}).get("repo", ""),
+            "branch": (cfg.get("updates") or {}).get("branch", "main"),
+            "auto_apply": bool((cfg.get("updates") or {}).get("auto_apply", False)),
+            "installed_sha": (st.get("update") or {}).get("installed_sha", ""),
+            "last_check": (st.get("update") or {}).get("last_check", 0),
+            "last_applied": (st.get("update") or {}).get("last_applied", 0),
+            "last_error": (st.get("update") or {}).get("last_error", ""),
+            "available": {k: v for k, v in
+                          ((st.get("update") or {}).get("available") or {}).items()
+                          if k != "path"} or None,
+        },
         "blocklist": {"domains": (st.get("blocklist") or {}).get("domains", 0),
                       "fetched_at": (st.get("blocklist") or {}).get("fetched_at", 0)},
-        "history": [dict(h) for h in (st.get("history") or [])[-8:]],
+        "history": [dict(h) for h in (st.get("history") or [])[-25:]],
         "request": None,
         "unlock": None,
         "health": [],
@@ -2086,11 +2196,17 @@ def health(cfg: dict, st: dict) -> list:
         detail = "drop-in present" if ok else "drop-in MISSING"
         if not SANDBOX:
             r = run(["resolvectl", "status"], timeout=20)
-            if r.ok and "DNSOverTLS=yes" in r.out.replace(" ", ""):
-                detail += ", DoT active"
-            elif r.ok:
-                m = re.search(r"Current DNS Server:\s*(\S+)", r.out)
-                detail += ", current server %s" % (m.group(1) if m else "?")
+            m = re.search(r"Current DNS Server:\s*(\S+)", r.out or "")
+            cur = m.group(1) if m else "?"
+            allowed = set(FILTERS[cfg["filter"]]["ipv4"] +
+                          FILTERS[cfg["filter"]]["ipv6"])
+            detail += ", now using %s" % cur
+            stray = _links_with_foreign_dns(cfg)
+            if stray:
+                ok = False
+                detail += ", STRAY on " + ",".join(stray)
+            elif cur not in allowed and cur != "?":
+                ok = False
         add("systemd-resolved DoT", ok, detail)
     if enf.get("nftables", True):
         cnt = nft_table_rule_count()
@@ -2232,6 +2348,18 @@ def cmd_setup(args) -> int:
             print("   %d) %s  (%s)" % (i, FILTERS[k]["label"], k))
         pick = _ask("Choose", 1 if cfg.get("filter") == keys[0] else 2, cast=int)
         cfg["filter"] = keys[max(1, min(len(keys), pick)) - 1]
+
+        print(bold("\n  Updates (optional)"))
+        print("  A git URL to pull new versions from. Whoever controls it")
+        print("  controls what runs as root here - a friend's fork is safer")
+        print("  than your own. Leave blank to switch updates off.")
+        cfg["updates"]["repo"] = _ask("Update repo URL",
+                                      cfg["updates"].get("repo") or "")
+        if cfg["updates"]["repo"]:
+            cfg["updates"]["branch"] = _ask("Branch",
+                                            cfg["updates"].get("branch") or "main")
+        else:
+            cfg["updates"]["enabled"] = False
 
         print(bold("\n  Dedicated mailbox"))
         cfg["email"]["address"] = _ask("Mailbox address (sends alerts, receives APPROVE)",
@@ -2642,6 +2770,10 @@ def cmd_install(args) -> int:
 
     save_record(record_from_config(cfg))
     print(green("  install record written and made immutable"))
+    sha = current_source_sha()
+    if sha:
+        st.setdefault("update", {})["installed_sha"] = sha
+        print("  installed from commit %s" % sha[:12])
 
     print("  fetching blocklist...")
     res = refresh_blocklist(cfg, st, force=args.refresh)
@@ -2803,6 +2935,7 @@ def tick(cfg_override=None) -> dict:
     mailer.flush_outbox(st)
     write_public_status(cfg, st)
     save_state(st)
+    maybe_update(cfg, st)
     return {"moves": moves, "changes": changes, "blocklist": bl, "mode": st["mode"]}
 
 
@@ -2915,6 +3048,296 @@ def cmd_simulate_approval(args) -> int:
     save_state(st)
     print(green("  recorded simulated %s from %s"
                 % ("denial" if args.deny else "approval", who_)))
+    return 0
+
+
+# ==========================================================================
+# Updating from git
+# ==========================================================================
+
+def _github_tarball_url(repo: str, branch: str):
+    m = re.match(r"https?://github\.com/([^/\s]+)/([^/\s.]+)", (repo or "").strip())
+    if not m:
+        return None
+    return "https://codeload.github.com/%s/%s/tar.gz/refs/heads/%s" % (
+        m.group(1), m.group(2), branch)
+
+
+def fetch_source(cfg: dict, dest: str) -> tuple:
+    """Download the pinned repo into `dest`. Returns (ok, sha, subject, err)."""
+    up = cfg.get("updates") or {}
+    repo = (up.get("repo") or "").strip()
+    branch = (up.get("branch") or "main").strip()
+    if not repo:
+        return False, "", "", "no update repo is configured"
+
+    err = ""
+    if shutil.which("git"):
+        r = run(["git", "clone", "--quiet", "--depth", "1", "--branch", branch,
+                 repo, dest], timeout=240)
+        if r.ok:
+            sha = run(["git", "-C", dest, "rev-parse", "HEAD"], timeout=30).out.strip()
+            subj = run(["git", "-C", dest, "log", "-1", "--pretty=%s"],
+                       timeout=30).out.strip()
+            return True, sha, subj, ""
+        err = "git clone failed: " + (r.err.strip()[:200] or "unknown")
+        shutil.rmtree(dest, ignore_errors=True)
+    else:
+        err = "git is not installed"
+
+    url = _github_tarball_url(repo, branch)
+    if not url:
+        return False, "", "", err
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "pornblock/" + VERSION})
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            blob = resp.read()
+        raw = dest + ".raw"
+        with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tf:
+            first = next((m.name for m in tf.getmembers() if m.name), "")
+            root = first.split("/")[0]
+            tf.extractall(raw, filter="data")
+        shutil.move(os.path.join(raw, root), dest)
+        shutil.rmtree(raw, ignore_errors=True)
+        return True, "tarball@" + branch, "", ""
+    except Exception as exc:                       # noqa: BLE001 - never fatal
+        return False, "", "", "%s; tarball fetch failed: %s" % (err, exc)
+
+
+def verify_source(dest: str) -> tuple:
+    """
+    Decide whether a downloaded candidate is safe to run as root.
+    Returns (ok, version, error).  A candidate that cannot compile, or that
+    fails its own self-test, is refused.
+    """
+    main = os.path.join(dest, "pornblock.py")
+    if not os.path.exists(main):
+        return False, "", "the download contains no pornblock.py"
+    r = run([sys.executable, "-m", "py_compile", main], timeout=120)
+    if not r.ok:
+        return False, "", "the new pornblock.py does not compile"
+    try:
+        with open(main, encoding="utf-8", errors="replace") as fh:
+            body = fh.read()
+    except OSError as exc:
+        return False, "", str(exc)
+    m = re.search(r'^VERSION\s*=\s*"([^"]+)"', body, re.M)
+    if not m:
+        return False, "", "the new pornblock.py declares no VERSION"
+    newver = m.group(1)
+
+    selftest = os.path.join(dest, "selftest.py")
+    if os.path.exists(selftest):
+        box = tempfile.mkdtemp(prefix="pb-update-check-")
+        env = dict(os.environ, PORNBLOCK_PREFIX=box)
+        env.pop("PYTHONPATH", None)
+        r = run([sys.executable, selftest], timeout=420, env=env, cwd=dest)
+        shutil.rmtree(box, ignore_errors=True)
+        if not r.ok:
+            tail = (r.out or r.err or "").strip().splitlines()[-6:]
+            return False, newver, ("the new version fails its own self-test, so "
+                                   "it will not be installed:\n  "
+                                   + "\n  ".join(tail))
+    return True, newver, ""
+
+
+def current_source_sha() -> str:
+    here = os.path.dirname(os.path.abspath(__file__))
+    r = run(["git", "-C", here, "rev-parse", "HEAD"], timeout=20)
+    return r.out.strip() if r.ok else ""
+
+
+def apply_update(cfg: dict, st: dict, dest: str, sha: str, subject: str,
+                 newver: str) -> list:
+    done = []
+    with open(os.path.join(dest, "pornblock.py"), encoding="utf-8") as fh:
+        core = fh.read()
+    write_managed(SELF_COPY, core, 0o600, True, backup=False)
+    write_managed(BIN_PATH, core, 0o755, True, backup=False)
+    done.append("core updated to %s" % newver)
+
+    gui_path = os.path.join(dest, "pornblock_gui.py")
+    if os.path.exists(gui_path):
+        with open(gui_path, encoding="utf-8") as fh:
+            gui = fh.read()
+        write_managed(GUI_SELF_COPY, gui, 0o600, True, backup=False)
+        write_managed(GUI_BIN_PATH, gui, 0o755, True, backup=False)
+        write_managed(DESKTOP_PATH, desktop_entry(cfg), 0o644, True, backup=False)
+        write_managed(ICON_PATH, icon_svg(), 0o644, True, backup=False)
+        done.append("desktop app updated")
+
+    for ch in write_units():
+        done.append(ch)
+    systemctl("daemon-reload")
+
+    upd = st.setdefault("update", {})
+    upd["installed_sha"] = sha
+    upd["last_applied"] = now()
+    upd["available"] = None
+    upd["last_error"] = ""
+    history(st, "updated to %s (%s)" % (newver, sha[:12] or "?"))
+
+    alert(cfg, st, "updated", "%s was updated to %s" % (cfg.get("app_name") or PROG, newver),
+          "%s on %s just installed an update pulled from:\n\n"
+          "  %s (%s)\n  commit %s\n  %s\n\n"
+          "The new code passed its own self-test before being installed, but "
+          "understand what this means: whoever controls that repository "
+          "controls what runs as root on this machine. If that is %s and this "
+          "update was not something you expected, ask about it.\n"
+          % (cfg.get("app_name") or PROG, socket.gethostname(),
+             (cfg.get("updates") or {}).get("repo"),
+             (cfg.get("updates") or {}).get("branch"),
+             sha[:12] or "?", subject or "(no commit subject)", who(cfg)),
+          force=True)
+    save_state(st)
+    return done
+
+
+def check_for_update(cfg: dict, st: dict, quiet: bool = True) -> dict:
+    """Fetch and evaluate, without installing. Returns the availability dict."""
+    upd = st.setdefault("update", {})
+    upd["last_check"] = now()
+    dest = tempfile.mkdtemp(prefix="pb-update-") + "/src"
+    try:
+        ok, sha, subject, err = fetch_source(cfg, dest)
+        if not ok:
+            upd["last_error"] = err
+            if not quiet:
+                print(red("  " + err))
+            return None
+        try:
+            with open(os.path.join(dest, "pornblock.py"), encoding="utf-8") as fh:
+                candidate = fh.read()
+        except OSError as exc:
+            upd["last_error"] = str(exc)
+            return None
+        current = ""
+        for path in (P(SELF_COPY), os.path.abspath(__file__)):
+            if os.path.exists(path):
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    current = fh.read()
+                break
+        if candidate == current:
+            upd["available"] = None
+            upd["last_error"] = ""
+            if not quiet:
+                print(green("  already up to date"))
+            return None
+        good, newver, verr = verify_source(dest)
+        if not good:
+            upd["available"] = None
+            upd["last_error"] = verr
+            if not quiet:
+                print(red("  " + verr))
+            log("update candidate rejected: %s" % verr.replace("\n", " "))
+            return None
+        upd["available"] = {"version": newver, "sha": sha, "subject": subject,
+                            "checked_at": now(), "path": dest}
+        upd["last_error"] = ""
+        if not quiet:
+            print(green("  update available: %s (%s) %s"
+                        % (newver, sha[:12] or "?", subject)))
+        return upd["available"]
+    finally:
+        pass
+
+
+def maybe_update(cfg: dict, st: dict) -> None:
+    """Daily availability check from the daemon; applies only if asked to."""
+    up = cfg.get("updates") or {}
+    if not up.get("enabled", True) or not (up.get("repo") or "").strip():
+        return
+    if st.get("mode") == "PENDING":
+        return
+    every = float(up.get("check_hours") or 24) * 3600
+    last = float((st.get("update") or {}).get("last_check") or 0)
+    if now() - last < every:
+        return
+    try:
+        avail = check_for_update(cfg, st)
+    except Exception as exc:                       # never take the loop down
+        log("update check blew up: %r" % exc)
+        st.setdefault("update", {})["last_error"] = repr(exc)
+        avail = None
+    save_state(st)
+    if not avail or not up.get("auto_apply"):
+        if avail:
+            log("update %s is available; waiting to be applied by hand"
+                % avail.get("version"))
+        return
+    unl = st.get("unlock") or {}
+    if up.get("require_unlock") and not (st.get("mode") == "UNLOCKED" and
+                                         now() < float(unl.get("expires_at") or 0)):
+        return
+    try:
+        apply_update(cfg, st, avail["path"], avail["sha"],
+                     avail.get("subject", ""), avail["version"])
+        write_public_status(cfg, st)
+        save_state(st)
+        systemctl("restart", "pornblock.service")   # replaces this process
+    except Exception as exc:
+        log("applying the update failed: %r" % exc)
+
+
+def cmd_update(args) -> int:
+    require_root()
+    cfg = load_config()
+    if not cfg:
+        print(red("No config. Run: sudo %s setup" % PROG))
+        return 1
+    st = load_state()
+    cfg, _ = reconcile_record(cfg, st)
+    up = cfg.get("updates") or {}
+
+    if not up.get("enabled", True):
+        print(yellow("  Updates are switched off in the config."))
+        return 1
+    if not (up.get("repo") or "").strip():
+        print(yellow("""
+  No update repo is configured.
+
+  Put your GitHub URL in /etc/pornblock/config.json:
+
+      "updates": { "enabled": true, "repo": "https://github.com/you/porn-block",
+                   "branch": "main" }
+
+  then run install once so it is pinned into the install record.
+"""))
+        return 1
+
+    unl = st.get("unlock") or {}
+    unlocked = (st.get("mode") == "UNLOCKED"
+                and now() < float(unl.get("expires_at") or 0))
+    if st.get("mode") == "PENDING" and not args.check:
+        print(red("  Not while an unlock request is open - you do not get to "
+                  "update your way out mid-request."))
+        return 1
+    if up.get("require_unlock", False) and not unlocked and not args.check:
+        print(red("  This install requires an unlock window before an update "
+                  "can be applied."))
+        return 1
+
+    print("  checking %s (%s)..." % (up.get("repo"), up.get("branch")))
+    avail = check_for_update(cfg, st, quiet=False)
+    if not avail:
+        save_state(st)
+        write_public_status(cfg, st)
+        return 0 if not (st.get("update") or {}).get("last_error") else 1
+    if args.check:
+        save_state(st)
+        write_public_status(cfg, st)
+        print("  run '%s update' to install it" % PROG)
+        return 0
+
+    print("  self-test passed; installing...")
+    for line in apply_update(cfg, st, avail["path"], avail["sha"],
+                             avail.get("subject", ""), avail["version"]):
+        print(green("  " + line))
+    write_public_status(cfg, st)
+    save_state(st)
+    systemctl("restart", "pornblock.service")
+    print(green("\n  Updated to %s. Your approvers were emailed.\n"
+                % avail["version"]))
     return 0
 
 
@@ -3116,6 +3539,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--no-roundtrip", action="store_true")
     s.add_argument("--wait", type=int, default=90, help="seconds to wait for round trip")
     s.set_defaults(fn=cmd_test_email)
+
+    s = sub.add_parser("update", help="pull a newer version from the pinned repo")
+    s.add_argument("--check", action="store_true",
+                   help="only report whether one is available")
+    s.set_defaults(fn=cmd_update)
 
     s = sub.add_parser("enforce", help="run one enforcement pass now")
     s.add_argument("--refresh", action="store_true")
