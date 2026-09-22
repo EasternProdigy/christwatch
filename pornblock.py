@@ -48,6 +48,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 VERSION = "1.0.3"
+HOMEPAGE = "https://github.com/EasternProdigy/christwatch"
 PROG = "pornblock"
 
 # --------------------------------------------------------------------------
@@ -186,6 +187,19 @@ DEFAULT_CONFIG = {
     "owner_name": "",
     "owner_email": "",
     "approvers": [],
+    # how your friends hear about it and how they answer:
+    #   "email"   - SMTP out, IMAP in, approvers are addresses
+    #   "discord" - a bot posts in one channel and reads the replies there,
+    #               approvers are Discord user ids
+    "transport": "email",
+    # identifier -> the name to show, so status is not a wall of numbers
+    "approver_names": {},
+    "discord": {
+        "channel_id": "",
+        "bot_token": "",          # kept in secrets.json, blanked out here
+        "ping_on_alert": True,
+        "poll_seconds": 45,
+    },
     "approvals_required": 2,
     "cooloff_hours": 24.0,
     "unlock_minutes": 60,
@@ -561,6 +575,7 @@ def deep_merge(base: dict, over: dict) -> dict:
 DEFAULT_SECRETS = {
     "smtp_password": "",
     "imap_password": "",
+    "discord_bot_token": "",
     # {"algo","iter","salt","hash","set_at"} - never the passphrase itself
     "partner_passphrase": None,
 }
@@ -576,6 +591,10 @@ def load_secrets() -> dict:
         if not sec.get(k) and inline.get(k):
             sec[k] = inline[k]
             moved = True
+    tok = (raw.get("discord") or {}).get("bot_token")
+    if not sec.get("discord_bot_token") and tok:
+        sec["discord_bot_token"] = tok
+        moved = True
     if moved:
         save_secrets(sec)
         log("migrated mail credentials out of config.json into secrets.json")
@@ -617,6 +636,7 @@ def load_config(with_secrets: bool = True) -> dict:
         sec = load_secrets()
         cfg["email"]["smtp_password"] = sec.get("smtp_password") or ""
         cfg["email"]["imap_password"] = sec.get("imap_password") or ""
+        cfg["discord"]["bot_token"] = sec.get("discord_bot_token") or ""
         cfg["_secrets"] = sec
     return cfg
 
@@ -627,6 +647,7 @@ def save_config(cfg: dict) -> None:
     out = json.loads(json.dumps(out))
     out.setdefault("email", {})["smtp_password"] = ""
     out["email"]["imap_password"] = ""
+    out.setdefault("discord", {})["bot_token"] = ""
     write_managed(CONFIG_PATH, dump_json(out), mode=0o600,
                   immutable=False, backup=False)
 
@@ -650,6 +671,8 @@ def record_from_config(cfg: dict) -> dict:
         "cooloff_hours": float(cfg["cooloff_hours"]),
         "unlock_minutes": int(cfg["unlock_minutes"]),
         "filter": cfg["filter"],
+        "transport": (cfg.get("transport") or "email").lower(),
+        "discord_channel": str((cfg.get("discord") or {}).get("channel_id") or ""),
         "update_repo": (cfg.get("updates") or {}).get("repo", ""),
         "update_branch": (cfg.get("updates") or {}).get("branch", "main"),
         "update_require_unlock": bool((cfg.get("updates") or {}
@@ -752,6 +775,8 @@ def strip_quoted(text: str) -> str:
 
 
 class Mailer:
+    NAME = "email"
+
     def __init__(self, cfg: dict):
         self.cfg = cfg
         self.e = cfg["email"]
@@ -841,6 +866,7 @@ class Mailer:
             log("email FAILED (%s) :: %s" % (exc, subject))
             if queue_on_fail and st is not None:
                 st.setdefault("outbox", []).append({
+                    "transport": self.NAME,
                     "to": list(to_list), "subject": subject, "text": text,
                     "html": html, "queued_at": now(), "attempts": 0,
                     "last_error": str(exc),
@@ -856,6 +882,10 @@ class Mailer:
         for item in box:
             if item.get("attempts", 0) >= 20:
                 log("dropping undeliverable queued email :: %s" % item.get("subject"))
+                continue
+            if (item.get("transport") or "email") != self.NAME:
+                log("dropping a queued %s message: this machine now uses %s"
+                    % (item.get("transport") or "email", self.NAME))
                 continue
             try:
                 self.send_now(item["to"], item["subject"], item["text"],
@@ -957,18 +987,261 @@ class Mailer:
 
 
 # --------------------------------------------------------------------------
+# Discord: one channel, in front of everybody
+# --------------------------------------------------------------------------
+
+DISCORD_API = "https://discord.com/api/v10"
+DISCORD_EPOCH_MS = 1420070400000
+DISCORD_LIMIT = 1900          # real limit is 2000; leave room for the header
+
+
+def snowflake_at(epoch_seconds: float) -> int:
+    """A Discord id encodes its own timestamp, so "everything posted after
+    the request went out" needs no bookkeeping on our side."""
+    return max(0, int(epoch_seconds * 1000) - DISCORD_EPOCH_MS) << 22
+
+
+def _discord_error(code: int, raw: str) -> str:
+    detail = ""
+    with contextlib.suppress(ValueError):
+        body = json.loads(raw or "{}")
+        detail = body.get("message") or ""
+    if code == 401:
+        return ("the bot token was rejected. Copy it again from the Bot page "
+                "of your application - it is not the application id or the "
+                "client secret. %s" % detail)
+    if code == 403:
+        return ("the bot is not allowed to do that in this channel. Give it "
+                "View Channel, Send Messages and Read Message History. %s" % detail)
+    if code == 404:
+        return ("no channel with that id, or the bot is not in that server. "
+                "%s" % detail)
+    if code == 429:
+        return "Discord is rate-limiting us. %s" % detail
+    return "HTTP %d %s" % (code, detail or raw[:200])
+
+
+def _chunk_text(text: str, limit: int = DISCORD_LIMIT) -> list:
+    """Split on line breaks so a message never lands mid-sentence."""
+    out, cur = [], ""
+    for line in (text or "").splitlines(True):
+        while len(line) > limit:
+            if cur:
+                out.append(cur)
+                cur = ""
+            out.append(line[:limit])
+            line = line[limit:]
+        if len(cur) + len(line) > limit:
+            out.append(cur)
+            cur = ""
+        cur += line
+    if cur.strip() or not out:
+        out.append(cur)
+    return [c for c in out if c.strip()]
+
+
+class DiscordCourier:
+    """
+    The same four methods as Mailer, over a Discord bot token.
+
+    Everything goes to one channel that all the approvers can see, and their
+    answers are read back out of the same channel. There is deliberately no
+    private path: approving an unlock happens in front of the group, which is
+    most of what makes this work at all.
+    """
+
+    NAME = "discord"
+
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.d = cfg.get("discord") or {}
+
+    # -- plumbing ---------------------------------------------------------
+
+    def _token(self) -> str:
+        tok = (self.d.get("bot_token") or "").strip()
+        if not tok:
+            raise MailError("no bot token configured")
+        return tok
+
+    def _channel(self) -> str:
+        cid = str(self.d.get("channel_id") or "").strip()
+        if not cid.isdigit():
+            raise MailError("no channel id configured")
+        return cid
+
+    def _call(self, method: str, path: str, body=None, timeout: int = 25,
+              retries: int = 1):
+        data = dump_json(body).encode("utf-8") if body is not None else None
+        req = urllib.request.Request(DISCORD_API + path, data=data, method=method)
+        req.add_header("Authorization", "Bot " + self._token())
+        req.add_header("User-Agent", "DiscordBot (%s, %s)" % (HOMEPAGE, VERSION))
+        if data is not None:
+            req.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8", "replace")
+            return json.loads(raw) if raw.strip() else {}
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", "replace")
+            if exc.code == 429 and retries > 0:
+                wait = 1.0
+                with contextlib.suppress(ValueError, TypeError):
+                    wait = min(5.0, float(json.loads(raw).get("retry_after") or 1))
+                time.sleep(wait)
+                return self._call(method, path, body, timeout, retries - 1)
+            raise MailError(_discord_error(exc.code, raw)) from exc
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            raise MailError("%s: %s" % (type(exc).__name__, exc)) from exc
+
+    # -- outgoing ---------------------------------------------------------
+
+    def post(self, text: str, ping_ids=()) -> None:
+        cid = self._channel()
+        ids = [str(i) for i in ping_ids if str(i).isdigit()]
+        chunks = _chunk_text(text)
+        for i, chunk in enumerate(chunks):
+            content = chunk
+            if i == 0 and ids and self.d.get("ping_on_alert", True):
+                content = " ".join("<@%s>" % i_ for i_ in ids) + "\n" + chunk
+            self._call("POST", "/channels/%s/messages" % cid,
+                       {"content": content,
+                        "allowed_mentions": {"parse": [], "users": ids[:50]}})
+
+    def send_now(self, to_list, subject, text, html=None) -> None:
+        """Post synchronously. html is ignored - Discord has no use for it."""
+        head = ("**%s**" % subject.strip()) if subject else ""
+        body = "\n".join(x for x in (head, (text or "").strip()) if x)
+        self.post(body, ping_ids=to_list or [])
+        log("discord post :: %s" % subject)
+
+    def send(self, st: dict, to_list, subject, text, html=None,
+             queue_on_fail: bool = True) -> bool:
+        try:
+            self.send_now(to_list, subject, text, html)
+            return True
+        except MailError as exc:
+            log("discord post FAILED (%s) :: %s" % (exc, subject))
+            if queue_on_fail and st is not None:
+                st.setdefault("outbox", []).append({
+                    "transport": self.NAME, "to": list(to_list or []),
+                    "subject": subject, "text": text, "html": None,
+                    "queued_at": now(), "attempts": 0, "last_error": str(exc),
+                })
+                st["outbox"] = st["outbox"][-100:]
+            return False
+
+    def flush_outbox(self, st: dict) -> None:
+        box = st.get("outbox") or []
+        if not box:
+            return
+        st["outbox"] = []
+        keep = []
+        for item in box:
+            if item.get("attempts", 0) >= 20:
+                log("dropping an undeliverable queued post :: %s"
+                    % item.get("subject"))
+                continue
+            if (item.get("transport") or "email") != self.NAME:
+                log("dropping a queued %s message: this machine now uses %s"
+                    % (item.get("transport") or "email", self.NAME))
+                continue
+            try:
+                self.send_now(item["to"], item["subject"], item["text"])
+            except MailError as exc:
+                item["attempts"] = item.get("attempts", 0) + 1
+                item["last_error"] = str(exc)
+                keep.append(item)
+        st["outbox"] = keep
+
+    # -- incoming ---------------------------------------------------------
+
+    def scan(self, st: dict, since_epoch: float) -> list:
+        """(author id, "", message text, message id) for everything humans
+        have said in the channel since `since_epoch`."""
+        cid = self._channel()
+        after = snowflake_at(since_epoch)
+        out, blank = [], 0
+        for _page in range(10):
+            msgs = self._call(
+                "GET", "/channels/%s/messages?limit=100&after=%d" % (cid, after))
+            if not isinstance(msgs, list) or not msgs:
+                break
+            msgs.sort(key=lambda m: int(m.get("id") or 0))
+            for m in msgs:
+                with contextlib.suppress(TypeError, ValueError):
+                    after = max(after, int(m.get("id") or 0))
+                author = m.get("author") or {}
+                if author.get("bot"):
+                    continue
+                body = m.get("content") or ""
+                if not body:
+                    blank += 1
+                    continue
+                out.append((str(author.get("id") or ""), "", body,
+                            str(m.get("id") or "")))
+            if len(msgs) < 100:
+                break
+        if blank and not out:
+            log("discord: message text came back empty - switch on the "
+                "Message Content intent for the bot")
+        return out
+
+    def probe(self) -> str:
+        me = self._call("GET", "/users/@me")
+        ch = self._call("GET", "/channels/%s" % self._channel())
+        name = ch.get("name") or self._channel()
+        return "signed in as %s, can see #%s" % (me.get("username") or "?", name)
+
+    def content_intent(self) -> bool:
+        """Whether the bot may read what other people type. Without it the
+        text of every message that does not mention the bot arrives empty."""
+        app = self._call("GET", "/applications/@me")
+        flags = int(app.get("flags") or 0)
+        return bool(flags & ((1 << 18) | (1 << 19)))
+
+
+def courier(cfg: dict):
+    """The way this machine talks to its approvers."""
+    if (cfg.get("transport") or "email").lower() == "discord":
+        return DiscordCourier(cfg)
+    return Mailer(cfg)
+
+
+def is_discord(cfg: dict) -> bool:
+    return (cfg.get("transport") or "email").lower() == "discord"
+
+
+def display_name(cfg: dict, ident: str) -> str:
+    """Approvers are addresses on email and 18-digit ids on Discord; nobody
+    should have to read the latter."""
+    ident = str(ident or "").strip()
+    name = (cfg.get("approver_names") or {}).get(ident)
+    if name:
+        return name
+    if is_discord(cfg) and ident.isdigit():
+        return "<@%s>" % ident
+    return ident
+
+
+def people_list(cfg: dict) -> str:
+    return ", ".join(display_name(cfg, a) for a in (cfg.get("approvers") or []))
+
+
+# --------------------------------------------------------------------------
 # Alerting helpers
 # --------------------------------------------------------------------------
 
 def everyone(cfg: dict) -> list:
     people = list(cfg.get("approvers") or [])
-    if cfg.get("owner_email"):
+    if cfg.get("owner_email") and not is_discord(cfg):
         people.append(cfg["owner_email"])
     return list(dict.fromkeys(a.strip() for a in people if a.strip()))
 
 
 def alert(cfg: dict, st: dict, key: str, subject: str, text: str,
-          html: str | None = None, to=None, force: bool = False) -> bool:
+          html: str | None = None, to=None, force: bool = False,
+          ping: bool = True) -> bool:
     """
     Loud email to all approvers (+ owner).  `key` rate-limits repeats of the
     same kind of alert so a wedged machine cannot spam your friends into
@@ -982,7 +1255,9 @@ def alert(cfg: dict, st: dict, key: str, subject: str, text: str,
     recipients = to if to is not None else everyone(cfg)
     app = cfg.get("app_name") or PROG
     prefix = "[%s DEMO] " % app if SANDBOX else "[%s] " % app
-    return Mailer(cfg).send(st, recipients, prefix + subject, text, html)
+    if is_discord(cfg) and not ping:
+        recipients = []          # still posted, just nobody's phone buzzes
+    return courier(cfg).send(st, recipients, prefix + subject, text, html)
 
 
 # ==========================================================================
@@ -1654,6 +1929,28 @@ def reconcile_record(cfg: dict, st: dict) -> tuple:
               "window, the only way out is unanimous approval from all of you.\n"
               % socket.gethostname())
 
+    rec_tr = (rec.get("transport") or "email").lower()
+    cfg_tr = (cfg.get("transport") or "email").lower()
+    if rec.get("transport") and rec_tr != cfg_tr:
+        notes.append("the way your friends are contacted was changed (%s -> %s); "
+                     "reverted" % (rec_tr, cfg_tr))
+        cfg["transport"] = rec_tr
+        reverted = True
+        cfg_tr = rec_tr
+
+    rec_ch = str(rec.get("discord_channel") or "")
+    cfg_ch = str((cfg.get("discord") or {}).get("channel_id") or "")
+    if rec_ch and cfg_ch != rec_ch:
+        # a channel your friends are not in is the same as no alerts at all
+        notes.append("the Discord channel was changed (%s -> %s); reverted"
+                     % (rec_ch, cfg_ch or "none"))
+        cfg.setdefault("discord", {})["channel_id"] = rec_ch
+        reverted = True
+    elif not rec_ch and cfg_ch and cfg_tr == "discord":
+        rec["discord_channel"] = cfg_ch
+        save_record(rec)
+        notes.append("Discord channel recorded as %s" % cfg_ch)
+
     up = cfg.setdefault("updates", {})
     rec_repo = rec.get("update_repo") or ""
     cfg_repo = (up.get("repo") or "").strip()
@@ -1924,6 +2221,9 @@ def _q(s: str) -> str:
 
 
 def mailto_link(cfg: dict, token: str, verb: str = "APPROVE") -> str:
+    """A one-click reply link. Empty on Discord, where you just type it."""
+    if is_discord(cfg):
+        return ""
     payload = "%s %s" % (verb, token)
     return "mailto:%s?subject=%s&body=%s" % (cfg["email"]["address"],
                                              _q(payload), _q(payload))
@@ -1940,6 +2240,29 @@ def request_email(cfg: dict, st: dict) -> tuple:
     need = int(cfg["approvals_required"])
     got = len(req.get("approvals") or {})
     subject = "Unlock requested by %s - code %s" % (who(cfg), tok)
+    if is_discord(cfg):
+        text = (
+            "%s has asked to switch off the porn blocker on %s.\n"
+            "They set this up themselves and asked you to be the brake.\n"
+            "\n"
+            "  Cool-off ends : %s  (in %s)\n"
+            "  Approvals     : %d of %d needed\n"
+            "  Approvers     : %s\n"
+            "\n"
+            "Nothing happens until the timer runs out AND %d of you approve.\n"
+            "If you do nothing, the blocker stays on. Doing nothing is a "
+            "valid, and often the kind, answer.\n"
+            "\n"
+            "To approve, say here:   `APPROVE %s`\n"
+            "To refuse, say here:    `DENY %s`   (one DENY cancels it)\n"
+            "\n"
+            "If it is granted, blocking lifts for %d minutes and then switches "
+            "itself back on. Asking again restarts the %s-hour wait from zero."
+            % (who(cfg), host, stamp(req["eligible_at"]),
+               human_delta(req["eligible_at"] - now()), got, need,
+               people_list(cfg), need, tok, tok,
+               int(cfg["unlock_minutes"]), cfg["cooloff_hours"]))
+        return subject, text, None
     text = (
         "%s has asked to switch off the porn blocker on %s.\n"
         "\n"
@@ -1965,7 +2288,7 @@ def request_email(cfg: dict, st: dict) -> tuple:
         "-- pornblock on %s\n"
         % (who(cfg), host, stamp(req["eligible_at"]),
            human_delta(req["eligible_at"] - now()), got, need,
-           ", ".join(cfg["approvers"]), need, tok, mailto_link(cfg, tok), tok,
+           people_list(cfg), need, tok, mailto_link(cfg, tok), tok,
            int(cfg["unlock_minutes"]), cfg["cooloff_hours"], host))
     html = (
         "<div style='font-family:system-ui,sans-serif;font-size:15px;line-height:1.5'>"
@@ -2054,13 +2377,13 @@ def classify_reply(subject: str, body: str, token: str):
     return None
 
 
-def poll_approvals(cfg: dict, st: dict, mailer: Mailer) -> list:
+def poll_approvals(cfg: dict, st: dict, post) -> list:
     req = st.get("request")
     if not req:
         return []
     events = []
     approvers = {a.strip().lower() for a in cfg.get("approvers") or []}
-    for sender, subject, body, _uid in mailer.scan(st, req["requested_at"]):
+    for sender, subject, body, _uid in post.scan(st, req["requested_at"]):
         if sender not in approvers:
             continue
         verdict = classify_reply(subject, body, req["token"])
@@ -2080,7 +2403,7 @@ def to_locked(cfg: dict, st: dict, why_text: str) -> None:
     history(st, "-> LOCKED (%s)" % why_text)
 
 
-def advance(cfg: dict, st: dict, mailer: Mailer) -> list:
+def advance(cfg: dict, st: dict, post) -> list:
     """Move the state machine forward.  Returns human-readable transitions."""
     moves = []
     mode = st.get("mode", "LOCKED")
@@ -2092,31 +2415,33 @@ def advance(cfg: dict, st: dict, mailer: Mailer) -> list:
         poll_every = float(cfg.get("imap_poll_seconds") or 60)
         if now() - float(req.get("last_poll") or 0) >= poll_every:
             req["last_poll"] = now()
-            events = poll_approvals(cfg, st, mailer)
+            events = poll_approvals(cfg, st, post)
 
         for kind, sender in events:
             if kind == "approve":
-                history(st, "approval received from %s" % sender)
+                sender_name = display_name(cfg, sender)
+                history(st, "approval received from %s" % sender_name)
                 got = len(req.get("approvals") or {})
                 alert(cfg, st, "approval_%s" % sender,
                       "%s approved the unlock (%d/%s)"
-                      % (sender, got, cfg["approvals_required"]),
+                      % (sender_name, got, cfg["approvals_required"]),
                       "%s approved %s's unlock request (code %s).\n\n"
                       "That is %d of %s approvals. The cool-off %s.\n"
-                      % (sender, who(cfg), req.get("token"), got,
+                      % (sender_name, who(cfg), req.get("token"), got,
                          cfg["approvals_required"],
                          ("ends " + stamp(req["eligible_at"]))
                          if now() < req["eligible_at"] else "has already ended"),
                       force=True)
             else:
-                history(st, "DENIAL received from %s" % sender)
+                sender_name = display_name(cfg, sender)
+                history(st, "DENIAL received from %s" % sender_name)
                 alert(cfg, st, "denial",
-                      "%s refused the unlock - request cancelled" % sender,
+                      "%s refused the unlock - request cancelled" % sender_name,
                       "%s replied DENY to %s's unlock request (code %s).\n\n"
                       "The request has been cancelled and the blocker stays on.\n"
-                      % (sender, who(cfg), req.get("token")), force=True)
-                to_locked(cfg, st, "denied by %s" % sender)
-                return ["denied by %s - back to LOCKED" % sender]
+                      % (sender_name, who(cfg), req.get("token")), force=True)
+                to_locked(cfg, st, "denied by %s" % sender_name)
+                return ["denied by %s - back to LOCKED" % sender_name]
 
         if now() - float(req.get("requested_at") or 0) > ttl:
             alert(cfg, st, "expired", "Unlock request expired",
@@ -2146,7 +2471,9 @@ def advance(cfg: dict, st: dict, mailer: Mailer) -> list:
                   "fresh %s-hour wait.\n"
                   % (got, need, socket.gethostname(),
                      stamp(st["unlock"]["expires_at"]), mins,
-                     ", ".join(st["unlock"]["approved_by"]), cfg["cooloff_hours"]),
+                     ", ".join(display_name(cfg, a)
+                               for a in st["unlock"]["approved_by"]),
+                     cfg["cooloff_hours"]),
                   force=True)
             moves.append("UNLOCKED for %d minutes" % mins)
         elif timer_done and not req.get("ready_notified"):
@@ -2488,7 +2815,7 @@ def digest_body(cfg: dict, day: str) -> tuple:
     return ("Daily report for %s - %s" % (who(cfg), day), "\n".join(lines) + "\n")
 
 
-def maybe_digest(cfg: dict, st: dict, mailer) -> None:
+def maybe_digest(cfg: dict, st: dict, post) -> None:
     trk = cfg.get("tracking") or {}
     if not (trk.get("enabled", True) and trk.get("digest_enabled", True)):
         return
@@ -2500,7 +2827,7 @@ def maybe_digest(cfg: dict, st: dict, mailer) -> None:
         return
     act["last_digest_day"] = day
     subject, text = digest_body(cfg, day)
-    alert(cfg, st, "digest", subject, text, force=True)
+    alert(cfg, st, "digest", subject, text, force=True, ping=False)
     history(st, "daily report sent for %s" % day)
 
 
@@ -2517,7 +2844,8 @@ def cmd_activity(args) -> int:
     if args.send:
         st = load_state()
         subject, text = digest_body(cfg, day)
-        ok = alert(cfg, st, "digest_manual", subject, text, force=True)
+        ok = alert(cfg, st, "digest_manual", subject, text,
+                   force=True, ping=False)
         save_state(st)
         print(green("  report sent") if ok else yellow("  queued for retry"))
         return 0
@@ -2581,6 +2909,10 @@ def public_status_doc(cfg: dict, st: dict) -> dict:
         "owner_name": cfg.get("owner_name") or "",
         "owner_email": cfg.get("owner_email") or "",
         "approvers": list(cfg.get("approvers") or []),
+        "approver_names": {str(k): str(v) for k, v in
+                           (cfg.get("approver_names") or {}).items()},
+        "transport": (cfg.get("transport") or "email").lower(),
+        "channel_id": str((cfg.get("discord") or {}).get("channel_id") or ""),
         "approvals_required": int(cfg.get("approvals_required") or 1),
         "cooloff_hours": float(cfg.get("cooloff_hours") or 24),
         "unlock_minutes": int(cfg.get("unlock_minutes") or 60),
@@ -2760,13 +3092,19 @@ def guess_provider(addr: str):
 
 def validate_config(cfg: dict) -> list:
     errs = []
-    if not valid_email(cfg.get("owner_email", "")):
+    discord = is_discord(cfg)
+    if not discord and not valid_email(cfg.get("owner_email", "")):
         errs.append("owner_email is not a valid address")
     appr = [a for a in (cfg.get("approvers") or []) if a.strip()]
     if not appr:
         errs.append("you need at least one approver")
     for a in appr:
-        if not valid_email(a):
+        if discord:
+            if not str(a).isdigit() or len(str(a)) < 15:
+                errs.append("approver %r is not a Discord user id - turn on "
+                            "Developer Mode, right-click the person and use "
+                            "Copy User ID" % a)
+        elif not valid_email(a):
             errs.append("approver %r is not a valid address" % a)
     n = int(cfg.get("approvals_required") or 0)
     if n < 1:
@@ -2780,6 +3118,15 @@ def validate_config(cfg: dict) -> list:
         errs.append("unlock_minutes must be > 0")
     if cfg.get("filter") not in FILTERS:
         errs.append("filter must be one of: %s" % ", ".join(FILTERS))
+    if discord:
+        d = cfg.get("discord") or {}
+        if not str(d.get("channel_id") or "").isdigit():
+            errs.append("discord.channel_id is required - right-click the "
+                        "channel and use Copy Channel ID")
+        if not (d.get("bot_token") or "").strip():
+            errs.append("no Discord bot token stored - your friend needs to "
+                        "paste it")
+        return errs
     e = cfg.get("email") or {}
     for k in ("address", "smtp_host", "imap_host"):
         if not e.get(k):
@@ -2928,6 +3275,8 @@ def cmd_setup(args) -> int:
         sec["smtp_password"] = cfg["email"]["smtp_password"]
     if cfg["email"].get("imap_password"):
         sec["imap_password"] = cfg["email"]["imap_password"]
+    if (cfg.get("discord") or {}).get("bot_token"):
+        sec["discord_bot_token"] = cfg["discord"]["bot_token"]
     phrase = cfg.pop("partner_passphrase", None)
     if phrase:
         if len(phrase) < 8:
@@ -2988,6 +3337,92 @@ def friendly_mail_error(text: str) -> str:
     return text
 
 
+def _discord_from_answers(args):
+    """Shared by the two unprivileged Discord commands."""
+    raw = sys.stdin.read() if args.answers == "-" else \
+        open(args.answers, encoding="utf-8").read()
+    ans = json.loads(raw)
+    d = dict(DEFAULT_CONFIG["discord"])
+    d.update(ans.get("discord") or ans or {})
+    return ans, DiscordCourier({"discord": d})
+
+
+def cmd_check_discord(args) -> int:
+    """
+    Try a bot token and channel. Needs no root, writes nothing, posts nothing.
+
+    Checks the three things that actually go wrong: a token that is really the
+    application id, a channel the bot was never invited to, and the Message
+    Content switch nobody remembers to turn on.
+    """
+    try:
+        _ans, dc = _discord_from_answers(args)
+    except (OSError, ValueError) as exc:
+        print("could not read the answers: %s" % exc)
+        return 2
+    ok = True
+    try:
+        print("Bot and channel: ok, %s" % dc.probe())
+    except MailError as exc:
+        print("Bot and channel failed: %s" % exc)
+        return 1
+    try:
+        if dc.content_intent():
+            print("Reading replies: ok, the bot may read what people type")
+        else:
+            print("Reading replies: NOT YET - open your application on "
+                  "discord.com/developers, go to Bot, and switch on the "
+                  "MESSAGE CONTENT INTENT. Without it every message arrives "
+                  "blank and no approval can ever be seen.")
+            ok = False
+    except MailError as exc:
+        print("Reading replies: could not tell (%s)" % exc)
+    return 0 if ok else 1
+
+
+def cmd_discord_checkin(args) -> int:
+    """
+    Ask the channel who the approvers are, instead of making anyone copy
+    18-digit user ids by hand.
+
+    Posts one message asking people to say a word, then watches for who says
+    it and prints them as JSON. Unprivileged and stateless.
+    """
+    try:
+        _ans, dc = _discord_from_answers(args)
+    except (OSError, ValueError) as exc:
+        print(dump_json({"error": "could not read the answers: %s" % exc}))
+        return 2
+    word = (args.word or "").strip().upper() or secrets.token_hex(2).upper()
+    started = now()
+    try:
+        dc.post("**Setting up ChristWatch**\n"
+                "Everyone who is going to be an approver: say `%s` here.\n"
+                "That is how this machine learns which account is yours - "
+                "nobody has to copy any ids." % word)
+    except MailError as exc:
+        print(dump_json({"error": str(exc)}))
+        return 1
+
+    found, deadline = {}, started + max(10, int(args.wait or 120))
+    while now() < deadline and len(found) < int(args.expect or 99):
+        time.sleep(3)
+        try:
+            for uid, _subj, body, _mid in dc.scan({}, started - 5):
+                if re.search(r"\b%s\b" % re.escape(word), body, re.I):
+                    found.setdefault(uid, {"id": uid, "name": ""})
+        except MailError as exc:
+            print(dump_json({"error": str(exc)}), flush=True)
+            return 1
+    for uid in list(found):
+        with contextlib.suppress(MailError, KeyError, TypeError):
+            u = dc._call("GET", "/users/%s" % uid)
+            found[uid]["name"] = (u.get("global_name") or u.get("username")
+                                  or uid)
+    print(dump_json({"word": word, "members": list(found.values())}))
+    return 0 if found else 1
+
+
 def cmd_check_mailbox(args) -> int:
     """
     Try a set of mailbox credentials and say whether they work.
@@ -3032,6 +3467,47 @@ def cmd_test_email(args) -> int:
         return 1
     st = load_state()
     ok = True
+
+    if is_discord(cfg):
+        dc = DiscordCourier(cfg)
+        marker = secrets.token_hex(4).upper()
+        print(bold("\n  1. Posting in the channel"))
+        try:
+            dc.send_now(everyone(cfg) if not args.no_approvers else [],
+                        "test - you are an approver",
+                        "%s set up ChristWatch on %s and named you as someone "
+                        "who can let them out of it.\n\n"
+                        "From now on this channel gets a message when they ask "
+                        "to unlock, when anyone tampers with it, and every "
+                        "evening with what happened on the machine.\n\n"
+                        "Nothing to do right now. A real request will carry a "
+                        "code and you answer with APPROVE <code> right here.\n\n"
+                        "Test marker: %s"
+                        % (who(cfg), socket.gethostname(), marker))
+            print(green("     posted"))
+        except MailError as exc:
+            print(red("     POSTING FAILED: %s" % exc))
+            ok = False
+        print(bold("\n  2. Reading the channel back"))
+        try:
+            print(green("     " + dc.probe()))
+        except MailError as exc:
+            print(red("     FAILED: %s" % exc))
+            ok = False
+        try:
+            if dc.content_intent():
+                print(green("     the bot may read what people type"))
+            else:
+                print(red("     MESSAGE CONTENT INTENT IS OFF - approvals can "
+                          "never be seen. Switch it on at discord.com/developers "
+                          "under your application, Bot."))
+                ok = False
+        except MailError as exc:
+            print(yellow("     could not check the content intent: %s" % exc))
+        save_state(st)
+        print(green("\n  Discord looks good.\n") if ok
+              else red("\n  Discord is NOT working yet - fix it before installing.\n"))
+        return 0 if ok else 1
 
     print(bold("\n  1. Sending alert mail via SMTP"))
     recipients = everyone(cfg) if not args.no_approvers else [cfg["owner_email"]]
@@ -3156,10 +3632,11 @@ def cmd_request(args) -> int:
     cool-off ends   : %s
     approvals needed: %d of %d
 
-  Your friends can approve by replying   APPROVE %s
+  Your friends can approve by %-13s APPROVE %s
   You can back out at any time with      %s cancel
 """ % (token, stamp(st["request"]["eligible_at"]), int(cfg["approvals_required"]),
-       len(cfg["approvers"]), token, PROG))
+       len(cfg["approvers"]),
+       "saying" if is_discord(cfg) else "replying", token, PROG))
     return 0
 
 
@@ -3220,7 +3697,11 @@ def cmd_status(args) -> int:
     print("  mode               : %s" % colour(mode))
     if mode == "LOCKED":
         print("  " + dim("blocking is on; nothing pending"))
-    print("  approvers          : %s" % ", ".join(cfg["approvers"]))
+    print("  contact            : %s" % (
+        ("Discord channel %s" % ((cfg.get("discord") or {}).get("channel_id")
+                                 or "?")) if is_discord(cfg)
+        else "email via %s" % (cfg["email"].get("address") or "?")))
+    print("  approvers          : %s" % people_list(cfg))
     print("  approvals required : %d of %d" % (int(cfg["approvals_required"]),
                                                len(cfg["approvers"])))
     print("  cool-off           : %s hours" % cfg["cooloff_hours"])
@@ -3247,7 +3728,7 @@ def cmd_status(args) -> int:
             key = a.strip().lower()
             mark = green("  approved  ") if key in got else dim("  waiting   ")
             when = stamp(got[key]) if key in got else ""
-            print("      %s %-34s %s" % (mark, a, dim(when)))
+            print("      %s %-34s %s" % (mark, display_name(cfg, a), dim(when)))
         pass_req, pass_ok = passphrase_gate(cfg, st, req)
         if pass_req:
             print("  partner passphrase : %s"
@@ -3575,24 +4056,24 @@ def tick(cfg_override=None) -> dict:
         return {}
     st = load_state()
     cfg, notes = reconcile_record(cfg, st)
-    mailer = Mailer(cfg)
-    mailer.flush_outbox(st)
+    post = courier(cfg)
+    post.flush_outbox(st)
 
     bl = refresh_blocklist(cfg, st)
     if bl == "refreshed" or not (st.get("blocklist") or {}).get("safesearch_ips"):
         refresh_safesearch_ips(cfg, st)
 
-    moves = advance(cfg, st, mailer)
+    moves = advance(cfg, st, post)
     apply = st.get("mode") != "UNLOCKED"
     quiet = bool(moves) or bool(notes) or bl == "refreshed" or not st.get("enforced_once")
     changes = enforce_all(cfg, st, apply, quiet=quiet)
     guard_units(cfg, st)
     try:
         sample_activity(cfg, st)
-        maybe_digest(cfg, st, mailer)
+        maybe_digest(cfg, st, post)
     except Exception as exc:                      # tracking must never wedge it
         log("activity sampling failed: %r" % exc)
-    mailer.flush_outbox(st)
+    post.flush_outbox(st)
     write_public_status(cfg, st)
     save_state(st)
     maybe_update(cfg, st)
@@ -4304,13 +4785,29 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("cancel", help="withdraw a request / end an unlock early")
     s.set_defaults(fn=cmd_cancel)
 
+    s = sub.add_parser("check-discord",
+                       help="try a bot token and channel (no root, posts nothing)")
+    s.add_argument("--answers", default="-",
+                   help="JSON file with a discord block, or - for stdin")
+    s.set_defaults(fn=cmd_check_discord)
+
+    s = sub.add_parser("discord-checkin",
+                       help="ask the channel who the approvers are")
+    s.add_argument("--answers", default="-")
+    s.add_argument("--word", default="", help="the word to watch for")
+    s.add_argument("--wait", type=int, default=120, help="seconds to listen")
+    s.add_argument("--expect", type=int, default=99,
+                   help="stop early once this many people have checked in")
+    s.set_defaults(fn=cmd_discord_checkin)
+
     s = sub.add_parser("check-mailbox",
                        help="try mailbox credentials (no root, writes nothing)")
     s.add_argument("--answers", default="-",
                    help="JSON file with an email block, or - for stdin")
     s.set_defaults(fn=cmd_check_mailbox)
 
-    s = sub.add_parser("test-email", help="prove SMTP and IMAP work")
+    s = sub.add_parser("test-email",
+                       help="prove the alert path works end to end")
     s.add_argument("--no-approvers", action="store_true",
                    help="only mail yourself, do not bother your friends")
     s.add_argument("--no-roundtrip", action="store_true")

@@ -139,6 +139,26 @@ c3 = pb.deep_merge(cfg, {"cooloff_hours": 72, "approvals_required": 3})
 got, notes = pb.reconcile_record(c3, pb.deep_merge(pb.DEFAULT_STATE, {}))
 check("strengthening is accepted", got["cooloff_hours"] == 72 and got["approvals_required"] == 3)
 
+# moving the alerts to a channel your friends are not in is the same as
+# switching them off, so the record pins both the transport and the channel
+dc0 = pb.deep_merge(cfg, {"transport": "discord",
+                          "approvers": ["111111111111111111",
+                                        "222222222222222222",
+                                        "333333333333333333"],
+                          "discord": {"channel_id": "999999999999999999"}})
+pb.save_config(dc0)
+pb.save_record(pb.record_from_config(dc0))
+moved = pb.deep_merge(dc0, {"discord": {"channel_id": "777777777777777777"}})
+got, notes = pb.reconcile_record(moved, pb.deep_merge(pb.DEFAULT_STATE, {}))
+check("moving the alerts to another channel is reverted",
+      got["discord"]["channel_id"] == "999999999999999999", repr(notes))
+back = pb.deep_merge(dc0, {"transport": "email"})
+got, notes = pb.reconcile_record(back, pb.deep_merge(pb.DEFAULT_STATE, {}))
+check("quietly switching back to email is reverted",
+      got["transport"] == "discord", repr(notes))
+pb.save_config(cfg)
+pb.save_record(pb.record_from_config(cfg))
+
 print("\n== state machine ==")
 st = pb.deep_merge(pb.DEFAULT_STATE, {})
 cfg = base_cfg()
@@ -197,13 +217,22 @@ print("\n== secrets are kept out of config.json ==")
 cfg = base_cfg()
 cfg["email"]["smtp_password"] = "hunter2-smtp"
 cfg["email"]["imap_password"] = "hunter2-imap"
+cfg["discord"]["bot_token"] = "hunter2-bot-token"
 pb.save_secrets({"smtp_password": "hunter2-smtp", "imap_password": "hunter2-imap",
+                 "discord_bot_token": "hunter2-bot-token",
                  "partner_passphrase": pb.hash_passphrase("friend-secret")})
 pb.save_config(cfg)
 raw_cfg = open(pb.P(pb.CONFIG_PATH)).read()
 check("no password text in config.json", "hunter2" not in raw_cfg)
 check("config.json blanks the password fields",
       json.loads(raw_cfg)["email"]["smtp_password"] == "")
+check("config.json blanks the bot token too",
+      json.loads(raw_cfg)["discord"]["bot_token"] == "")
+check("load_config merges the bot token back in",
+      pb.load_config()["discord"]["bot_token"] == "hunter2-bot-token")
+check("the snapshot never carries the bot token",
+      "hunter2-bot-token" not in json.dumps(
+          pb.public_status_doc(pb.load_config(), pb.load_state())))
 loaded = pb.load_config()
 check("load_config merges the secrets back in",
       loaded["email"]["smtp_password"] == "hunter2-smtp")
@@ -308,6 +337,152 @@ check("snapshot has what the GUI needs",
 pb.write_public_status(cfg, st)
 check("snapshot is world readable",
       oct(os.stat(pb.P(pb.PUBLIC_STATUS)).st_mode)[-3:] == "644")
+
+print("\n== discord transport (no network) ==")
+
+
+class FakeDiscord(pb.DiscordCourier):
+    """The real courier with the one HTTP call replaced."""
+
+    def __init__(self, cfg, pages=None, me=None):
+        super().__init__(cfg)
+        self.sent = []
+        self.pages = list(pages or [])
+        self.me = me or {}
+
+    def _call(self, method, path, body=None, timeout=25, retries=1):
+        if method == "POST":
+            self.sent.append((path, body))
+            return {"id": "1"}
+        if path.startswith("/users/@me"):
+            return {"username": "christwatch"}
+        if path.startswith("/channels/") and "/messages" in path:
+            return self.pages.pop(0) if self.pages else []
+        if path.startswith("/channels/"):
+            return {"name": "accountability"}
+        if path.startswith("/applications/@me"):
+            return self.me
+        return {}
+
+
+dcfg = {"transport": "discord",
+        "approvers": ["111111111111111111", "222222222222222222"],
+        "approver_names": {"111111111111111111": "marcus",
+                           "222222222222222222": "james"},
+        "discord": {"channel_id": "999999999999999999",
+                    "bot_token": "tok", "ping_on_alert": True}}
+
+check("a discord config is recognised", pb.is_discord(dcfg)
+      and not pb.is_discord({"transport": "email"}))
+check("the courier factory follows the transport",
+      isinstance(pb.courier(dcfg), pb.DiscordCourier)
+      and isinstance(pb.courier(base_cfg()), pb.Mailer))
+check("ids are shown as the names your friends use",
+      pb.people_list(dcfg) == "marcus, james")
+check("an unknown id still renders as a mention",
+      pb.display_name(dcfg, "333333333333333333") == "<@333333333333333333>")
+
+fd = FakeDiscord(dcfg)
+fd.send_now(dcfg["approvers"], "Unlock requested", "code ABCD1234")
+check("one alert is one post", len(fd.sent) == 1)
+_path, sent = fd.sent[0]
+check("the subject is posted in bold", "**Unlock requested**" in sent["content"])
+check("the pings come first, before the text", sent["content"].startswith("<@"))
+check("both approvers are pinged",
+      "<@111111111111111111>" in sent["content"]
+      and "<@222222222222222222>" in sent["content"])
+check("mentions are restricted to those two",
+      sent["allowed_mentions"]["parse"] == []
+      and len(sent["allowed_mentions"]["users"]) == 2)
+
+quiet = FakeDiscord(dcfg)
+quiet.send_now([], "Daily report", "screen time 4h")
+check("a report with nobody to ping pings nobody",
+      "<@" not in quiet.sent[0][1]["content"])
+
+long_text = "\n".join("line %d" % i for i in range(600))
+big = FakeDiscord(dcfg)
+big.send_now([], "Long", long_text)
+check("a long report is split, never truncated",
+      len(big.sent) > 1 and all(len(c[1]["content"]) <= 2000 for c in big.sent)
+      and "line 599" in "".join(c[1]["content"] for c in big.sent))
+
+now_ms = int(pb.now() * 1000)
+snow = pb.snowflake_at(pb.now())
+check("snowflakes carry the right timestamp",
+      abs(((snow >> 22) + pb.DISCORD_EPOCH_MS) - now_ms) < 1000)
+
+msgs = [{"id": "100", "content": "APPROVE ABCD1234",
+         "author": {"id": "111111111111111111", "username": "marcus"}},
+        {"id": "101", "content": "[ChristWatch] Unlock requested",
+         "author": {"id": "555", "username": "bot", "bot": True}},
+        {"id": "102", "content": "", "author": {"id": "222222222222222222"}}]
+sc = FakeDiscord(dcfg, pages=[msgs])
+seen = sc.scan({}, pb.now() - 600)
+check("the bot ignores its own posts", all(u != "555" for u, _s, _b, _m in seen))
+check("blank messages are skipped (no content intent)", len(seen) == 1)
+check("a human approval comes through",
+      seen[0][0] == "111111111111111111" and "APPROVE" in seen[0][2])
+
+st_d = pb.deep_merge(pb.DEFAULT_STATE, {})
+st_d["mode"] = "PENDING"
+st_d["request"] = {"token": "ABCD1234", "requested_at": pb.now() - 60,
+                   "eligible_at": pb.now() + 60, "approvals": {}, "denials": {}}
+events = pb.poll_approvals(dcfg, st_d, FakeDiscord(dcfg, pages=[msgs]))
+check("that approval is recorded against the right person",
+      events == [("approve", "111111111111111111")])
+strangers = [{"id": "103", "content": "APPROVE ABCD1234",
+              "author": {"id": "444444444444444444", "username": "randomer"}}]
+st_d["request"]["approvals"] = {}
+check("a stranger in the channel cannot approve",
+      pb.poll_approvals(dcfg, st_d, FakeDiscord(dcfg, pages=[strangers])) == [])
+
+check("the content intent is read off the application flags",
+      FakeDiscord(dcfg, me={"flags": 1 << 18}).content_intent()
+      and not FakeDiscord(dcfg, me={"flags": 0}).content_intent())
+check("a token that is really an application id is explained",
+      "not the application id" in pb._discord_error(401, "{}"))
+check("a channel the bot is not in is explained",
+      "not in that server" in pb._discord_error(404, "{}"))
+
+_real_courier = pb.courier
+_spy = FakeDiscord(dcfg)
+pb.courier = lambda _cfg: _spy
+_st = pb.deep_merge(pb.DEFAULT_STATE, {})
+pb.alert(dcfg, _st, "k", "Something happened", "body", force=True)
+check("alerts go to the channel, not to a mailbox", len(_spy.sent) == 1)
+pb.alert(dcfg, _st, "digest", "Daily report", "body", force=True, ping=False)
+check("the nightly report does not ping anyone at 8pm",
+      "<@" not in _spy.sent[1][1]["content"])
+
+
+class DeadDiscord(FakeDiscord):
+    def _call(self, *a, **k):
+        raise pb.MailError("Discord is down")
+
+
+dead = DeadDiscord(dcfg)
+_st2 = pb.deep_merge(pb.DEFAULT_STATE, {})
+check("a failed post is queued, not lost",
+      dead.send(_st2, [], "later", "body") is False
+      and len(_st2["outbox"]) == 1)
+check("and the queue remembers which transport it belongs to",
+      _st2["outbox"][0]["transport"] == "discord")
+pb.Mailer(base_cfg()).flush_outbox(_st2)
+check("the mailer does not try to send someone else's queue",
+      _st2["outbox"] == [])
+pb.courier = _real_courier
+
+check("a discord config validates without any mail settings",
+      pb.validate_config(pb.deep_merge(pb.DEFAULT_CONFIG, dict(
+          dcfg, owner_name="bill", approvals_required=2, cooloff_hours=24,
+          unlock_minutes=60, filter="cloudflare_family"))) == [])
+bad_ids = pb.deep_merge(pb.DEFAULT_CONFIG, dict(
+    dcfg, approvers=["marcus@example.com"], approvals_required=1,
+    owner_name="bill", cooloff_hours=24, unlock_minutes=60,
+    filter="cloudflare_family"))
+check("an email address where a user id belongs is caught",
+      any("Copy User ID" in e for e in pb.validate_config(bad_ids)))
 
 print("\n== mailbox check (offline paths only) ==")
 import argparse  # noqa: E402
