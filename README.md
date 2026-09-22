@@ -257,6 +257,21 @@ what your friends download and double-click.
 /etc/systemd/system/pornblock-watchdog.{service,timer}   every 60s
 ```
 
+With `harden --on`, two more - both removed again by `harden --off`:
+
+```
+/etc/cron.d/christwatch             the re-armer that is not systemd
+/etc/profile.d/christwatch.sh       the warning every terminal prints
+```
+
+And one outside our own territory, written only because our own domain
+tracking is what makes the journal chatty. `tracking.journal_cap_mb: 0`
+opts out; `uninstall` removes it:
+
+```
+/etc/systemd/journald.conf.d/90-pornblock.conf   SystemMaxUse, default 512M
+```
+
 ---
 
 ## Daily use
