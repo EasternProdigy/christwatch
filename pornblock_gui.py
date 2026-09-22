@@ -504,6 +504,39 @@ class SetupView(Gtk.Box):
                                             "download the blocklist.")
         self.log_buf.set_text("")
 
+        def via_file():
+            """Fallback if stdin did not survive pkexec: a 0600 file in the
+            user's own runtime dir, deleted the moment the call returns."""
+            rt = GLib.get_user_runtime_dir() or "/tmp"
+            path = os.path.join(rt, "christwatch-answers.json")
+            try:
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w") as fh:
+                    fh.write(payload)
+            except OSError as exc:
+                done(False, "could not stage the answers: %s" % exc)
+                return
+
+            def cleanup(ok, out):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+                done(ok, out)
+            run_privileged(["setup", "--answers", path, "--install"],
+                           on_done=cleanup)
+
+        def first(ok, out):
+            text = out or ""
+            if not ok and ("not valid JSON" in text or "Expecting value" in text
+                           or not text.strip()):
+                self.log_buf.set_text(
+                    text + "\n\nThe answers did not reach the helper over "
+                    "stdin. Retrying through a private file...\n")
+                via_file()
+                return
+            done(ok, out)
+
         def done(ok, out):
             self.log_buf.set_text(out or "(no output)")
             self.back_btn.set_sensitive(True)
@@ -524,7 +557,7 @@ class SetupView(Gtk.Box):
                 self.window.toast("Install failed")
 
         run_privileged(["setup", "--answers", "-", "--install"],
-                       stdin_text=payload, on_done=done)
+                       stdin_text=payload, on_done=first)
 
     def _next_clicked(self, *_):
         self.go(1)
