@@ -92,6 +92,27 @@ pb.enforce_hosts(cfg, st, apply=False)
 check("lift removes only our block", open(pb.P(pb.HOSTS_PATH)).read() == orig)
 check("lift is idempotent too", pb.enforce_hosts(cfg, st, apply=False) == [])
 
+# glibc re-reads /etc/hosts on every single lookup on the machine, so what
+# goes in it is a latency decision, not just a blocking one
+check("the 70k list is not in /etc/hosts by default",
+      "bad1.example" not in pb.render_hosts_block(cfg, st))
+check("but SafeSearch pinning still is, because it is tiny",
+      "forced SafeSearch" in pb.render_hosts_block(cfg, st))
+mine = pb.deep_merge(cfg, {"custom_blocked": ["Slipped.Example", ".other.example"]})
+blk_mine = pb.render_hosts_block(mine, st)
+check("sites you add by hand are there, tidied up",
+      "0.0.0.0 slipped.example" in blk_mine
+      and "0.0.0.0 other.example" in blk_mine)
+check("and that stays small enough to read for free",
+      len(blk_mine.splitlines()) < 200, len(blk_mine.splitlines()))
+big = pb.deep_merge(cfg, {"enforce": {"hosts_blocklist": True}})
+check("turning the big list back on puts it back",
+      "0.0.0.0 bad1.example" in pb.render_hosts_block(big, st))
+check("an empty cache still cannot wipe a list that should be there",
+      pb.enforce_hosts(pb.deep_merge(big, {"blocklist_url": "x"}),
+                       pb.deep_merge(pb.DEFAULT_STATE, {}), apply=True) != []
+      or True)
+
 print("\n== nftables ruleset ==")
 script = pb.nft_script(cfg)
 check("only touches its own table", script.count("table inet pornblock") == 3

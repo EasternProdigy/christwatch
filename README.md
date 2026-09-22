@@ -645,12 +645,43 @@ failure - but the honest unlock path is closed until it comes back.
 rather than written to disk, but a process you own can be attached to by a
 debugger you own. Again: friction, not secrecy.
 
-### Performance note
+### What this costs you, measured
 
-A ~77k-line `/etc/hosts` is read by glibc on every uncached lookup and adds a
-few milliseconds each time. If that bothers you, set `enforce.hosts` to
-`false` - layers 2 and 3 still block the same domains at the resolver, you
-just lose the SafeSearch pinning.
+Short version: nothing you will feel. Longer version, from a real machine:
+
+| | |
+|---|---|
+| Repeat lookup (resolved's cache) | **0 ms** |
+| First lookup of a domain, over DNS-over-TLS | 17-110 ms, and the first one after a restart pays the TLS handshake |
+| nftables lockdown | 15 rules on the output hook, unmeasurable |
+| `/etc/hosts` with the 70k list | ~5 ms of parsing on **every** lookup, because glibc re-reads the whole 2 MB file each time |
+| `/etc/hosts` without it | 4 KB, nothing to speak of |
+
+That last row is why `enforce.hosts_blocklist` defaults to **off**. The
+resolver blocks the same sites for free, so the file keeps only the SafeSearch
+pinning and anything you add yourself:
+
+```bash
+sudo pornblock block somewhere.example   # something slipped through
+sudo pornblock block --list
+sudo pornblock block --remove somewhere.example   # said out loud to your approvers
+```
+
+Turn the big list back on with `"enforce": {"hosts_blocklist": true}` if you
+want the belt as well as the braces - it does catch niche sites the resolver's
+categories miss.
+
+**Your browser does not use any of this anyway.** The Firefox and Chromium
+policies lock DNS-over-HTTPS to the same filtering resolver, so pages resolve
+through the browser's own encrypted connection. `/etc/hosts` and
+systemd-resolved never enter into it - which also means the hosts list was
+never what blocked porn in your browser.
+
+**The domain log is the one real cost.** Tracking which domains were looked up
+means systemd-resolved logs every query at debug level, which is tens of lines
+a second into the journal. It costs disk, not latency. `"tracking":
+{"dns_log": false}` switches it off; screen time, app time and blocked
+attempts all keep working, and you lose the list of sites.
 
 ### Packaging note
 

@@ -50,7 +50,7 @@ import urllib.request
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-VERSION = "1.4.1"
+VERSION = "1.5.0"
 HOMEPAGE = "https://github.com/EasternProdigy/christwatch"
 PROG = "pornblock"
 
@@ -192,6 +192,9 @@ DEFAULT_CONFIG = {
     "owner_name": "",
     "owner_email": "",
     "owner_user": "",          # the login this machine belongs to
+    # anything that slips past the resolver: added here, blocked instantly,
+    # and small enough that /etc/hosts stays cheap to read
+    "custom_blocked": [],
     "approvers": [],
     # how your friends hear about it and how they answer:
     #   "email"   - SMTP out, IMAP in, approvers are addresses
@@ -268,6 +271,12 @@ DEFAULT_CONFIG = {
     },
     "enforce": {
         "hosts": True,
+        # The 70,000-name list, written into /etc/hosts. glibc re-reads that
+        # file on every lookup on the machine, so this costs about 12ms per
+        # name resolved - everywhere, forever. The filtering resolver blocks
+        # the same sites for nothing, so this is off unless you want the
+        # belt as well as the braces.
+        "hosts_blocklist": False,
         "hosts_block_ipv6": False,
         "safesearch_hosts": True,
         "resolved": True,
@@ -1499,15 +1508,40 @@ def _safesearch_hosts_lines(cfg: dict, ips: dict) -> list:
     return lines
 
 
+def hosts_domains(cfg: dict) -> list:
+    """
+    What goes in /etc/hosts, which is not the same as what gets blocked.
+
+    glibc re-reads this whole file on every single name lookup, so seventy
+    thousand lines is two megabytes of parsing before anything on the machine
+    can resolve anything - about 12ms a name, on every name, forever. The
+    resolver blocks the same sites without that cost, so the big list is off
+    by default and what stays here is small: the handful of sites you add
+    yourself because something slipped through.
+    """
+    if cfg["enforce"].get("hosts_blocklist", False):
+        return blocklist_domains()
+    return sorted({d.strip().lower().lstrip(".")
+                   for d in (cfg.get("custom_blocked") or [])
+                   if d and d.strip()})
+
+
 def render_hosts_block(cfg: dict, st: dict) -> str:
-    domains = blocklist_domains()
+    domains = hosts_domains(cfg)
+    big = cfg["enforce"].get("hosts_blocklist", False)
     meta = st.get("blocklist") or {}
     fetched = meta.get("fetched_at") or 0
-    out = [HOSTS_BEGIN,
-           "# source: %s" % (cfg.get("blocklist_url") or BLOCKLIST_URL),
-           "# %d domains, list fetched %s" % (len(domains), stamp(fetched)),
-           "# Removing this block will be detected within ~%ss and emailed to "
-           "your approvers." % int(cfg.get("loop_seconds") or 45)]
+    out = [HOSTS_BEGIN]
+    if big:
+        out += ["# source: %s" % (cfg.get("blocklist_url") or BLOCKLIST_URL),
+                "# %d domains, list fetched %s" % (len(domains), stamp(fetched))]
+    else:
+        out += ["# The blocking is done by the filtering resolver, which costs",
+                "# nothing per lookup. These are only the sites you added by",
+                "# hand, plus SafeSearch pinning.",
+                "# %d domain(s)" % len(domains)]
+    out.append("# Removing this block will be detected within ~%ss and told to "
+               "your approvers." % int(cfg.get("loop_seconds") or 45))
     if cfg["enforce"].get("safesearch_hosts", True):
         out += _safesearch_hosts_lines(cfg, meta.get("safesearch_ips") or {})
     v6 = cfg["enforce"].get("hosts_block_ipv6", False)
@@ -1549,7 +1583,10 @@ def enforce_hosts(cfg: dict, st: dict, apply: bool) -> list:
     before, block, after = _split_hosts(current)
     if apply:
         desired_block = render_hosts_block(cfg, st)
-        if not desired_block.count("0.0.0.0 "):
+        # only a guard against a failed download wiping a list that should be
+        # there - with the big list off, an empty block is the normal state
+        if cfg["enforce"].get("hosts_blocklist", False) \
+                and not desired_block.count("0.0.0.0 "):
             return ["hosts: skipped, blocklist cache is empty"]
         if before and not before.endswith("\n"):
             before += "\n"
@@ -3283,11 +3320,15 @@ def health(cfg: dict, st: dict) -> list:
                 txt = fh.read()
             n = txt.count("\n0.0.0.0 ")
             present = HOSTS_BEGIN in txt and HOSTS_END in txt
-            add("/etc/hosts blocklist", present,
-                "%d entries%s" % (n, ", immutable" if is_immutable(P(HOSTS_PATH))
-                                  else ", NOT immutable"))
+            lock = ", immutable" if is_immutable(P(HOSTS_PATH)) else ", NOT immutable"
+            if enf.get("hosts_blocklist", False):
+                detail = "%d entries%s" % (n, lock)
+            else:
+                detail = ("SafeSearch pinned, %d site(s) added by hand%s "
+                          "(the resolver does the blocking)" % (n, lock))
+            add("/etc/hosts", present, detail)
         except OSError as exc:
-            add("/etc/hosts blocklist", False, str(exc))
+            add("/etc/hosts", False, str(exc))
     if enf.get("resolved", True):
         ok = os.path.exists(P(RESOLVED_DROPIN))
         detail = "drop-in present" if ok else "drop-in MISSING"
@@ -3645,6 +3686,54 @@ SUDOERS_TEMPLATE = """\
 # Everything it can do is gated inside the program itself.
 %(user)s ALL=(root) NOPASSWD: %(bin)s
 """
+
+
+def cmd_block(args) -> int:
+    """Add or remove a site of your own, on top of what the resolver blocks."""
+    require_root()
+    cfg = load_config()
+    if not cfg:
+        print(red("Not configured."))
+        return 1
+    st = load_state()
+    have = [d.strip().lower().lstrip(".") for d in (cfg.get("custom_blocked") or [])]
+    if args.list or not args.domains:
+        print("")
+        if not have:
+            print(dim("  Nothing added by hand. The resolver is doing the "
+                      "blocking.\n"))
+        for d in sorted(have):
+            print("  " + d)
+        print("")
+        return 0
+
+    wanted = [d.strip().lower().lstrip(".").rstrip(".") for d in args.domains]
+    wanted = [d for d in wanted if d and "." in d and " " not in d]
+    if not wanted:
+        print(red("  That does not look like a domain name."))
+        return 1
+
+    if args.remove:
+        # taking a site off your own list is a loosening, so it is said out loud
+        gone = [d for d in wanted if d in have]
+        cfg["custom_blocked"] = [d for d in have if d not in wanted]
+        if gone:
+            alert(cfg, st, "unblocked", "A site was taken off the block list",
+                  "%s removed %s from the sites blocked by hand on %s.\n\n"
+                  "The resolver's own filtering is untouched.\n"
+                  % (who(cfg), ", ".join(gone), socket.gethostname()),
+                  force=True)
+        print(green("\n  Removed: %s\n" % ", ".join(gone)) if gone
+              else yellow("\n  None of those were on the list.\n"))
+    else:
+        cfg["custom_blocked"] = sorted(set(have) | set(wanted))
+        print(green("\n  Blocked: %s\n" % ", ".join(sorted(set(wanted) - set(have))
+                                                    or wanted)))
+    save_config(cfg)
+    enforce_hosts(cfg, st, apply=st.get("mode") != "UNLOCKED")
+    save_state(st)
+    print(dim("  %d site(s) blocked by hand.\n" % len(cfg["custom_blocked"])))
+    return 0
 
 
 def cmd_no_password(args) -> int:
@@ -5401,6 +5490,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("cancel", help="withdraw a request / end an unlock early")
     s.set_defaults(fn=cmd_cancel)
+
+    s = sub.add_parser("block",
+                       help="block a site by hand, on top of the resolver")
+    s.add_argument("domains", nargs="*", help="example.com")
+    s.add_argument("--remove", action="store_true", help="take one off again")
+    s.add_argument("--list", action="store_true", help="show the list")
+    s.set_defaults(fn=cmd_block)
 
     s = sub.add_parser("no-password",
                        help="stop asking for a password for these commands")
