@@ -49,7 +49,7 @@ import urllib.request
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 HOMEPAGE = "https://github.com/EasternProdigy/christwatch"
 PROG = "pornblock"
 
@@ -403,6 +403,13 @@ def stamp(epoch: float | None) -> str:
     if not epoch:
         return "-"
     return dt.datetime.fromtimestamp(epoch).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def short_stamp(epoch: float | None) -> str:
+    """Day and time, for messages people read on a phone."""
+    if not epoch:
+        return "-"
+    return dt.datetime.fromtimestamp(epoch).astimezone().strftime("%a %H:%M")
 
 
 def sha256_text(text: str) -> str:
@@ -2348,30 +2355,14 @@ def request_email(cfg: dict, st: dict) -> tuple:
     subject = "Unlock requested by %s - code %s" % (who(cfg), tok)
     if is_discord(cfg):
         text = (
-            "%s has asked to switch off the porn blocker on %s.\n"
-            "They set this up themselves and asked you to be the brake.\n"
-            "\n"
-            "  Cool-off ends : %s  (in %s)\n"
-            "  Approvals     : %d of %d needed\n"
-            "  Approvers     : %s\n"
-            "\n"
-            "Nothing happens until the timer runs out AND %d of you approve.\n"
-            "If you do nothing, the blocker stays on. Doing nothing is a "
-            "valid, and often the kind, answer.\n"
-            "\n"
-            "To approve: tap the %s under this message.\n"
-            "To refuse:  tap the %s. One refusal cancels the whole request.\n"
-            "\n"
-            "Typing works too, if you would rather: `APPROVE %s` or `DENY %s`.\n"
-            "Taking your tick back takes your approval back, any time before "
-            "it is granted.\n"
-            "\n"
-            "If it is granted, blocking lifts for %d minutes and then switches "
-            "itself back on. Asking again restarts the %s-hour wait from zero."
-            % (who(cfg), host, stamp(req["eligible_at"]),
-               human_delta(req["eligible_at"] - now()), got, need,
-               people_list(cfg), need, TICK, CROSS, tok, tok,
-               int(cfg["unlock_minutes"]), cfg["cooloff_hours"]))
+            "%s wants the blocker on %s switched off.\n"
+            "Tap %s to allow it, %s to refuse. %d of %d needed, and it cannot "
+            "happen before %s (%s from now).\n"
+            "Doing nothing keeps it on. You can untap any time before it is "
+            "granted. Code `%s`."
+            % (who(cfg), host, TICK, CROSS, need, len(cfg.get("approvers") or []),
+               short_stamp(req["eligible_at"]),
+               human_delta(req["eligible_at"] - now()), tok))
         return subject, text, None
     text = (
         "%s has asked to switch off the porn blocker on %s.\n"
@@ -2502,8 +2493,7 @@ def ensure_request_posted(cfg: dict, st: dict) -> bool:
         return True
     dc = DiscordCourier(cfg)
     subject, text, _html = request_email(cfg, st)
-    app = cfg.get("app_name") or PROG
-    head = "**[%s%s] %s**" % (app, " DEMO" if SANDBOX else "", subject)
+    head = "**Unlock request%s**" % (" (demo)" if SANDBOX else "")
     try:
         mid = dc.post(head + "\n" + text, ping_ids=everyone(cfg))
         if not mid:
@@ -3677,38 +3667,90 @@ def cmd_discord_people(args) -> int:
 
 def cmd_discord_checkin(args) -> int:
     """
-    Ask the channel who the approvers are, instead of making anyone copy
-    18-digit user ids by hand.
+    Find out which Discord accounts your approvers are.
 
-    Posts one message asking people to say a word, then watches for who says
-    it and prints them as JSON. Unprivileged and stateless.
+    Nobody has to copy an id, and - this is the part that was broken - nobody
+    has to type anything the bot might not be allowed to read. A tap on the
+    tick is enough, because a reaction carries a user id and no text at all.
+
+    --post-only puts the question up and returns straight away. --collect
+    reads who has answered so far. Between the two there is no deadline: the
+    app keeps asking while you get on with something else.
     """
     try:
         _ans, dc = _discord_from_answers(args)
     except (OSError, ValueError) as exc:
         print(dump_json({"error": "could not read the answers: %s" % exc}))
         return 2
-    word = (args.word or "").strip().upper() or secrets.token_hex(2).upper()
-    started = now()
-    invite = ("**Setting up ChristWatch**\n"
-              "%s is putting a porn blocker on their machine and has asked "
-              "you to be one of the people who can let them out of it.\n\n"
-              "If you are willing: say `%s` back.\n"
-              "That is only so this knows which account is yours - nobody has "
-              "to copy any ids." % (_ans.get("owner_name") or "Someone", word))
 
-    # privately, to the people named, or out loud in the channel
-    dms, failed = {}, {}
-    targets = [t.strip() for t in (args.dm or "").split(",")
-               if t.strip().isdigit()]
+    word = (args.word or "").strip().upper() or secrets.token_hex(2).upper()
+    started = float(args.since or 0) or now()
+
+    def collect(since, message_id, dm_channels):
+        """(who answered, why we could not look)"""
+        found = {}
+        if message_id:
+            with contextlib.suppress(MailError):
+                for uid in dc.who_pressed(message_id, TICK):
+                    found.setdefault(uid, {"id": uid, "name": ""})
+        for cid in dm_channels:
+            with contextlib.suppress(MailError):
+                msgs = dc._call("GET", "/channels/%s/messages?limit=20&after=%d"
+                                % (cid, snowflake_at(since - 5)))
+                for m in msgs or []:
+                    a = m.get("author") or {}
+                    if not a.get("bot"):
+                        uid = str(a.get("id") or "")
+                        found.setdefault(uid, {"id": uid, "name": ""})
+        if not dm_channels:
+            try:
+                msgs = dc._call("GET", "/channels/%s/messages?limit=100&after=%d"
+                                % (dc._channel(), snowflake_at(since - 5)))
+            except MailError as exc:
+                return found, str(exc)
+            for m in msgs or []:
+                a = m.get("author") or {}
+                if a.get("bot"):
+                    continue
+                uid = str(a.get("id") or "")
+                body = m.get("content") or ""
+                # the word if we can read it, and otherwise the plain fact
+                # that they said something right after being asked
+                if not body or re.search(r"\b%s\b" % re.escape(word), body, re.I):
+                    found.setdefault(uid, {"id": uid, "name": ""})
+        return found, None
+
+    def name_them(found):
+        for uid in list(found):
+            with contextlib.suppress(MailError, KeyError, TypeError):
+                u = dc._call("GET", "/users/%s" % uid)
+                found[uid]["name"] = (u.get("global_name") or u.get("username")
+                                      or uid)
+        return found
+
+    # -- just read who has answered so far ---------------------------------
+    if args.collect:
+        dms = [c for c in (args.dm_channels or "").split(",") if c.strip()]
+        found, why = collect(started, args.message_id, dms)
+        if why and not found:
+            print(dump_json({"error": why, "members": []}))
+            return 1
+        print(dump_json({"word": word, "members": list(name_them(found).values())}))
+        return 0 if found else 1
+
+    # -- put the question up -----------------------------------------------
+    invite = ("**%s is setting up a porn blocker**\n"
+              "They have asked you to be one of the people who can let them "
+              "out of it. Tap %s if you are in."
+              % (_ans.get("owner_name") or "Someone", TICK))
+    dms, failed, message_id = {}, {}, ""
+    targets = [t.strip() for t in (args.dm or "").split(",") if t.strip().isdigit()]
     if targets:
         for uid in targets:
             try:
-                ch = dc._call("POST", "/users/@me/channels",
-                              {"recipient_id": uid})
+                ch = dc._call("POST", "/users/@me/channels", {"recipient_id": uid})
                 cid = str((ch or {}).get("id") or "")
-                dc._call("POST", "/channels/%s/messages" % cid,
-                         {"content": invite})
+                dc._call("POST", "/channels/%s/messages" % cid, {"content": invite})
                 dms[uid] = cid
             except MailError as exc:
                 failed[uid] = ("cannot send them a direct message - they "
@@ -3720,38 +3762,29 @@ def cmd_discord_checkin(args) -> int:
             return 1
     else:
         try:
-            dc.post(invite)
+            message_id = dc.post(invite)
+            if message_id:
+                with contextlib.suppress(MailError):
+                    dc._call("PUT", "/channels/%s/messages/%s/reactions/%s/@me"
+                             % (dc._channel(), message_id,
+                                urllib.parse.quote(TICK, safe="")))
         except MailError as exc:
             print(dump_json({"error": str(exc)}))
             return 1
 
+    if args.post_only:
+        print(dump_json({"word": word, "posted_at": started,
+                         "message_id": message_id,
+                         "dm_channels": ",".join(dms.values()),
+                         "failed": failed, "private": bool(dms), "members": []}))
+        return 0
+
+    # -- or hang around and watch, for anyone driving this from a terminal --
     found, deadline = {}, started + max(10, int(args.wait or 120))
     while now() < deadline and len(found) < int(args.expect or 99):
         time.sleep(3)
-        try:
-            if dms:
-                # a reply in their own DM is proof enough of who they are, so
-                # the word is a courtesy here rather than a test
-                for uid, cid in dms.items():
-                    msgs = dc._call(
-                        "GET", "/channels/%s/messages?limit=20&after=%d"
-                        % (cid, snowflake_at(started - 5)))
-                    for m in msgs or []:
-                        if not (m.get("author") or {}).get("bot"):
-                            found.setdefault(uid, {"id": uid, "name": ""})
-            else:
-                for uid, _subj, body, _mid in dc.scan({}, started - 5):
-                    if re.search(r"\b%s\b" % re.escape(word), body, re.I):
-                        found.setdefault(uid, {"id": uid, "name": ""})
-        except MailError as exc:
-            print(dump_json({"error": str(exc), "failed": failed}), flush=True)
-            return 1
-    for uid in list(found):
-        with contextlib.suppress(MailError, KeyError, TypeError):
-            u = dc._call("GET", "/users/%s" % uid)
-            found[uid]["name"] = (u.get("global_name") or u.get("username")
-                                  or uid)
-    print(dump_json({"word": word, "members": list(found.values()),
+        found, _why = collect(started, message_id, list(dms.values()))
+    print(dump_json({"word": word, "members": list(name_them(found).values()),
                      "failed": failed, "private": bool(dms)}))
     return 0 if found else 1
 
@@ -5150,6 +5183,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--dm", default="",
                    help="comma separated user ids to ask privately instead of "
                         "asking in the channel")
+    s.add_argument("--post-only", action="store_true",
+                   help="ask, then return at once - collect the answers later")
+    s.add_argument("--collect", action="store_true",
+                   help="read who has answered so far and return at once")
+    s.add_argument("--message-id", default="", help="with --collect")
+    s.add_argument("--dm-channels", default="", help="with --collect")
+    s.add_argument("--since", default="", help="with --collect: epoch seconds")
     s.set_defaults(fn=cmd_discord_checkin)
 
     s = sub.add_parser("discord-people",

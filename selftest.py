@@ -521,6 +521,15 @@ check("and a request with no message has no buttons to read",
       pb.poll_reactions(dcfg, _pending(), ButtonDiscord(dcfg),
                         {"approvals": {}}) == [])
 
+# the request that goes in the channel has to be readable on a phone
+_st_msg = _pending()
+_subj, _text, _html = pb.request_email(dfull, _st_msg)
+check("the request is three lines, not twenty",
+      len(_text.strip().splitlines()) <= 4, _text)
+check("and it says which tap does what",
+      pb.TICK in _text and pb.CROSS in _text and "Code" in _text)
+check("with no html to render on Discord", _html is None)
+
 # when the bot is deaf it should say so where the people who can fix it are
 st_blind = pb.deep_merge(pb.DEFAULT_STATE, {})
 st_blind["mode"] = "PENDING"

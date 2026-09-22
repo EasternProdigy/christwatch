@@ -200,6 +200,23 @@ def run(app):
         sv.apply_checkin({"error": "the bot token was rejected"})
         check("and an outright failure is shown as one",
               "rejected" in sv.l_checkin.get_label())
+        check("it is not listening until you ask", not sv._listening())
+        sv._checkin = {"message_id": "555", "word": "AB12", "posted_at": 1,
+                       "dm_channels": "", "failed": {}}
+        sv.start_listening()
+        check("asking starts a listener with no deadline", sv._listening()
+              and "no time limit" in sv.l_checkin.get_label())
+        check("and the button becomes the way to stop it",
+              sv.b_checkin.get_label() == "Stop listening")
+        sv.stop_listening()
+        check("stopping it stops it",
+              not sv._listening() and sv.b_checkin.get_label() == "Ask them")
+        sv.apply_checkin({"members": [{"id": "999999999999999999",
+                                       "name": "late"}]}, quiet=True)
+        check("someone turning up an hour later still counts",
+              "999999999999999999" in sv.approvers())
+        sv.discord_people = [p for p in sv.discord_people
+                             if p["id"] != "999999999999999999"]
         check("checked-in friends become the approvers",
               sv.approvers() == ["111111111111111111", "222222222222222222"])
         check("and their names are kept for the emails and the app",

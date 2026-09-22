@@ -145,12 +145,15 @@ The wizard walks it, and each step opens the page it is talking about:
    Developer Mode, no copying ids. There is a box for pasting one if you
    prefer.
 
-Then press **Ask them to check in**. It posts one message in the channel, and
-everyone who answers becomes an approver, names and all - nobody has to copy
-an 18-digit user id either. **Privately** does the same thing by direct
-message to people you pick from the channel, if you would rather the whole
-server did not watch you set this up. Anyone whose DMs are shut is named, so
-you can ask them the other way.
+Then press **Ask them to check in**. It posts one short message in the
+channel and everyone who taps the tick becomes an approver, names and all -
+nobody copies an 18-digit id, and nobody has to type anything the bot might
+not be allowed to read. **There is no time limit**: the question stays up and
+the app keeps watching, so your friends can answer tonight or tomorrow.
+
+**Privately** does the same by direct message to people you pick out of the
+channel, if you would rather the whole server did not watch you set this up.
+Anyone whose DMs are shut is named so you can ask them another way.
 
 ```bash
 # what that button runs, if you prefer a terminal

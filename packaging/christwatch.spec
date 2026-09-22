@@ -1,5 +1,5 @@
 Name:           christwatch
-Version:        1.2.0
+Version:        1.2.1
 Release:        1%{?dist}
 Summary:        Accountability-gated content blocker
 
@@ -67,6 +67,10 @@ cd %{_builddir}/%{name}-%{version} && python3 selftest.py
 %{_datadir}/%{name}/
 
 %changelog
+* Tue Sep 22 2026 William Mezitis <wmezitis@gmail.com> - 1.2.1-1
+- Checking in is a tap, and waits as long as you need.
+- Shorter messages in the channel.
+
 * Tue Sep 22 2026 William Mezitis <wmezitis@gmail.com> - 1.2.0-1
 - Approve by tapping a tick under the request.
 - Ask approvers privately by direct message.
