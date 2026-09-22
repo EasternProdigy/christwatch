@@ -32,6 +32,7 @@ import imaplib
 import io
 import json
 import os
+import pwd
 import re
 import secrets
 import shutil
@@ -49,7 +50,7 @@ import urllib.request
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 HOMEPAGE = "https://github.com/EasternProdigy/christwatch"
 PROG = "pornblock"
 
@@ -98,6 +99,8 @@ PUBLIC_STATUS = RUN_DIR + "/status.json"
 # source. World-readable; the GUI runs as you, not as root.
 SOURCE_HINT = RUN_DIR + "/source-hint.json"
 
+POLKIT_RULE = "/etc/polkit-1/rules.d/49-christwatch.rules"
+SUDOERS_DROPIN = "/etc/sudoers.d/christwatch"
 DESKTOP_PATH = "/usr/share/applications/christwatch.desktop"
 ICON_PATH = "/usr/share/icons/hicolor/scalable/apps/christwatch.svg"
 
@@ -188,6 +191,7 @@ DEFAULT_CONFIG = {
     "app_name": "ChristWatch",
     "owner_name": "",
     "owner_email": "",
+    "owner_user": "",          # the login this machine belongs to
     "approvers": [],
     # how your friends hear about it and how they answer:
     #   "email"   - SMTP out, IMAP in, approvers are addresses
@@ -3165,6 +3169,7 @@ def public_status_doc(cfg: dict, st: dict) -> dict:
         "passphrase_locked_until": float((st.get("passphrase") or {}).get("locked_until") or 0),
         "passphrase_fails": int((st.get("passphrase") or {}).get("fails") or 0),
         "recovery_enabled": bool(cfg.get("passphrase_recovery", True)),
+        "passwordless": os.path.exists(P(POLKIT_RULE)),
         "passphrase_inert": passphrase_is_inert(cfg),
         "queued_emails": len(st.get("outbox") or []),
         "armed": bool(os.path.exists(P(UNIT_SERVICE)) and
@@ -3586,6 +3591,121 @@ def _discord_from_answers(args):
     d = dict(DEFAULT_CONFIG["discord"])
     d.update(ans.get("discord") or ans or {})
     return ans, DiscordCourier({"discord": d})
+
+
+def desktop_user(cfg: dict | None = None) -> str:
+    """Whose machine this is - the person the app is for, never root."""
+    names = []
+    uid = os.environ.get("PKEXEC_UID")
+    if uid:
+        with contextlib.suppress(KeyError, ValueError):
+            names.append(pwd.getpwuid(int(uid)).pw_name)
+    names += [(cfg or {}).get("owner_user"), os.environ.get("SUDO_USER")]
+    for name in names:
+        if name and name != "root":
+            return name
+    r = run(["loginctl", "list-sessions", "--no-legend"], timeout=10)
+    for line in (r.out or "").splitlines():
+        bits = line.split()
+        if len(bits) >= 3 and bits[2] != "root":
+            return bits[2]
+    return ""
+
+
+POLKIT_TEMPLATE = """\
+// %(prog)s: let %(user)s run this program's own commands without being asked
+// for a password every time. It hands over no new power. Every command is
+// gated on its own terms: uninstall still refuses outside a granted unlock
+// window, weakening the settings still reverts and tells everyone, and the
+// passphrase is still the passphrase.
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.policykit.exec" &&
+        action.lookup("program") == "%(bin)s" &&
+        subject.user == "%(user)s") {
+        return polkit.Result.YES;
+    }
+});
+"""
+
+SUDOERS_TEMPLATE = """\
+# %(prog)s: no password for this one program, for this one person.
+# Everything it can do is gated inside the program itself.
+%(user)s ALL=(root) NOPASSWD: %(bin)s
+"""
+
+
+def cmd_no_password(args) -> int:
+    """Stop this machine asking for a password before its own commands."""
+    require_root()
+    cfg = load_config() or {}
+    user = args.user or desktop_user(cfg)
+    fields = {"prog": PROG, "user": user, "bin": BIN_PATH}
+
+    if args.off:
+        gone = []
+        for path in (POLKIT_RULE, SUDOERS_DROPIN):
+            if os.path.exists(P(path)):
+                with mutable(P(path)):
+                    os.unlink(P(path))
+                gone.append(path)
+        print(green("\n  Password prompts are back.\n") if gone
+              else yellow("\n  They were never switched off.\n"))
+        if gone and cfg:
+            st = load_state()
+            alert(cfg, st, "password_on", "Password prompts are back on",
+                  "%s put the password prompt back on ChristWatch commands "
+                  "on %s.\n" % (who(cfg), socket.gethostname()), force=True)
+            save_state(st)
+        return 0
+
+    if not user:
+        print(red("  Could not work out whose machine this is. Pass --user."))
+        return 1
+    try:
+        pwd.getpwnam(user)
+    except KeyError:
+        print(red("  There is no login called %r on this machine." % user))
+        return 1
+
+    write_managed(POLKIT_RULE, POLKIT_TEMPLATE % fields, 0o644, False,
+                  backup=False)
+
+    # sudo refuses to read a file it dislikes, so check before putting it there
+    body = SUDOERS_TEMPLATE % fields
+    os.makedirs(os.path.dirname(P(SUDOERS_DROPIN)), exist_ok=True)
+    draft = P(SUDOERS_DROPIN) + ".new"
+    with open(draft, "w", encoding="utf-8") as fh:
+        fh.write(body)
+    os.chmod(draft, 0o440)
+    verdict = run(["visudo", "-cf", draft], timeout=20)
+    if not verdict.ok and not SANDBOX:
+        os.unlink(draft)
+        print(red("  sudo would not accept that: %s"
+                  % (verdict.err or verdict.out).strip()))
+        return 1
+    os.replace(draft, P(SUDOERS_DROPIN))
+
+    if cfg:
+        cfg["owner_user"] = user
+        save_config(cfg)
+        st = load_state()
+        alert(cfg, st, "password_off",
+              "Password prompts switched off on %s" % socket.gethostname(),
+              "%s has stopped this machine asking for a password before "
+              "running ChristWatch commands.\n\n"
+              "Worth knowing, and it opens no door: uninstall still refuses "
+              "outside a granted unlock, changing the approvers or the "
+              "timings still reverts and tells you, and the passphrase is "
+              "still the passphrase. They were always root here - this only "
+              "removes the typing.\n" % who(cfg), force=True)
+        save_state(st)
+
+    print(green("\n  Done. %s is no longer asked for a password to run %s."
+                % (user, PROG)))
+    print(dim("    polkit   %s" % P(POLKIT_RULE)))
+    print(dim("    sudo     %s" % P(SUDOERS_DROPIN)))
+    print(dim("    undo     sudo %s no-password --off\n" % PROG))
+    return 0
 
 
 def cmd_check_discord(args) -> int:
@@ -4852,6 +4972,19 @@ def apply_update(cfg: dict, st: dict, dest: str, sha: str, subject: str,
     return done
 
 
+def code_fingerprint(text: str) -> str:
+    """
+    What the program is, ignoring its first line.
+
+    Packaging rewrites the shebang - rpm turns "#!/usr/bin/env python3" into
+    "#!/usr/bin/python3" - so an installed copy never matches the repository
+    byte for byte, and comparing them that way offers you an update you are
+    already running, forever.
+    """
+    body = text.split("\n", 1)[1] if text.startswith("#!") else text
+    return hashlib.sha256(body.encode("utf-8", "replace")).hexdigest()
+
+
 def check_for_update(cfg: dict, st: dict, quiet: bool = True) -> dict:
     """Fetch and evaluate, without installing. Returns the availability dict."""
     upd = st.setdefault("update", {})
@@ -4876,9 +5009,10 @@ def check_for_update(cfg: dict, st: dict, quiet: bool = True) -> dict:
                 with open(path, encoding="utf-8", errors="replace") as fh:
                     current = fh.read()
                 break
-        if candidate == current:
+        if code_fingerprint(candidate) == code_fingerprint(current):
             upd["available"] = None
             upd["last_error"] = ""
+            upd["installed_sha"] = sha      # so the next poll is one cheap line
             if not quiet:
                 print(green("  already up to date"))
             return None
@@ -5254,6 +5388,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("cancel", help="withdraw a request / end an unlock early")
     s.set_defaults(fn=cmd_cancel)
+
+    s = sub.add_parser("no-password",
+                       help="stop asking for a password for these commands")
+    s.add_argument("--user", default="", help="which login (default: yours)")
+    s.add_argument("--off", action="store_true", help="ask for it again")
+    s.set_defaults(fn=cmd_no_password)
 
     s = sub.add_parser("check-discord",
                        help="try a bot token and channel (no root, posts nothing)")

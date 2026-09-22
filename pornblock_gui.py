@@ -1848,6 +1848,7 @@ class MainWindow(Adw.ApplicationWindow):
                          ("checkupdate", self.check_update),
                          ("testmail", self.do_test_email),
                          ("activity", self.show_activity),
+                         ("nopassword", self.toggle_password),
                          ("about", self.show_about)):
             act = Gio.SimpleAction.new(name, None)
             act.connect("activate", lambda *_a, f=fn: f())
@@ -1859,6 +1860,7 @@ class MainWindow(Adw.ApplicationWindow):
         s1.append("Set the update source", "win.setsource")
         s1.append("Check for updates", "win.checkupdate")
         s1.append("Send a test email", "win.testmail")
+        s1.append("Password prompts…", "win.nopassword")
         menu.append_section(None, s1)
         s2 = Gio.Menu()
         s2.append("Today's full report", "win.fullreport")
@@ -1914,6 +1916,43 @@ class MainWindow(Adw.ApplicationWindow):
         self.refresh()
 
     # -- menu actions -----------------------------------------------------
+
+    def toggle_password(self):
+        """Ask for the password once more, to stop being asked for it."""
+        doc = read_status() or {}
+        off = bool(doc.get("passwordless"))
+        d = Adw.AlertDialog(
+            heading="Password prompts",
+            body=("This machine currently runs ChristWatch commands without "
+                  "asking you for a password. Turning that back on means one "
+                  "prompt per action again."
+                  if off else
+                  "Every action here asks for your password first. You can "
+                  "switch that off for this one program.\n\n"
+                  "It opens no door: uninstall still refuses outside a "
+                  "granted unlock, changing your approvers or the timings "
+                  "still reverts and tells everyone, and the passphrase is "
+                  "still the passphrase. You were always root on this "
+                  "machine - this only removes the typing.\n\n"
+                  "Your approvers are told either way."))
+        d.add_response("no", "Leave it")
+        d.add_response("yes", "Ask me again" if off else "Stop asking")
+        d.set_response_appearance("yes", Adw.ResponseAppearance.SUGGESTED)
+        d.set_default_response("no")
+        d.set_close_response("no")
+
+        def resp(_d, r):
+            if r != "yes":
+                return
+            argv = ["no-password"] + (["--off"] if off else [])
+            run_privileged(argv, on_done=lambda ok, out: (
+                self.toast("Password prompts are back" if off
+                           else "You will not be asked again"),
+                self.refresh()) if ok else
+                self.show_output("That did not work", out))
+
+        d.connect("response", resp)
+        d.present(self)
 
     def set_update_source(self):
         doc = read_status() or {}

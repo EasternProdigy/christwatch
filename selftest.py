@@ -405,6 +405,37 @@ check("migrating twice changes nothing the second time",
       pb.migrate_config(pb.migrate_config(dict(OLD_CONFIG)))["version"]
       == pb.CONFIG_SCHEMA)
 
+print("\n== not being asked for a password ==")
+_fields = {"prog": "pornblock", "user": "someone",
+           "bin": "/usr/local/bin/pornblock"}
+_rule = pb.POLKIT_TEMPLATE % _fields
+check("the polkit rule is for one program and one person",
+      'action.lookup("program") == "/usr/local/bin/pornblock"' in _rule
+      and 'subject.user == "someone"' in _rule)
+check("and it only ever answers yes, never widens anything else",
+      "polkit.Result.YES" in _rule and "AUTH_ADMIN" not in _rule)
+_sudo = pb.SUDOERS_TEMPLATE % _fields
+check("the sudo rule names the program, never a wildcard",
+      _sudo.strip().endswith(": /usr/local/bin/pornblock")
+      and "ALL=(root)" in _sudo and "*" not in _sudo)
+check("and neither file is where the gates live",
+      "uninstall" not in _sudo and "approvals_required" not in _rule)
+check("root is never the answer to whose machine this is",
+      pb.desktop_user({"owner_user": "root"}) != "root")
+check("but a recorded owner is",
+      pb.desktop_user({"owner_user": "bill"}) == "bill")
+
+print("\n== knowing what is already installed ==")
+_body = "import os\nprint('hello')\n"
+check("the shebang is not part of what the program is",
+      pb.code_fingerprint("#!/usr/bin/env python3\n" + _body)
+      == pb.code_fingerprint("#!/usr/bin/python3\n" + _body))
+check("a file with no shebang at all still hashes",
+      pb.code_fingerprint(_body) == pb.code_fingerprint("#!/x\n" + _body))
+check("but a real change is a real change",
+      pb.code_fingerprint("#!/x\n" + _body)
+      != pb.code_fingerprint("#!/x\n" + _body + "print('and one more thing')\n"))
+
 print("\n== an update may not cost you your setup ==")
 _now = {"configured": True, "mode": "LOCKED", "transport": "discord",
         "approvers": ["111", "222"], "approvals_required": 2,
