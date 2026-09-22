@@ -271,6 +271,7 @@ sudo pornblock cancel           # always allowed, always the right answer
 sudo pornblock test-email       # re-verify the mail path
 sudo pornblock enforce          # force one enforcement pass now
 sudo pornblock phone            # what your phones are doing
+sudo pornblock harden           # what makes taking this off hard
 ```
 
 ### How the desktop app is wired
@@ -324,6 +325,79 @@ type can satisfy it - unanimity becomes the only route. That is deliberate.
 > it is not really a third gate. `status` says so, and the wizard warns you
 > while it is still one click to change. Three approvers with a quorum of
 > two, or `passphrase_recovery: false`, gives you the third gate back.
+
+---
+
+## Making it hard to take off
+
+You are root. Nothing here stops you, and this program will not pretend
+otherwise. What `harden` does is close the *quiet* routes, so that every way
+out is slow, loud, and something you have to mean.
+
+```bash
+sudo pornblock harden --on     # the extra nets
+sudo pornblock harden          # what is in place, and what each layer costs
+sudo pornblock harden --grub   # the last one; your friend types the password
+sudo pornblock harden --off    # said out loud to your approvers
+```
+
+### The nets, and what each one is worth
+
+| Layer | Closes | Costs you |
+|---|---|---|
+| The two systemd units | Stopping one of them | Stop the other too |
+| **cron, every minute** | Stopping **both** units, or deleting the program | Delete `/etc/cron.d/christwatch` as well - and until you do, it is back within a minute and your friends have been told |
+| **The terminal warning** | Forgetting you turned it off | Nothing. It is a line in `/etc/profile.d` |
+| **Boot menu password** | Editing the boot line into a root shell with none of this running | A friend holds it |
+
+The cron line is the important one. Before it, `systemctl disable --now
+pornblock.service pornblock-watchdog.timer` left nothing running and said
+nothing to anybody. Measured on a real machine after `--on`:
+
+```
+16:21:04  both units stopped, nothing of ChristWatch running
+16:22:01  cron re-enabled and restarted them
+16:22:05  "Blocker was stopped - watchdog restarted it" posted to the channel
+```
+
+Sixty-one seconds, and a message your friends can see.
+
+If the program itself is deleted, the same cron line falls back to the copy
+the installer kept at `/var/lib/pornblock/pornblock.py.installed`, which puts
+the binary back.
+
+### The boot menu is the only genuinely silent way out
+
+Editing the kernel line at the GRUB menu (`init=/bin/bash`) gives you a root
+shell with no daemon, no cron and no network - so nothing is re-applied and
+nothing is said. `harden --grub` closes it by putting a password on editing
+boot entries. Booting normally is unaffected: Fedora marks the existing
+entries `--unrestricted`, so nobody is asked for it just to start the
+machine.
+
+Once it is set, the daemon watches it. Changing or removing that password is
+reported to your approvers like any other tamper.
+
+### What it still does not do
+
+Everything above assumes something of this is running when you act. It is
+defence in depth against a tired person at 2am, not against a determined one
+with an afternoon. With root and a clear head you can stop cron, delete the
+cron file, remove the units, drop the immutable flags and unpick each
+blocking layer by hand. That takes maybe ten deliberate minutes, and
+depending on the order, some of it gets reported before you finish.
+
+That is the honest ceiling of this design, and raising it further means
+giving up root - see the note below.
+
+### If you ever do want the real thing
+
+The only way this genuinely stops you is if you are not root: your account
+out of `wheel`, the root password and the boot menu password held by a
+friend, and firmware locked against USB boot. Then the ceiling becomes
+"open the laptop and clear the CMOS", which is hours of deliberate work.
+The cost is that you cannot install a package or debug a service without a
+phone call, which is why it is not the default.
 
 ---
 
@@ -660,6 +734,13 @@ well-known public resolvers - but any app that hardcodes an obscure DoH
 endpoint, or any DoH server not on that list, gets through. Closing this
 properly needs allowlist-style egress filtering, which would break ordinary
 use of the machine.
+
+**The extra nets do not stop a root user either.**  `harden` closes the
+quiet routes - stopping both systemd units at once, deleting the program,
+editing the boot line - but everything it adds is a file that root can
+delete. The point is that deleting each one is a separate deliberate act,
+and that until you have done all of them, the blocker comes back within a
+minute and says so. It buys you friction and witnesses, not immunity.
 
 **Your phone is watched, not held.**  The Android app cannot stop you
 changing the setting and it cannot stop you uninstalling it - no app can,

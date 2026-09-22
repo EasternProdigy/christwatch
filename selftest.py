@@ -9,6 +9,7 @@ import datetime as dt
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 
@@ -1306,8 +1307,100 @@ check("an update that lost a phone would be refused",
       "phones" in pb.arrangement_diff(pb.arrangement(DOC), pb.arrangement(LOST)))
 
 
+print("\n== the extra nets ==")
+
+HCFG = pb.deep_merge(base_cfg(), {"harden": {"enabled": True}})
+HST = pb.deep_merge(pb.DEFAULT_STATE, {})
+
+# nothing should appear on a machine that never asked for it
+pb.remove_harden()
+OFFCFG = pb.deep_merge(base_cfg(), {"harden": {"enabled": False}})
+pb.guard_harden(OFFCFG, HST)
+check("nothing is installed until you ask for it",
+      not os.path.exists(pb.P(pb.CRON_PATH))
+      and not os.path.exists(pb.P(pb.SHELL_NAG_PATH)))
+
+pb.guard_harden(HCFG, HST)
+check("asking for it installs both nets",
+      os.path.exists(pb.P(pb.CRON_PATH))
+      and os.path.exists(pb.P(pb.SHELL_NAG_PATH)))
+check("and doing it twice changes nothing",
+      pb.guard_harden(HCFG, HST) == [])
+
+CRON = open(pb.P(pb.CRON_PATH), encoding="utf-8").read()
+check("cron runs the watchdog every minute",
+      CRON.splitlines()[-1].startswith("* * * * * root"))
+check("cron runs it as root", " root " in CRON.splitlines()[-1])
+check("cron sends nobody mail", 'MAILTO=""' in CRON)
+check("cron falls back to the kept copy if the program was deleted",
+      pb.SELF_COPY in CRON and "||" in CRON)
+check("cron is a net the systemd units cannot take with them",
+      "systemd" in CRON.lower())
+
+NAG = open(pb.P(pb.SHELL_NAG_PATH), encoding="utf-8").read()
+check("the terminal warning is valid sh",
+      subprocess.run(["sh", "-n", pb.P(pb.SHELL_NAG_PATH)]).returncode == 0)
+check("it stays quiet when there is no terminal", "[ -t 1 ]" in NAG)
+check("it only speaks up when the blocker is not running",
+      "is-active --quiet pornblock.service" in NAG and "! systemctl" in NAG)
+
+# putting the nets back is the whole point
+os.unlink(pb.P(pb.CRON_PATH))
+FIXED = pb.guard_harden(HCFG, HST)
+check("deleting the cron net puts it straight back",
+      os.path.exists(pb.P(pb.CRON_PATH))
+      and any("cron.d" in f for f in FIXED))
+
+# it must be honest about what it is
+ROWS = dict((n, (ok, d)) for n, ok, d in pb.harden_rows(HCFG, HST))
+check("the two systemd units are counted as one layer",
+      "systemd pair" in ROWS)
+check("an unset boot password is reported as the hole it is",
+      ROWS["boot menu password"][0] is False
+      and "root shell" in ROWS["boot menu password"][1])
+
+check("an unset boot password never shows up as a broken layer",
+      not any(n == "boot menu password"
+              for n, _o, _d in pb.harden_rows(HCFG, HST, advice=False)))
+check("but the harden command still says it out loud",
+      any(n == "boot menu password"
+          for n, _o, _d in pb.harden_rows(HCFG, HST)))
+
+# the boot menu is the one silent way out, so changes to it are said
+GST = pb.deep_merge(pb.DEFAULT_STATE, {})
+check("the first look just records what is there",
+      pb.watch_grub(HCFG, GST) == [] and "grub_fingerprint" in GST)
+GST["grub_fingerprint"] = "something-else-entirely"
+_real_gc = pb.courier
+GSPY = FakeDiscord(pb.deep_merge(HCFG, {"transport": "discord",
+                                        "discord": {"channel_id": "1",
+                                                    "bot_token": "t"}}))
+pb.courier = lambda _cfg: GSPY
+MOVED = pb.watch_grub(HCFG, GST)
+pb.courier = _real_gc
+check("changing the boot menu password is not quiet",
+      MOVED and any("boot menu" in str(b) for _p, b in GSPY.sent))
+
+# an update must not be able to drop the nets
+HDOC = pb.public_status_doc(HCFG, HST)
+check("the nets are part of your setup, not of the program",
+      HDOC["hardened"] is True)
+LOSTH = dict(HDOC)
+LOSTH["hardened"] = False
+check("an update that switched them off would be refused",
+      "hardened" in pb.arrangement_diff(pb.arrangement(HDOC),
+                                        pb.arrangement(LOSTH)))
+
+# and it must never claim to be more than it is
+SRC = open(os.path.join(HERE, "pornblock.py"), encoding="utf-8").read()
+HSEC = SRC[SRC.index("# Extra nets"):SRC.index("def guard_units")]
+check("the code says plainly that none of this stops a root user",
+      "You are root" in HSEC and "cannot" in HSEC)
+
+pb.remove_harden()
+
+
 print("\n== packaging (skipped when not shipped in the tarball) ==")
-import subprocess  # noqa: E402
 
 def _present(name):
     return os.path.exists(os.path.join(HERE, name))

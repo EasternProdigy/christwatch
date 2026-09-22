@@ -53,7 +53,7 @@ import urllib.request
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-VERSION = "1.6.1"
+VERSION = "1.7.0"
 HOMEPAGE = "https://github.com/EasternProdigy/christwatch"
 PROG = "pornblock"
 
@@ -225,6 +225,13 @@ DEFAULT_CONFIG = {
         # id -> {"name", "kind": android|ios, "added"}
         "devices": {},
     },
+    # Extra nets. You are root, so none of this stops you - it makes the
+    # ways out slow and loud instead. Off until asked for: nobody should
+    # find cron entries on their machine they did not ask for.
+    "harden": {
+        "enabled": False,
+        "watch_grub": True,
+    },
     "approvals_required": 2,
     "cooloff_hours": 24.0,
     "unlock_minutes": 60,
@@ -330,6 +337,7 @@ DEFAULT_STATE = {
     # id -> {"last_seen", "state", "dns", "profile", "silent"}
     "phones": {},
     "phone_cursor": 0,
+    "grub_fingerprint": None,
     "enforced_once": False,
     "history": [],
 }
@@ -3051,6 +3059,219 @@ def protect_binary(cfg: dict, st: dict) -> list:
             % BIN_PATH if cur is not None else "binary: %s reinstalled" % BIN_PATH]
 
 
+# ==========================================================================
+# Extra nets
+# ==========================================================================
+#
+# You are root. Nothing below stops you - it cannot, and pretending
+# otherwise would be the one thing this program must never do.
+#
+# What it does is make every route out of here slow, loud, and impossible
+# to take while half asleep. The two systemd units guard each other, so
+# stopping one puts it back. Stopping BOTH at once used to leave nothing
+# running and nothing said, and that was the quiet path. These close it:
+#
+#   cron        a different subsystem entirely. It does not care that the
+#               units are off, and within a minute it has put them back and
+#               told your friends. If the program itself was deleted, it
+#               falls back to the copy the installer kept.
+#   your shell  every terminal you open says so while the blocker is off.
+#               Not a lock. But a thing you can see beats a thing you forgot.
+#
+# Each of these is one more deliberate act to undo, done knowingly, in
+# daylight - which is the whole design.
+
+CRON_PATH = "/etc/cron.d/christwatch"
+SHELL_NAG_PATH = "/etc/profile.d/christwatch.sh"
+
+
+def cron_body() -> str:
+    return (
+        "# ChristWatch: the net that is not systemd.\n"
+        "#\n"
+        "# Turning off both systemd units at once leaves nothing running and\n"
+        "# nothing said. cron is a separate subsystem and does not care: within\n"
+        "# a minute this has put them back and your approvers know.\n"
+        "#\n"
+        "# The second half is for the case where the program itself was\n"
+        "# deleted - it runs the copy kept at install time, which restores it.\n"
+        "#\n"
+        "# Deleting this file is another deliberate step, and the daemon\n"
+        "# writes it again the moment it is running.\n"
+        "SHELL=/bin/sh\n"
+        "PATH=/usr/sbin:/usr/bin:/sbin:/bin\n"
+        "MAILTO=\"\"\n"
+        "* * * * * root %s watchdog >/dev/null 2>&1 || "
+        "/usr/bin/python3 %s watchdog >/dev/null 2>&1\n"
+        % (BIN_PATH, SELF_COPY))
+
+
+def shell_nag_body() -> str:
+    return (
+        "# ChristWatch: say so, in every terminal, while the blocker is off.\n"
+        "#\n"
+        "# This is not a lock and does not pretend to be one. It is here\n"
+        "# because a thing you can see beats a thing you have forgotten, and\n"
+        "# a shell prompt is the cheapest place to put it.\n"
+        "if [ -t 1 ] && ! systemctl is-active --quiet pornblock.service "
+        "2>/dev/null; then\n"
+        "    printf '\\n\\033[31;1m  ChristWatch is not running.\\033[0m\\n'\n"
+        "    printf '  It puts itself back within a minute, and your friends "
+        "are told.\\n\\n'\n"
+        "fi\n")
+
+
+HARDEN_FILES = (
+    (lambda: CRON_PATH, cron_body, 0o644),
+    (lambda: SHELL_NAG_PATH, shell_nag_body, 0o644),
+)
+
+
+def harden_installed() -> bool:
+    return all(os.path.exists(P(path())) for path, _b, _m in HARDEN_FILES)
+
+
+def write_harden() -> list:
+    """Put the extra nets back. Idempotent; returns what it had to fix."""
+    out = []
+    for path, body, mode in HARDEN_FILES:
+        what = write_managed(path(), body(), mode=mode, immutable=True,
+                             backup=False)
+        if what != "unchanged":
+            out.append("%s: %s" % (path(), what))
+    # cron is only a net while cron is running
+    if not SANDBOX:
+        if systemctl("is-enabled", "crond.service").out.strip() != "enabled":
+            systemctl("enable", "crond.service")
+            out.append("cron was disabled; re-enabled")
+        if systemctl("is-active", "crond.service").out.strip() != "active":
+            systemctl("start", "crond.service")
+            out.append("cron was not running; started")
+    return out
+
+
+def remove_harden() -> list:
+    gone = []
+    for path, _body, _mode in HARDEN_FILES:
+        if os.path.exists(P(path())):
+            remove_managed(path())
+            gone.append(path())
+    return gone
+
+
+def guard_harden(cfg: dict, st: dict) -> list:
+    """
+    Keep the extra nets in place, every tick.
+
+    Only when they were asked for. Someone who never turned this on should
+    not find cron entries they did not ask for appearing on their machine.
+    """
+    if st.get("uninstalling"):
+        return []
+    if not (cfg.get("harden") or {}).get("enabled", False):
+        return []
+    # No SANDBOX guard here on purpose: every path this writes goes through
+    # P(), so a sandbox gets its own copies and the behaviour can actually
+    # be tested. write_harden() is the one that leaves systemd alone.
+    return write_harden()
+
+
+# --------------------------------------------------------------------------
+# The boot menu: the one genuinely quiet way out
+# --------------------------------------------------------------------------
+
+GRUB_USER_CFG = "/boot/grub2/user.cfg"
+
+
+def grub_locked() -> bool:
+    try:
+        with open(P(GRUB_USER_CFG), encoding="utf-8", errors="replace") as fh:
+            return "password_pbkdf2" in fh.read()
+    except OSError:
+        return False
+
+
+def grub_fingerprint() -> str:
+    try:
+        with open(P(GRUB_USER_CFG), "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()[:16]
+    except OSError:
+        return ""
+
+
+def watch_grub(cfg: dict, st: dict) -> list:
+    """
+    Notice the boot menu's password being changed or taken off.
+
+    Editing the kernel line at boot gives a root shell with nothing of this
+    running - no daemon, no cron, no alert. It is the only way out of here
+    that is genuinely silent, which is exactly why its lock is watched.
+    """
+    # Reads through P(), so a sandbox watches its own copy and this can be
+    # tested rather than taken on trust.
+    if not (cfg.get("harden") or {}).get("watch_grub", True):
+        return []
+    have = grub_fingerprint()
+    seen = st.get("grub_fingerprint")
+    if seen is None:
+        st["grub_fingerprint"] = have
+        return []
+    if have == seen:
+        return []
+    st["grub_fingerprint"] = have
+    if not have:
+        what = "The boot menu password was removed."
+    elif not seen:
+        what = "A boot menu password was set."
+    else:
+        what = "The boot menu password was changed."
+    alert(cfg, st, "grub_changed", "The boot menu password changed",
+          "%s on %s.\n\n"
+          "That password is what stops someone editing the boot line and "
+          "getting a root shell with none of this running - the one way out "
+          "of here that makes no noise. If %s did not do this deliberately, "
+          "ask why.\n"
+          % (what, socket.gethostname(),
+             cfg.get("owner_name") or "they"), force=True)
+    return ["boot menu password changed"]
+
+
+
+# The boot menu password is a step you have not taken yet, not a thing that
+# broke. Health rows drive the "something was tampered with" banner, and a
+# row that can never go green until you act would leave that banner up for
+# good - which is how people learn to ignore banners.
+ADVICE_ROWS = ("boot menu password",)
+
+
+def harden_rows(cfg: dict, st: dict, advice: bool = True) -> list:
+    """(name, ok, detail) for each extra net."""
+    on = bool((cfg.get("harden") or {}).get("enabled", False))
+    rows = [("systemd pair", True,
+             "the daemon and the watchdog put each other back")]
+    if not SANDBOX:
+        cron_ok = (os.path.exists(P(CRON_PATH))
+                   and systemctl("is-active", "crond.service").out.strip()
+                   == "active")
+    else:
+        cron_ok = os.path.exists(P(CRON_PATH))
+    rows.append(("cron re-armer", cron_ok if on else False,
+                 "every minute, and it survives both units being stopped"
+                 if cron_ok else
+                 ("not installed - run: %s harden --on" % PROG)))
+    nag = os.path.exists(P(SHELL_NAG_PATH))
+    rows.append(("terminal warning", nag if on else False,
+                 "every shell says so while it is off" if nag
+                 else "not installed"))
+    rows.append(("boot menu password", grub_locked(),
+                 "set - the boot line cannot be edited" if grub_locked()
+                 else ("NOT set: editing the boot line gives a root shell "
+                       "with none of this running")))
+    if not advice:
+        rows = [r for r in rows if r[0] not in ADVICE_ROWS or r[1]]
+    return rows
+
+
 def guard_units(cfg: dict, st: dict) -> list:
     """Daemon side of the mutual guard: keep the watchdog timer alive."""
     if SANDBOX or st.get("uninstalling"):
@@ -3066,6 +3287,7 @@ def guard_units(cfg: dict, st: dict) -> list:
     if systemctl("is-active", "pornblock-watchdog.timer").out.strip() != "active":
         systemctl("start", "pornblock-watchdog.timer")
         fixed.append("watchdog timer was not running; started")
+    fixed += guard_harden(cfg, st)
     fixed += protect_binary(cfg, st)
     if fixed:
         body = ("pornblock's own watchdog had to be repaired on %s:\n\n%s\n\n"
@@ -3873,6 +4095,8 @@ def public_status_doc(cfg: dict, st: dict) -> dict:
         "phones": sorted("%s:%s" % (m.get("kind") or "android",
                                     m.get("name") or d)
                          for d, m in phone_devices(cfg).items()),
+        # an update is not allowed to quietly drop the extra nets either
+        "hardened": bool((cfg.get("harden") or {}).get("enabled", False)),
         "approvals_required": int(cfg.get("approvals_required") or 1),
         "cooloff_hours": float(cfg.get("cooloff_hours") or 24),
         "unlock_minutes": int(cfg.get("unlock_minutes") or 60),
@@ -4029,6 +4253,9 @@ def health(cfg: dict, st: dict) -> list:
         add("watchdog timer", tact == "active", "%s / %s" % (tact or "?", tena or "?"))
     for name, kind, pok, detail in phone_table(cfg, st):
         add("phone: " + name, pok, detail)
+    if (cfg.get("harden") or {}).get("enabled", False):
+        for name, hok, detail in harden_rows(cfg, st, advice=False):
+            add("net: " + name, hok, detail)
     return rows
 
 
@@ -4569,6 +4796,96 @@ def cmd_phone(args) -> int:
     print("")
     print(dim("  Should be on:  %s" % FILTERS[cfg["filter"]]["dot_name"]))
     print("")
+    return 0
+
+
+def cmd_harden(args) -> int:
+    require_root()
+    cfg = load_config()
+    if not cfg:
+        print(red("Not configured."))
+        return 1
+    st = load_state()
+    cfg.setdefault("harden", {})
+
+    if args.grub:
+        if SANDBOX:
+            print(red("not in a sandbox."))
+            return 1
+        if not shutil.which("grub2-setpassword"):
+            print(red("\n  grub2-setpassword is not on this machine.\n"))
+            return 1
+        print("")
+        print(bold("  Hand the laptop to your friend."))
+        print("")
+        print("  They pick a password. After this, editing the boot line "
+              "needs it,")
+        print("  which closes the only way out of here that makes no noise.")
+        print("")
+        print(dim("  Booting normally is unaffected - Fedora marks the "
+                  "existing entries"))
+        print(dim("  unrestricted, so nobody is asked for this just to start "
+                  "the machine."))
+        print("")
+        rc = subprocess.call(["grub2-setpassword"])
+        if rc != 0:
+            print(red("\n  grub2-setpassword exited %d; nothing changed.\n" % rc))
+            return 1
+        st["grub_fingerprint"] = grub_fingerprint()
+        save_state(st)
+        print(green("\n  Set. The daemon now watches it and will say so if "
+                    "it changes.\n"))
+        alert(cfg, st, "grub_set", "A boot menu password was set",
+              "%s set a password on the boot menu of %s, with someone "
+              "holding it.\n\nEditing the boot line was the last way to take "
+              "this apart without anything being said. It is closed.\n"
+              % (who(cfg), socket.gethostname()), force=True)
+        save_state(st)
+        return 0
+
+    if args.off:
+        gone = remove_harden()
+        cfg["harden"]["enabled"] = False
+        save_config(cfg)
+        alert(cfg, st, "harden_off", "The extra nets were removed",
+              "%s removed the extra nets from %s:\n\n%s\n\n"
+              "The two systemd units still guard each other, but stopping "
+              "both at once is quiet again.\n"
+              % (who(cfg), socket.gethostname(),
+                 "\n".join("  - " + g for g in gone) or "  - (none present)"),
+              force=True)
+        save_state(st)
+        print(yellow("\n  Removed: %s\n" % (", ".join(gone) or "nothing was there")))
+        return 0
+
+    if args.on:
+        cfg["harden"]["enabled"] = True
+        save_config(cfg)
+        done = write_harden()
+        save_state(st)
+        print(green("\n  On.") if done else green("\n  Already on."))
+        for d in done:
+            print("    " + d)
+        print("")
+
+    rows = harden_rows(cfg, st)
+    if args.json:
+        print(dump_json({"enabled": bool(cfg["harden"].get("enabled")),
+                         "layers": [{"name": n, "ok": o, "detail": d}
+                                    for n, o, d in rows]}))
+        return 0
+
+    print("")
+    for name, ok, detail in rows:
+        print("  %s %-20s %s" % (green("[ ok ]") if ok else yellow("[ -- ]"),
+                                 name, detail))
+    print("")
+    if not grub_locked():
+        print(dim("  Close the last quiet one:  %s harden --grub" % PROG))
+        print("")
+    print(dim("  None of this stops you. You are root, and this program will"))
+    print(dim("  not pretend otherwise. It makes every way out slow, loud,"))
+    print(dim("  and something you have to mean.\n"))
     return 0
 
 
@@ -5491,6 +5808,7 @@ def cmd_uninstall(args) -> int:
         remove_managed(path)
     systemctl("daemon-reload")
 
+    remove_harden()
     for path in (RESOLVED_DROPIN, NM_DROPIN, FIREFOX_POLICY, CHROMIUM_POLICY,
                  CHROME_POLICY, NFT_CONF_PATH, RECORD_PATH, CONFIG_PATH,
                  SECRETS_PATH, SELF_COPY, GUI_SELF_COPY, BIN_PATH,
@@ -5538,6 +5856,7 @@ def tick(cfg_override=None) -> dict:
 
     moves = advance(cfg, st, post)
     moves += poll_phones(cfg, st, post)
+    moves += watch_grub(cfg, st)
     apply = st.get("mode") != "UNLOCKED"
     quiet = bool(moves) or bool(notes) or bl == "refreshed" or not st.get("enforced_once")
     changes = enforce_all(cfg, st, apply, quiet=quiet)
@@ -5604,6 +5923,7 @@ def cmd_watchdog(args) -> int:
         if systemctl("is-active", "pornblock.service").out.strip() != "active":
             systemctl("restart", "pornblock.service")
             fixed.append("service was not running; restarted")
+        fixed += guard_harden(cfg, st)
         fixed += protect_binary(cfg, st)
 
     if fixed:
@@ -5785,7 +6105,7 @@ def current_source_sha() -> str:
 ARRANGEMENT_KEYS = ("configured", "mode", "transport", "approvers",
                     "approvals_required", "cooloff_hours", "unlock_minutes",
                     "channel_id", "passphrase_set", "filter", "armed",
-                    "phones")
+                    "phones", "hardened")
 
 
 def arrangement(doc: dict) -> dict:
@@ -6357,6 +6677,16 @@ def build_parser() -> argparse.ArgumentParser:
                         "stdin instead of asking")
     s.add_argument("--json", action="store_true", help="machine-readable")
     s.set_defaults(fn=cmd_phone)
+
+    s = sub.add_parser("harden",
+                       help="make taking this off slow and loud")
+    s.add_argument("--on", action="store_true", help="install the extra nets")
+    s.add_argument("--off", action="store_true",
+                   help="remove them (said out loud to your approvers)")
+    s.add_argument("--grub", action="store_true",
+                   help="have a friend set the boot menu password")
+    s.add_argument("--json", action="store_true", help="machine-readable")
+    s.set_defaults(fn=cmd_harden)
 
     s = sub.add_parser("no-password",
                        help="stop asking for a password for these commands")
