@@ -609,6 +609,18 @@ generalises; `/etc/hosts` is belt-and-braces.
 
 **Search engines other than Google/Bing** are not SafeSearch-pinned.
 
+**DNSSEC validation is off, deliberately.** A filtering resolver answers some
+questions differently on purpose - `google.com` points at forcesafesearch,
+blocked domains point at nowhere - and those answers are not the ones the
+zone signed. Validating them on this machine rejects them as forged and the
+machine loses DNS entirely, which is exactly the bug that shipped in 1.4.0.
+What protects a lookup here is the TLS connection to a resolver whose
+certificate is checked, and that stays on. The same reason is why every
+server is pinned as `1.1.1.3#family.cloudflare-dns.com` rather than a bare
+address, on links as well as globally: with a bare address, systemd-resolved
+checks the certificate against the address, and Cloudflare's certificate does
+not list the family ones.
+
 **Your approvers are human.**  If they rubber-stamp everything, you have a
 24-hour delay and nothing else. Pick people who will actually ask why.
 

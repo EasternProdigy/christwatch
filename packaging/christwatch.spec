@@ -1,5 +1,5 @@
 Name:           christwatch
-Version:        1.4.0
+Version:        1.4.1
 Release:        1%{?dist}
 Summary:        Accountability-gated content blocker
 
@@ -67,6 +67,9 @@ cd %{_builddir}/%{name}-%{version} && python3 selftest.py
 %{_datadir}/%{name}/
 
 %changelog
+* Tue Sep 22 2026 William Mezitis <wmezitis@gmail.com> - 1.4.1-1
+- Fix DNS breaking system-wide: pin links with the TLS name, DNSSEC off.
+
 * Tue Sep 22 2026 William Mezitis <wmezitis@gmail.com> - 1.4.0-1
 - Optional: stop asking for a password for this program's commands.
 - Stop offering an update you already have.

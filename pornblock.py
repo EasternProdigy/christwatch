@@ -50,7 +50,7 @@ import urllib.request
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 HOMEPAGE = "https://github.com/EasternProdigy/christwatch"
 PROG = "pornblock"
 
@@ -1590,7 +1590,13 @@ def resolved_dropin(cfg: dict) -> str:
         "FallbackDNS=\n"
         "Domains=~.\n"
         "DNSOverTLS=yes\n"
-        "DNSSEC=allow-downgrade\n"
+        # A filtering resolver answers some questions differently on purpose:
+        # it points google.com at forcesafesearch and blocked domains at
+        # nowhere. Those answers are, by definition, not the ones the zone
+        # signed, so validating them here rejects them as forged and the
+        # machine loses DNS. What protects the lookup is the TLS connection
+        # to a resolver whose certificate we check, which stays on.
+        "DNSSEC=no\n"
         "DNSStubListener=yes\n"
         "Cache=yes\n" % servers)
 
@@ -1659,10 +1665,17 @@ def enforce_link_dns(cfg: dict, apply: bool) -> list:
         return []
     changes = []
     f = FILTERS[cfg["filter"]]
+    # With DNS-over-TLS on, a bare address makes resolved check the
+    # certificate against the address itself, and the certificate for
+    # 1.1.1.3 does not list it. The handshake fails, per-link servers beat
+    # the global ones, and the machine loses DNS entirely. Pin the links the
+    # same way the drop-in does: address plus the name on the certificate.
+    servers = ["%s#%s" % (ip, f["dot_name"]) if f.get("dot_name") else ip
+               for ip in f["ipv4"] + f["ipv6"]]
     if apply:
         bad = _links_with_foreign_dns(cfg)
         for iface in bad:
-            run(["resolvectl", "dns", iface] + f["ipv4"] + f["ipv6"], timeout=20)
+            run(["resolvectl", "dns", iface] + servers, timeout=20)
             run(["resolvectl", "domain", iface, "~."], timeout=20)
             changes.append("link %s was using another resolver; pinned to the "
                            "filter" % iface)

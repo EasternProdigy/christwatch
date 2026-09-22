@@ -464,6 +464,18 @@ check("the order approvers are listed in does not count as a change",
 pb.save_config(cfg)
 pb.save_record(pb.record_from_config(cfg))
 
+print("\n== the resolver has to actually resolve ==")
+_drop = pb.resolved_dropin(base_cfg())
+_f = pb.FILTERS["cloudflare_family"]
+check("every server carries the name on its certificate",
+      all("%s#%s" % (ip, _f["dot_name"]) in _drop
+          for ip in _f["ipv4"] + _f["ipv6"]))
+check("DNS-over-TLS is on", "DNSOverTLS=yes" in _drop)
+check("and DNSSEC is off, because the filter rewrites answers on purpose",
+      "DNSSEC=no" in _drop and "allow-downgrade" not in _drop)
+check("nothing falls back past the filter",
+      "FallbackDNS=\n" in _drop and "Domains=~." in _drop)
+
 print("\n== reading resolvectl ==")
 check("a DNS-over-TLS server is still that address",
       pb.bare_ip("1.1.1.3#family.cloudflare-dns.com") == "1.1.1.3")
