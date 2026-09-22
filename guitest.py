@@ -9,6 +9,7 @@ Kept out of selftest.py on purpose: that one has to stay display-free because
 the updater runs it to vet a candidate version.
 """
 
+import json
 import os
 import re
 import sys
@@ -163,6 +164,16 @@ def run(app):
                          "server": "the lads"}]
         sv.c_channel.set_model(Gtk.StringList.new(["the lads  \u2022  #general"]))
         sv.c_channel.set_selected(0)
+        pretty = json.dumps({"channels": [
+            {"id": "1467054089291563226", "name": "general",
+             "server": "the lads", "position": 0}]}, indent=2)
+        check("a pretty-printed reply is read, not just its last line",
+              (G.read_json_output(pretty) or {}).get("channels"))
+        check("noise before the json does not break it",
+              G.read_json_output("warning: something\n" + pretty) is not None)
+        check("and nonsense comes back as nothing, not a crash",
+              G.read_json_output("not json at all") is None
+              and G.read_json_output("") is None)
         check("picking one from the list wins over the box",
               sv.channel_id() == "888888888888888888")
         sv._channels = []

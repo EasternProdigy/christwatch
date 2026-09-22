@@ -156,6 +156,24 @@ def core_argv():
     return ["pornblock"]
 
 
+def read_json_output(out):
+    """
+    First JSON object in a command's output, whatever else it printed.
+
+    The helper pretty-prints, so its replies are many lines long - reading
+    just the last one gets you a lonely closing brace.
+    """
+    text = (out or "").strip()
+    start = text.find("{")
+    if start < 0:
+        return None
+    try:
+        value, _end = json.JSONDecoder().raw_decode(text[start:])
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
 def open_url(uri, parent=None):
     if not uri:
         return
@@ -479,10 +497,8 @@ class SetupView(Gtk.Box):
         def done(ok, out):
             self.b_checkin.set_sensitive(True)
             self.b_checkin.set_label("Ask them")
-            try:
-                res = json.loads((out or "").strip().splitlines()[-1])
-            except (ValueError, IndexError):
-                res = {"error": (out or "").strip() or "nothing came back"}
+            res = read_json_output(out) or {
+                "error": (out or "").strip() or "nothing came back"}
             if res.get("error"):
                 self.l_checkin.add_css_class("error")
                 self.l_checkin.set_label(res["error"])
@@ -714,10 +730,8 @@ class SetupView(Gtk.Box):
         def done(ok, out):
             self.b_find.set_sensitive(True)
             self.b_find.set_label("Find channels")
-            try:
-                res = json.loads((out or "").strip().splitlines()[-1])
-            except (ValueError, IndexError):
-                res = {"error": (out or "").strip() or "nothing came back"}
+            res = read_json_output(out) or {
+                "error": (out or "").strip() or "nothing came back"}
             chans = res.get("channels") or []
             self._channels = chans
             if not chans:
