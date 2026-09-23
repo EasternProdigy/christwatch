@@ -54,6 +54,11 @@ What it *is*:
 * **Witnesses.** Every request, approval, denial, grant, re-lock, wrong
   passphrase, tamper event and uninstall attempt emails all of your approvers.
   The cost of bypassing isn't technical, it's having to explain yourself.
+  Routine repairs - the wifi reconnecting and handing out its own DNS, a
+  lock flag the blocker's own update left off - are fixed and logged but not
+  posted, and news that needs nobody to act (an update, a cancelled request)
+  is posted without pinging anyone. What does ping your friends is worth
+  reading.
 * **One thing you genuinely cannot do alone.** The partner passphrase is
   stored only as a PBKDF2 hash. You can delete it, but deleting it does not
   open the gate - it welds it shut (see below). Short of brute force, you
@@ -451,7 +456,9 @@ sudo pornblock phone --remove "my phone"
 ```
 
 `--add` finishes by putting a page on your home network and printing the
-address. Open that address on the phone and everything it needs is there: the
+address, with a QR code for it. In the desktop app the same thing is
+**Set up a phone** → **Add a phone**, which shows the code on screen. Point
+the phone's camera at it and everything the phone needs is there: the
 app, the pairing link, the hostname to type, or the iPhone profile. The
 address stops working after twenty minutes. Nothing is emailed to yourself,
 and nothing is left in your downloads.
@@ -539,12 +546,16 @@ This is what happens about a month in. You set it up, you tell a friend,
 they want one - and now there are four of you in the same Discord server
 running four blockers that know nothing about each other.
 
-Group mode adds one shared channel, the **lobby**, that every member's
-machine posts a short line to every half hour:
+Group mode adds one shared channel, the **lobby**, where every member's
+machine keeps one message and edits it every half hour:
 
 ```
+Will's blocker is running (LOCKED) - checked in 20:17
 CWG1 {"v":1,"m":"216…","n":"Will","h":"will-laptop","s":"LOCKED","at":1758…}
 ```
+
+An edit notifies nobody and does not mark the channel unread, so the lobby
+holds one line per person rather than a new one every half hour.
 
 Nothing central runs, and that is deliberate. Each machine still enforces by
 itself, still answers to its own approvers, still keeps its own channel.
@@ -707,11 +718,11 @@ of the group by hand is reverted and said out loud; leaving for real is
 still reporting to a room your friends are in, which is the thing being
 pinned. Only walking out altogether is gated.
 
-**A word on the heartbeat, if you share one channel.** Every member posts a
-line every thirty minutes, so a lobby that is also somebody's alert channel
-collects about fifty short messages a day on top of everything else. It is
-the main reason the separate `#christwatch` lobby is the recommendation
-rather than a nicety.
+**A word on the heartbeat, if you share one channel.** Each member's line is
+one message edited in place, so sharing the lobby with an alert channel adds
+one message per person, once. The line sits where it was first posted and
+scrolls up out of the way; a separate `#christwatch` lobby still keeps
+everybody's status in one place you can glance at.
 
 ---
 
@@ -738,6 +749,8 @@ Edit `/etc/pornblock/config.json`, then `sudo systemctl restart pornblock`.
 | `tracking.digest_hour` | `20` | Local hour the daily report is emailed |
 | `tracking.keep_days` | `90` | How long daily logs are kept |
 | `tracking.top_n` | `15` | Rows per section in the report |
+| `tracking.report_apps` | `false` | Put the apps that were open in the daily report (off: every app left open all day shows the same time) |
+| `tracking.report_domains` | `false` | Put the most looked-up domains in the daily report (off: they are mostly telemetry and CDNs) |
 | `updates.repo` | - | Git URL to pull new versions from |
 | `updates.branch` | `main` | Branch to track |
 | `updates.check_minutes` | `15` | How often the daemon looks (cheap: `git ls-remote`) |

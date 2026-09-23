@@ -178,13 +178,21 @@ end up with a blocker that does nothing.
 Neither phone runs a copy of this. Both have a system-wide setting that
 sends every app's lookups to a resolver that will not answer for porn.
 
+**The easy way:** in ChristWatch, press **Set up a phone** → **Add a phone**,
+give it a name, and press **Show the code to scan**. Point the phone's camera
+at the code on the laptop screen, tap the link, and follow the page - it
+walks you through installing the app and the one setting. Nothing to type.
+The phone has to be on the same wifi as the laptop.
+
+The same thing from a terminal, which draws the code there too:
+
 **Android:**
 
 ```bash
 sudo pornblock phone --add "Pixel"
 ```
 
-That hands you a link to open on the phone. Install the small app, tap
+That hands you a code to scan (or a link to type) on the phone. Install the small app, tap
 through, and set Private DNS. The app reports to your channel once a day; if
 it stops reporting, that is said out loud - because uninstalling the app is
 easier than changing the setting, so silence is treated as an answer.

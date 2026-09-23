@@ -53,7 +53,7 @@ import urllib.request
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-VERSION = "1.8.1"
+VERSION = "1.9.0"
 HOMEPAGE = "https://github.com/EasternProdigy/christwatch"
 PROG = "pornblock"
 
@@ -1197,6 +1197,23 @@ def _discord_error(code: int, raw: str) -> str:
     return "HTTP %d %s" % (code, detail or raw[:200])
 
 
+def _marked_lines(m: dict, marker: str) -> list:
+    """(who posted it, decoded line, message id) for each marker line in m."""
+    out = []
+    src_id = str((m.get("author") or {}).get("id") or "")
+    if m.get("webhook_id"):
+        src_id = "webhook:%s" % m["webhook_id"]
+    for line in (m.get("content") or "").splitlines():
+        line = line.strip().strip("`").strip()
+        if not line.startswith(marker):
+            continue
+        with contextlib.suppress(ValueError):
+            body = json.loads(line[len(marker):])
+            if isinstance(body, dict):
+                out.append((src_id, body, str(m.get("id") or "")))
+    return out
+
+
 def _chunk_text(text: str, limit: int = DISCORD_LIMIT) -> list:
     """Split on line breaks so a message never lands mid-sentence."""
     out, cur = [], ""
@@ -1293,6 +1310,13 @@ class DiscordCourier:
                               "allowed_mentions": {"parse": [], "users": ids[:50]}})
             last = str((res or {}).get("id") or last)
         return last
+
+    def edit(self, message_id: str, text: str, channel: str = "") -> str:
+        """Rewrite one of our own messages. Nobody is notified of an edit."""
+        cid = str(channel or "").strip() or self._channel()
+        res = self._call("PATCH", "/channels/%s/messages/%s" % (cid, message_id),
+                         {"content": text, "allowed_mentions": {"parse": []}})
+        return str((res or {}).get("id") or message_id)
 
     # -- one tap instead of typing ----------------------------------------
 
@@ -1493,21 +1517,33 @@ class DiscordCourier:
                 for m in msgs:
                     with contextlib.suppress(TypeError, ValueError):
                         after = max(after, int(m.get("id") or 0))
-                    src_id = str((m.get("author") or {}).get("id") or "")
-                    if m.get("webhook_id"):
-                        src_id = "webhook:%s" % m["webhook_id"]
-                    for line in (m.get("content") or "").splitlines():
-                        line = line.strip().strip("`").strip()
-                        if not line.startswith(marker):
-                            continue
-                        with contextlib.suppress(ValueError):
-                            body = json.loads(line[len(marker):])
-                            if isinstance(body, dict):
-                                out.append((src_id, body, str(m.get("id") or "")))
+                    out += _marked_lines(m, marker)
                 if len(msgs) < 100:
                     break
         except MailError as exc:
             log("could not read channel %s: %s" % (cid, exc))
+        return out
+
+    def marked_ids(self, cid: str, ids, marker: str) -> list:
+        """
+        The same, for messages whose ids we already know.
+
+        A heartbeat is one message edited in place, and an edit does not make
+        a message new - reading "everything since" never sees it again. So
+        the lines we know about are re-read by id. Never raises; a line that
+        has gone is simply not there.
+        """
+        out = []
+        for mid in ids:
+            if not str(mid or "").isdigit():
+                continue
+            try:
+                m = self._call("GET", "/channels/%s/messages/%s" % (cid, mid))
+            except MailError as exc:
+                log("could not re-read line %s: %s" % (mid, exc))
+                continue
+            if isinstance(m, dict):
+                out += _marked_lines(m, marker)
         return out
 
     def probe(self) -> str:
@@ -1584,6 +1620,26 @@ def everyone(cfg: dict) -> list:
     if cfg.get("owner_email") and not is_discord(cfg):
         people.append(cfg["owner_email"])
     return list(dict.fromkeys(a.strip() for a in people if a.strip()))
+
+
+# Things a machine in normal use does to itself, often, that get put right
+# on the next tick. They are still repaired, logged and kept in the history.
+# They are not posted: a channel that says "tampered with" every time the
+# wifi reconnects teaches your friends to stop reading it, and then the one
+# that is real goes past as well.
+ROUTINE_REPAIRS = (
+    "was using another resolver",   # NetworkManager, on every reconnect
+    "logging set to",               # resolved forgets its level when restarted
+    "journal capped",               # our own cost, bounded
+    "immutable flag re-applied",    # the file was intact - only the flag,
+    "re-applied immutable flag",    # which our own installs leave off
+)
+
+
+def worth_saying(changes) -> list:
+    """The repairs that mean somebody did something."""
+    return [c for c in changes
+            if not any(r in c for r in ROUTINE_REPAIRS)]
 
 
 def alert(cfg: dict, st: dict, key: str, subject: str, text: str,
@@ -1785,6 +1841,212 @@ def lan_address() -> str:
         s.close()
 
 
+# --------------------------------------------------------------------------
+# A QR code for the phone page
+# --------------------------------------------------------------------------
+#
+# Typing "http://192.168.1.23:8723/Xa9-.../" into a phone is where a friend
+# who does not do computers gives up. Pointing the camera at the screen is
+# not. This is just enough of the standard to draw one address: byte mode,
+# medium error correction, versions 1-6 (up to 106 bytes), which is several
+# times what the address needs. Nothing is installed for it.
+
+# per version: (EC codewords per block, number of blocks, data codewords
+# per block), level M. Versions 1-6 all have blocks of one size.
+_QR_M = {1: (10, 1, 16), 2: (16, 1, 28), 3: (26, 1, 44),
+         4: (18, 2, 32), 5: (24, 2, 43), 6: (16, 4, 27)}
+_QR_ALIGN = {1: [], 2: [6, 18], 3: [6, 22], 4: [6, 26], 5: [6, 30],
+             6: [6, 34]}
+
+
+def _gf_tables():
+    exp, log_ = [0] * 512, [0] * 256
+    x = 1
+    for i in range(255):
+        exp[i], log_[x] = x, i
+        x <<= 1
+        if x & 0x100:
+            x ^= 0x11D
+    for i in range(255, 512):
+        exp[i] = exp[i - 255]
+    return exp, log_
+
+
+_GF_EXP, _GF_LOG = _gf_tables()
+
+
+def _gf_mul(a: int, b: int) -> int:
+    return 0 if not a or not b else _GF_EXP[_GF_LOG[a] + _GF_LOG[b]]
+
+
+def _rs_ecc(data: list, n: int) -> list:
+    """Reed-Solomon remainder: the n error correction codewords for data."""
+    gen = [1]
+    for i in range(n):
+        nxt = [0] * (len(gen) + 1)
+        for j, c in enumerate(gen):
+            nxt[j] ^= c
+            nxt[j + 1] ^= _gf_mul(c, _GF_EXP[i])
+        gen = nxt
+    rem = [0] * n
+    for b in data:
+        factor = b ^ rem[0]
+        rem = rem[1:] + [0]
+        for j in range(n):
+            rem[j] ^= _gf_mul(gen[j + 1], factor)
+    return rem
+
+
+def _qr_mask(m: int, x: int, y: int) -> bool:
+    return [(x + y) % 2 == 0, y % 2 == 0, x % 3 == 0, (x + y) % 3 == 0,
+            (x // 3 + y // 2) % 2 == 0, x * y % 2 + x * y % 3 == 0,
+            (x * y % 2 + x * y % 3) % 2 == 0,
+            ((x + y) % 2 + x * y % 3) % 2 == 0][m]
+
+
+def _qr_penalty(grid: list) -> int:
+    """The standard's four ways a code can be hard to read, scored."""
+    size, score = len(grid), 0
+    lines = ["".join("1" if c else "0" for c in r) for r in grid]
+    lines += ["".join("1" if grid[y][x] else "0" for y in range(size))
+              for x in range(size)]
+    for ln in lines:
+        for run in re.findall(r"0{5,}|1{5,}", ln):
+            score += len(run) - 2
+        for pat in ("10111010000", "00001011101"):
+            score += 40 * sum(1 for i in range(len(ln) - 10)
+                              if ln.startswith(pat, i))
+    for y in range(size - 1):
+        for x in range(size - 1):
+            if grid[y][x] == grid[y][x + 1] == grid[y + 1][x] == grid[y + 1][x + 1]:
+                score += 3
+    dark = sum(map(sum, grid))
+    score += abs(dark * 20 - size * size * 10) // (size * size) * 10
+    return score
+
+
+def qr_matrix(text: str) -> list:
+    """
+    The modules of a QR code for text, as rows of booleans (True is dark),
+    without the quiet zone around it. ValueError if it is too long to fit.
+    """
+    data = text.encode("utf-8")
+    ver = next((v for v in sorted(_QR_M)
+                if 4 + 8 + 8 * len(data) <= 8 * _QR_M[v][1] * _QR_M[v][2]),
+               0)
+    if not ver or len(data) > 255:
+        raise ValueError("too long for a QR code this small")
+    ecn, blocks, per = _QR_M[ver]
+    cap = blocks * per
+
+    # the message: mode, length, bytes, terminator, then padding
+    bits = "0100" + format(len(data), "08b") + "".join(
+        format(b, "08b") for b in data)
+    bits += "0" * min(4, cap * 8 - len(bits))
+    bits += "0" * (-len(bits) % 8)
+    words = [int(bits[i:i + 8], 2) for i in range(0, len(bits), 8)]
+    pad = (0xEC, 0x11)
+    words += [pad[i % 2] for i in range(cap - len(words))]
+
+    # split into blocks, correct each, interleave
+    chunks = [words[i * per:(i + 1) * per] for i in range(blocks)]
+    eccs = [_rs_ecc(c, ecn) for c in chunks]
+    stream = [c[i] for i in range(per) for c in chunks]
+    stream += [e[i] for i in range(ecn) for e in eccs]
+
+    size = 17 + 4 * ver
+    grid = [[False] * size for _ in range(size)]
+    fixed = [[False] * size for _ in range(size)]
+
+    def put(x, y, dark):
+        grid[y][x], fixed[y][x] = dark, True
+
+    for cx, cy in ((3, 3), (size - 4, 3), (3, size - 4)):     # finders
+        for dy in range(-4, 5):
+            for dx in range(-4, 5):
+                x, y = cx + dx, cy + dy
+                if 0 <= x < size and 0 <= y < size:
+                    d = max(abs(dx), abs(dy))
+                    put(x, y, d not in (2, 4))
+    for i in range(size):                                     # timing
+        if not fixed[6][i]:
+            put(i, 6, i % 2 == 0)
+        if not fixed[i][6]:
+            put(6, i, i % 2 == 0)
+    pos = _QR_ALIGN[ver]
+    for cx in pos:                                            # alignment
+        for cy in pos:
+            if (cx, cy) in ((6, 6), (6, pos[-1]), (pos[-1], 6)):
+                continue                      # those three are the finders
+            for dy in range(-2, 3):
+                for dx in range(-2, 3):
+                    put(cx + dx, cy + dy, max(abs(dx), abs(dy)) != 1)
+    for i in range(9):                                        # format areas
+        for x, y in ((8, i), (i, 8)):
+            if not fixed[y][x]:
+                put(x, y, False)
+    for i in range(8):
+        put(size - 1 - i, 8, False)
+        put(8, size - 1 - i, False)
+    put(8, size - 8, True)                                    # dark module
+
+    # the data, zigzagging up and down in two-module columns from the right
+    i, total, right = 0, len(stream) * 8, size - 1
+    while right >= 1:
+        if right == 6:
+            right = 5
+        upward = ((right + 1) & 2) == 0
+        for vert in range(size):
+            y = size - 1 - vert if upward else vert
+            for x in (right, right - 1):
+                if not fixed[y][x] and i < total:
+                    grid[y][x] = bool(stream[i >> 3] >> (7 - (i & 7)) & 1)
+                    i += 1
+        right -= 2
+
+    def finish(mask):
+        g = [[grid[y][x] != (not fixed[y][x] and _qr_mask(mask, x, y))
+              for x in range(size)] for y in range(size)]
+        fmt = mask                     # level M is 00, so just the mask
+        rem = fmt
+        for _ in range(10):
+            rem = (rem << 1) ^ ((rem >> 9) * 0x537)
+        fb = ((fmt << 10) | rem) ^ 0x5412
+        bit = [bool(fb >> k & 1) for k in range(15)]
+        for k in range(6):
+            g[k][8] = bit[k]
+        g[7][8], g[8][8], g[8][7] = bit[6], bit[7], bit[8]
+        for k in range(9, 15):
+            g[8][14 - k] = bit[k]
+        for k in range(8):
+            g[8][size - 1 - k] = bit[k]
+        for k in range(8, 15):
+            g[size - 15 + k][8] = bit[k]
+        return g
+
+    return min((finish(m) for m in range(8)), key=_qr_penalty)
+
+
+def qr_terminal(text: str) -> str:
+    """
+    The same code drawn in a terminal, two rows to a line.
+
+    Colours are set outright - black on white - because a dark terminal would
+    otherwise draw it inverted, and not every phone camera reads that.
+    """
+    m = qr_matrix(text)
+    n = len(m) + 8
+    rows = [[False] * n for _ in range(4)]
+    rows += [[False] * 4 + r + [False] * 4 for r in m]
+    rows += [[False] * n for _ in range(5)]      # odd, so the pairs come out even
+    out = []
+    for y in range(0, len(rows) - 1, 2):
+        line = "".join(" ▄▀█"[rows[y][x] * 2 + rows[y + 1][x]]
+                       for x in range(n))
+        out.append("  \033[30;107m" + line + "\033[0m")
+    return "\n".join(out)
+
+
 def apk_cache_path() -> str:
     return os.path.join(STATE_DIR, "ChristWatch.apk")
 
@@ -1876,10 +2138,22 @@ same thing.</li>
 
 ANDROID_CARD = """<div class="card">
 <h2>Android</h2>
-<p>Install the app, then tap Pair. It watches the setting below and tells
-%(home)s if it ever changes.</p>
+<ol>
+<li>Tap <b>Download the app</b>. If the phone asks, tap <b>Download
+anyway</b>, then open the file.</li>
+<li>If it says installing from here is not allowed, tap <b>Settings</b>,
+switch on <b>Allow from this source</b>, then press back and tap
+<b>Install</b>. If Play Protect warns you, tap <b>More details</b> &rarr;
+<b>Install anyway</b>.</li>
+<li>Come back to this page and tap <b>Pair this phone</b>. The app opens
+and walks you through the one setting that does the blocking.</li>
+</ol>
+<p></p>
 %(download)s
 <a class="btn ghost" href="%(pair)s">Pair this phone</a>
+<p>It watches that setting and tells %(home)s if it ever changes. Using a
+work profile too? Open this page in that profile's browser and do the same
+again.</p>
 </div>
 """
 
@@ -2017,6 +2291,12 @@ def serve_phone_page(cfg: dict, dev_id: str = "", minutes: int = 20,
     url = "http://%s:%d/%s/" % (lan_address(), port, token)
 
     print("")
+    if sys.stdout.isatty():
+        # Pointing the phone's camera at this beats typing the address.
+        with contextlib.suppress(ValueError):
+            print("  Point the phone's camera at this:\n")
+            print(qr_terminal(url))
+            print("")
     print("  Open this on the phone:\n")
     print("      " + bold(url))
     print("")
@@ -2794,14 +3074,15 @@ def enforce_all(cfg: dict, st: dict, apply: bool, quiet: bool = False) -> list:
     for ch in changes:
         log("enforce[%s] %s" % ("apply" if apply else "lift", ch))
 
-    if apply and changes and st.get("enforced_once") and not quiet:
+    loud = worth_saying(changes)
+    if apply and loud and st.get("enforced_once") and not quiet:
         body = ("Something changed the blocking configuration on %s and "
                 "pornblock has just put it back.\n\n"
                 "What was re-applied:\n%s\n\n"
                 "If %s did not tell you they were doing maintenance, this is "
                 "worth a conversation.\n"
                 % (socket.gethostname(),
-                   "\n".join("  - " + x for x in changes),
+                   "\n".join("  - " + x for x in loud),
                    cfg.get("owner_name") or cfg.get("owner_email") or "they"))
         alert(cfg, st, "tamper_enforce", "Blocking was tampered with and restored", body)
 
@@ -3427,13 +3708,14 @@ def guard_units(cfg: dict, st: dict) -> list:
         fixed.append("watchdog timer was not running; started")
     fixed += guard_harden(cfg, st)
     fixed += protect_binary(cfg, st)
-    if fixed:
+    for f in fixed:
+        history(st, "guard: " + f)
+    loud = worth_saying(fixed)
+    if loud:
         body = ("pornblock's own watchdog had to be repaired on %s:\n\n%s\n\n"
                 "The blocker is running again. Somebody had to be root to do "
-                "this.\n" % (socket.gethostname(), "\n".join("  - " + f for f in fixed)))
+                "this.\n" % (socket.gethostname(), "\n".join("  - " + f for f in loud)))
         alert(cfg, st, "tamper_units", "Watchdog was disabled and has been restored", body)
-        for f in fixed:
-            history(st, "guard: " + f)
     return fixed
 
 
@@ -3813,7 +4095,8 @@ def advance(cfg: dict, st: dict, post) -> list:
                   "The %d-minute unlock window on %s has ended and every "
                   "blocking layer has been re-applied.\n\nNothing to do - this "
                   "is the system working.\n"
-                  % (int(cfg["unlock_minutes"]), socket.gethostname()), force=True)
+                  % (int(cfg["unlock_minutes"]), socket.gethostname()), force=True,
+                  ping=False)
             to_locked(cfg, st, "unlock window expired")
             moves.append("unlock window expired - re-locked")
 
@@ -4279,11 +4562,17 @@ def digest_body(cfg: dict, day: str) -> tuple:
                   "  something asked for them.", ""]
     else:
         lines += ["  Nothing on the blocklist was requested today.", ""]
-    if d["apps"]:
-        lines += ["  Applications open while you were at the machine:"]
+    # Off unless asked for. The busiest domains on any machine are telemetry
+    # and CDNs, and every app left open all day shows the same number - two
+    # long lists that tell your friends nothing and push the part that does
+    # off the screen.
+    if trk.get("report_apps", False) and d["apps"]:
+        lines += ["  Applications open while the screen was in use "
+                  "(open, not looked at):"]
         lines += ["    %-45s %s" % (n, human_delta(sec)) for n, sec in d["apps"]]
         lines += [""]
-    if trk.get("dns_log", True) and d["domains"]:
+    if (trk.get("report_domains", False) and trk.get("dns_log", True)
+            and d["domains"]):
         lines += ["  Most looked-up domains (all browsing, not just blocked):"]
         lines += ["    %-45s %d" % (n, c) for n, c in d["domains"]]
         lines += [""]
@@ -4291,8 +4580,6 @@ def digest_body(cfg: dict, day: str) -> tuple:
         "-" * 58,
         "You are getting this because %s asked you to hold them to it."
         % who(cfg),
-        "App time is time the application was open while the screen was in",
-        "use - not time spent looking at it.",
     ]
     return ("Daily report for %s - %s" % (who(cfg), day), "\n".join(lines) + "\n")
 
@@ -4507,13 +4794,31 @@ def post_group_beat(cfg: dict, st: dict, post, force: bool = False) -> bool:
     every = max(1.0, float(group_cfg(cfg).get("heartbeat_minutes") or 30)) * 60
     if not force and (now() - float(grp.get("last_beat") or 0)) < every:
         return False
-    line = GROUP_MARKER + json.dumps(group_beat(cfg, st), separators=(",", ":"))
-    try:
-        post.post("`%s`" % line, channel=group_lobby(cfg))
-    except MailError as exc:
-        log("group heartbeat failed: %s" % exc)
-        return False
+    beat = group_beat(cfg, st)
+    line = GROUP_MARKER + json.dumps(beat, separators=(",", ":"))
+    # One message per machine, edited in place. A new post every half hour
+    # was forty-eight lines of JSON a day in a channel people read, each one
+    # marking it unread; an edit does neither. The first line is for the
+    # people - the one in backticks is for the other machines.
+    text = "%s's blocker is running (%s) - checked in %s\n`%s`" % (
+        clean_label(beat.get("n")) or "someone", beat.get("s"),
+        short_stamp(now()), line)
+    prev = str(grp.get("beat_id") or "")
+    mid = ""
+    if prev and hasattr(post, "edit"):
+        try:
+            mid = post.edit(prev, text, channel=group_lobby(cfg))
+        except MailError as exc:
+            # deleted by hand, or the lobby moved: start a fresh one
+            log("could not update the heartbeat, posting anew: %s" % exc)
+    if not mid:
+        try:
+            mid = post.post(text, channel=group_lobby(cfg))
+        except MailError as exc:
+            log("group heartbeat failed: %s" % exc)
+            return False
     grp["last_beat"] = now()
+    grp["beat_id"] = mid or prev
     return True
 
 
@@ -4526,7 +4831,17 @@ def read_group_beats(cfg: dict, st: dict, post) -> list:
     since = float(grp.get("cursor") or 0) or (now() - 86400)
     me = group_me(cfg)
     moves = []
-    for author, body, _mid in post.marked(group_lobby(cfg), since, GROUP_MARKER):
+    lines = post.marked(group_lobby(cfg), since, GROUP_MARKER)
+    # Heartbeats are edited in place, so the ones we know are re-read by id.
+    # Every tick would be a request per member per 45 seconds for a line that
+    # changes every half hour; twice a heartbeat is plenty.
+    every = max(1.0, float(group_cfg(cfg).get("heartbeat_minutes") or 30)) * 60
+    if hasattr(post, "marked_ids") and \
+            now() - float(grp.get("reread") or 0) >= every / 2:
+        known = sorted({str(r.get("mid") or "") for r in members.values()} - {""})
+        lines += post.marked_ids(group_lobby(cfg), known, GROUP_MARKER)
+        grp["reread"] = now()
+    for author, body, mid in lines:
         who_id = str(body.get("m") or "")
         if not who_id.isdigit() or who_id == me:
             continue                          # our own line tells us nothing
@@ -4561,6 +4876,13 @@ def read_group_beats(cfg: dict, st: dict, post) -> list:
         # machine cannot buy itself silence by claiming to be in the future.
         claimed = float(body.get("at") or 0)
         heard = min(now(), claimed) if claimed else now()
+        if mid:
+            row["mid"] = mid
+        # Re-reading a line that has not been edited since is not hearing
+        # from them. Without this, a machine that stopped would be "back"
+        # every time its last line was looked at again.
+        if row.get("last_seen") and heard <= float(row["last_seen"]):
+            continue
         was_quiet = bool(row.get("quiet"))
         row.update({
             "name": name,
@@ -5654,7 +5976,7 @@ def cmd_harden(args) -> int:
               "%s set a password on the boot menu of %s, with someone "
               "holding it.\n\nEditing the boot line was the last way to take "
               "this apart without anything being said. It is closed.\n"
-              % (who(cfg), socket.gethostname()), force=True)
+              % (who(cfg), socket.gethostname()), force=True, ping=False)
         save_state(st)
         return 0
 
@@ -5724,7 +6046,8 @@ def cmd_no_password(args) -> int:
             st = load_state()
             alert(cfg, st, "password_on", "Password prompts are back on",
                   "%s put the password prompt back on ChristWatch commands "
-                  "on %s.\n" % (who(cfg), socket.gethostname()), force=True)
+                  "on %s.\n" % (who(cfg), socket.gethostname()), force=True,
+                  ping=False)
             save_state(st)
         return 0
 
@@ -5767,7 +6090,7 @@ def cmd_no_password(args) -> int:
               "outside a granted unlock, changing the approvers or the "
               "timings still reverts and tells you, and the passphrase is "
               "still the passphrase. They were always root here - this only "
-              "removes the typing.\n" % who(cfg), force=True)
+              "removes the typing.\n" % who(cfg), force=True, ping=False)
         save_state(st)
 
     print(green("\n  Done. %s is no longer asked for a password to run %s."
@@ -6260,7 +6583,7 @@ def cmd_cancel(args) -> int:
           "%s cancelled the unlock request (code %s) on %s and went straight "
           "back to LOCKED.\n\nThis is the good outcome. If you want to say "
           "something encouraging, now is the moment.\n"
-          % (who(cfg), tok, socket.gethostname()), force=True)
+          % (who(cfg), tok, socket.gethostname()), force=True, ping=False)
     write_public_status(cfg, st)
     save_state(st)
     print(green("""
@@ -6747,12 +7070,22 @@ def cmd_watchdog(args) -> int:
     if fixed:
         for f in fixed:
             history(st, "watchdog: " + f)
-        body = ("The pornblock watchdog on %s found the blocker switched off "
-                "and turned it back on.\n\n%s\n\n"
-                "Only root can do this, so it was almost certainly %s. Worth "
-                "asking about.\n"
-                % (socket.gethostname(), "\n".join("  - " + f for f in fixed), who(cfg)))
-        alert(cfg, st, "watchdog", "Blocker was stopped - watchdog restarted it", body)
+    loud = worth_saying(fixed)
+    if loud:
+        # Say "stopped" only when it was: a unit file or a cron entry put
+        # back is worth telling, but it is not the blocker being switched off.
+        stopped = any(f.startswith("service was") for f in loud)
+        body = ("The pornblock watchdog on %s found %s and put it right.\n\n"
+                "%s\n\nOnly root can do this, so it was almost certainly %s. "
+                "Worth asking about.\n"
+                % (socket.gethostname(),
+                   "the blocker switched off" if stopped
+                   else "part of the blocker removed",
+                   "\n".join("  - " + f for f in loud), who(cfg)))
+        alert(cfg, st, "watchdog",
+              "Blocker was stopped - watchdog restarted it" if stopped
+              else "Part of the blocker was removed and put back", body)
+    if fixed:
         save_state(st)
         print("\n".join(fixed))
     return 0
@@ -7048,18 +7381,19 @@ def apply_update(cfg: dict, st: dict, dest: str, sha: str, subject: str,
     upd["last_error"] = ""
     history(st, "updated to %s (%s)" % (newver, sha[:12] or "?"))
 
+    # Said without a ping and without a link preview: an update is worth
+    # knowing about, not worth buzzing two phones and a GitHub card for.
+    # The warning about who controls the repository stays - it is the one
+    # sentence in here that matters.
+    repo = ((cfg.get("updates") or {}).get("repo") or "").rstrip("/")
+    where = ("<%s/commit/%s>" % (repo, sha) if "github.com/" in repo and sha
+             else "%s (%s)" % (repo, sha[:12] or "?"))
     alert(cfg, st, "updated", "%s was updated to %s" % (cfg.get("app_name") or PROG, newver),
-          "%s on %s just installed an update pulled from:\n\n"
-          "  %s (%s)\n  commit %s\n  %s\n\n"
-          "The new code passed its own self-test before being installed, but "
-          "understand what this means: whoever controls that repository "
-          "controls what runs as root on this machine. If that is %s and this "
-          "update was not something you expected, ask about it.\n"
-          % (cfg.get("app_name") or PROG, socket.gethostname(),
-             (cfg.get("updates") or {}).get("repo"),
-             (cfg.get("updates") or {}).get("branch"),
-             sha[:12] or "?", subject or "(no commit subject)", who(cfg)),
-          force=True)
+          "%s\n%s\n\nIt passed its own self-test first. Whoever controls that "
+          "repository controls what runs as root here - if %s did not "
+          "expect an update, ask.\n"
+          % (subject or "(no commit subject)", where, who(cfg)),
+          force=True, ping=False)
     save_state(st)
     return done
 

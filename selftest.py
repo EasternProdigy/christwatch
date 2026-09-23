@@ -979,7 +979,14 @@ check("digest names the day", day in subject)
 check("digest reports screen time", "1h 2m 5s" in text, text[:200])
 check("digest lists the blocked domain", "badsite.example" in text)
 check("digest reports bypass drops", "7 packets" in text)
-check("digest explains what app time means", "not time spent looking at it" in text)
+check("the report leaves out the long lists nobody reads",
+      "org.mozilla.firefox" not in text and "example.com" not in text.replace(
+          "badsite.example", ""))
+_, text = pb.digest_body(pb.deep_merge(cfg, {"tracking": {
+    "report_apps": True, "report_domains": True}}), day)
+check("...unless asked for, and then app time is explained",
+      "org.mozilla.firefox" in text and "not looked at" in text
+      and "example.com" in text)
 
 old_day = (dt.date.today() - dt.timedelta(days=400)).isoformat()
 pb.save_day(old_day, {"day": old_day, "screen_seconds": 1, "apps": {},
@@ -1045,6 +1052,50 @@ if os.path.exists(KOT):
           "URL_SAFE" in core_kt and "NO_PADDING" in core_kt)
 else:
     print("  --   android/ not in this copy")
+
+# -- the QR code the phone scans --------------------------------------------
+# Checked against a real decoder when this was written; what is kept here is
+# the shape, so a change that breaks it cannot pass quietly.
+URL = "http://192.168.100.200:8723/%s/" % ("A" * 12)
+QR = pb.qr_matrix(URL)
+check("the phone address fits a small QR code",
+      len(QR) in (17 + 4 * v for v in range(1, 7)) and all(len(r) == len(QR) for r in QR))
+FINDER = [[max(abs(x - 3), abs(y - 3)) not in (2, 4) for x in range(7)]
+          for y in range(7)]
+n = len(QR)
+check("it has its three finder squares",
+      [r[:7] for r in QR[:7]] == FINDER and [r[n - 7:] for r in QR[:7]] == FINDER
+      and [r[:7] for r in QR[n - 7:]] == FINDER)
+check("and its timing line", all(QR[6][i] == (i % 2 == 0) for i in range(8, n - 8)))
+
+
+def _format_bits(g):
+    return sum(g[8][n - 1 - k] << k for k in range(8)) | \
+        sum(g[n - 15 + k][8] << k for k in range(8, 15))
+
+
+fb = _format_bits(QR) ^ 0x5412
+rem = fb >> 10
+for _ in range(10):
+    rem = (rem << 1) ^ ((rem >> 9) * 0x537)
+check("its format bits say medium correction, and check out",
+      fb >> 13 == 0 and (fb & 0x3FF) == rem & 0x3FF)
+check("the same bits are written in both places",
+      [QR[k][8] for k in range(6)] == [bool(_format_bits(QR) >> k & 1)
+                                       for k in range(6)])
+TERM = [re.sub(r"\x1b\[[0-9;]*m", "", ln)[2:] for ln in pb.qr_terminal(URL).splitlines()]
+BACK = []
+for ln in TERM:
+    BACK.append([ch in "▀█" for ch in ln])
+    BACK.append([ch in "▄█" for ch in ln])
+check("the terminal drawing is the same code, with room around it",
+      [r[4:4 + n] for r in BACK[4:4 + n]] == QR
+      and not any(BACK[0]) and not any(BACK[-1]))
+try:
+    pb.qr_matrix("x" * 200)
+    check("an address too long to draw is refused", False)
+except ValueError:
+    check("an address too long to draw is refused", True)
 
 # -- the iPhone profile ----------------------------------------------------
 import plistlib
@@ -1605,13 +1656,20 @@ class Lobby(pb.DiscordCourier):
         super().__init__(cfg)
         self.messages = list(messages)
         self.posted = []
+        self.edited = []
 
     def _call(self, method, path, body=None, timeout=25, retries=1):
         if method == "POST":
             self.posted.append((path, (body or {}).get("content", "")))
-            return {"id": "1"}
+            return {"id": str(len(self.posted))}
+        if method == "PATCH":
+            self.edited.append((path, (body or {}).get("content", "")))
+            return {"id": path.rsplit("/", 1)[1]}
         if "/messages?" in path:
             return list(self.messages)
+        if "/messages/" in path:
+            mid = path.rsplit("/", 1)[1]
+            return next((m for m in self.messages if m["id"] == mid), {})
         return {}
 
 
@@ -1640,14 +1698,60 @@ ST = pb.deep_merge(pb.DEFAULT_STATE, {})
 LOB = Lobby(GRP_CFG)
 check("this machine posts a line saying it is still here",
       pb.post_group_beat(GRP_CFG, ST, LOB, force=True))
-_line = LOB.posted[0][1]
+_text = LOB.posted[0][1]
+_line = next(ln for ln in _text.splitlines() if pb.GROUP_MARKER in ln)
 check("that line is machine-readable", pb.GROUP_MARKER in _line)
+check("and a person can read it too",
+      _text.splitlines()[0].startswith(pb.group_my_name(GRP_CFG))
+      and "running" in _text.splitlines()[0])
 check("and it goes to the lobby, not to your own channel",
       "555555555555555555" in LOB.posted[0][0])
 _body = json.loads(_line.strip("`")[len(pb.GROUP_MARKER):])
 check("it carries who and what state", _body["m"] == ME and _body["s"] == "LOCKED")
 check("it does not carry what you looked up",
       not any(k in _body for k in ("domains", "apps", "blocked_domains")))
+pb.post_group_beat(GRP_CFG, ST, LOB, force=True)
+pb.post_group_beat(GRP_CFG, ST, LOB, force=True)
+check("after that it edits the same message instead of posting again",
+      len(LOB.posted) == 1 and len(LOB.edited) == 2
+      and LOB.edited[-1][0].endswith("/messages/1")
+      and ST["group"]["beat_id"] == "1")
+
+
+class _Gone(Lobby):
+    def _call(self, method, path, body=None, timeout=25, retries=1):
+        if method == "PATCH":
+            raise pb.MailError("no channel with that id. Unknown Message")
+        return super()._call(method, path, body, timeout, retries)
+
+
+_STG = pb.deep_merge(pb.DEFAULT_STATE, {})
+_LG = _Gone(GRP_CFG)
+pb.post_group_beat(GRP_CFG, _STG, _LG, force=True)
+check("if somebody deletes it, a fresh one is posted - never a missed beat",
+      pb.post_group_beat(GRP_CFG, _STG, _LG, force=True)
+      and len(_LG.posted) == 2 and _STG["group"]["beat_id"] == "2")
+
+# The others see an edit by re-reading the line by id.
+_STE = pb.deep_merge(pb.DEFAULT_STATE, {})
+_old = beat_msg(SAM, "Sam", ago=20 * 3600)
+_LE = Lobby(GRP_CFG, [_old])
+pb.read_group_beats(GRP_CFG, _STE, _LE)
+_seen = _STE["group"]["members"][SAM]["last_seen"]
+_LE.messages = []                      # nothing new since the cursor...
+_fresh = beat_msg(SAM, "Sam")          # ...but the same message was edited
+_fresh["id"] = _old["id"]
+_LE.marked = lambda *a, **k: []
+_LE.messages = [_fresh]
+_STE["group"]["reread"] = 0
+pb.read_group_beats(GRP_CFG, _STE, _LE)
+check("an edited heartbeat is heard, though it is not a new message",
+      _STE["group"]["members"][SAM]["last_seen"] > _seen + 3600)
+_STE["group"]["members"][SAM]["quiet"] = True
+_STE["group"]["reread"] = 0
+_back = pb.read_group_beats(GRP_CFG, _STE, _LE)
+check("re-reading a line that has not changed is not hearing from them",
+      _STE["group"]["members"][SAM]["quiet"] and not any("back" in m for m in _back))
 
 # Reading the others.
 ST2 = pb.deep_merge(pb.DEFAULT_STATE, {})
@@ -1840,6 +1944,49 @@ check("a tamper alert survives an outage and is sent later",
       len(_outbox_after(lambda s: pb.alert(
           LIVE_CFG, s, "tamper", "Someone changed something", "body\n",
           force=True))) == 1)
+
+# -- what is worth telling your friends ------------------------------------
+# Wifi reconnecting and our own updates leaving a flag off used to post
+# "tampered with" several times a day. Those are still repaired - they are
+# just not said. Anything else still is.
+print("\n== quiet repairs ==")
+_said = []
+
+
+def _run_enforce(changes):
+    keep = {n: getattr(pb, n) for n in (
+        "enforce_hosts", "enforce_resolved", "enforce_nftables",
+        "enforce_browsers", "enforce_dns_logging", "enforce_journal_cap",
+        "alert")}
+    pb.enforce_hosts = lambda c, s, a: list(changes)
+    for n in ("enforce_resolved", "enforce_nftables", "enforce_browsers"):
+        setattr(pb, n, lambda c, s, a: [])
+    pb.enforce_dns_logging = pb.enforce_journal_cap = lambda c, a: []
+    pb.alert = lambda c, s, key, subj, body, **kw: _said.append((key, body))
+    try:
+        _said.clear()
+        est = pb.deep_merge(pb.DEFAULT_STATE, {"enforced_once": True})
+        pb.enforce_all(LIVE_CFG, est, True)
+    finally:
+        for n, f in keep.items():
+            setattr(pb, n, f)
+    return list(_said)
+
+
+check("a wifi reconnect is fixed without a word",
+      _run_enforce(["link wlp1s0 was using another resolver; pinned to the "
+                    "filter", "systemd-resolved logging set to debug "
+                    "(domain tracking)"]) == [])
+check("so is a lock flag our own update left off",
+      _run_enforce(["hosts: re-applied immutable flag"]) == []
+      and pb.worth_saying(["binary: immutable flag re-applied"]) == [])
+_real = _run_enforce(["link wlp1s0 was using another resolver; pinned to "
+                      "the filter", "nftables: (re)loaded table inet pornblock"])
+check("something real is still said - and only that",
+      len(_real) == 1 and "nftables" in _real[0][1]
+      and "wlp1s0" not in _real[0][1])
+check("a binary that was changed is always said",
+      pb.worth_saying(["binary: 1234 bytes restored from the protected copy"]))
 
 # A live alert is only true while it is true. Holding one through an outage
 # and releasing it hours later describes nothing that is still happening,

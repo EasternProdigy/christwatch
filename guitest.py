@@ -453,6 +453,57 @@ def run(app):
               and any("match" in t for t in st.toasts))
         ph._stop()
 
+        class Lines:
+            """Stands in for the helper's stdout, one line per call."""
+            def __init__(self, lines):
+                self.lines = list(lines)
+            def read_line_finish_utf8(self, _res):
+                return (self.lines.pop(0), 0) if self.lines else (None, 0)
+            def read_line_async(self, *_a):
+                pass
+
+        ph._spawn = lambda *_a: None       # no real helper, no pkexec prompt
+
+        def feed(lines):
+            ph.e_name.set_text("Pixel")
+            ph.kind.set_selected(0)
+            ph._begin(existing=True)
+            ph.url, ph.deadline = "", time.time() + 600
+            ph.reader = Lines(lines)
+            for _ in range(len(lines) + 1):
+                ph._line(ph.reader, None)
+
+        url = "http://192.168.1.23:8723/AbCdEfGhIjKl/"
+        feed(["", "  Open this on the phone:", "", "      " + url])
+        check("the phone page shows a code to scan",
+              ph.qr.get_visible() and ph._qr and len(ph._qr) >= 21)
+        check("and the address, for a phone with no camera",
+              ph.l_url.get_label() == url and "camera" in ph.l_steps.get_label())
+        check("the code is for that address",
+              ph._qr == G.qr_modules(url))
+
+        feed(["", "  Your bot needs one more permission before a phone can "
+              "post: Manage Webhooks.",
+              "      https://discord.com/oauth2/authorize?client_id=1"])
+        check("a missing Discord permission is said in plain words",
+              not ph.qr.get_visible()
+              and "permission" in ph.l_steps.get_label())
+        check("and the fix is one button", ph.b_fix.get_visible()
+              and ph._fix_link.startswith("https://discord.com/"))
+
+        feed([])
+        check("closing the password prompt is not left spinning",
+              "try again" in ph.l_steps.get_label()
+              and ph.l_title.get_label() == "That did not work")
+        feed(["", "  Your bot needs one more permission before a phone can "
+              "post: Manage Webhooks."])
+        stale = ph.reader
+        feed(["      " + url])
+        ph._line(stale, None)
+        check("an earlier attempt ending does not spoil the next one",
+              ph.qr.get_visible() and ph.l_url.get_label() == url)
+        ph._stop()
+
         print("\n== dashboard (continued) ==")
         d.update(doc("UNLOCKED"))
         d.tick()

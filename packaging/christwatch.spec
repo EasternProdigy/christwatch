@@ -1,5 +1,5 @@
 Name:           christwatch
-Version:        1.8.1
+Version:        1.9.0
 Release:        1%{?dist}
 Summary:        Accountability-gated content blocker
 
@@ -67,6 +67,17 @@ cd %{_builddir}/%{name}-%{version} && python3 selftest.py
 %{_datadir}/%{name}/
 
 %changelog
+* Wed Sep 23 2026 William Mezitis <wmezitis@gmail.com> - 1.9.0-1
+- Set up a phone by scanning a QR code: in the app and in the
+  terminal. The phone page walks through Android's install prompts,
+  and a missing Discord permission is one button, not a stuck screen.
+- Routine self-repairs (wifi handing out its own DNS, a lock flag our
+  own update left off) are fixed and logged, not posted.
+- Updates, cancellations and other news nobody has to act on are
+  posted without pinging, and updates without a link preview.
+- The daily report drops the app and top-domain lists by default.
+- Each group heartbeat is one message edited in place.
+
 * Tue Sep 22 2026 William Mezitis <wmezitis@gmail.com> - 1.8.1-1
 - A live blocked-site post is dropped during an outage, not replayed
   hours later as though it were still happening.

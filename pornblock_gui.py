@@ -158,6 +158,42 @@ def core_argv():
     return ["pornblock"]
 
 
+_QR_SOURCE = []
+
+
+def qr_modules(text):
+    """
+    The QR code for text as rows of booleans, or None if it cannot be drawn.
+
+    The encoder lives in the core, where the display-free tests can reach it;
+    this borrows it rather than keeping a second copy. It is a pure function,
+    so loading the file costs nothing but the parse.
+    """
+    if not _QR_SOURCE:
+        import importlib.machinery
+        import importlib.util
+        here = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "pornblock.py")
+        for path in (CORE_BIN, here):
+            try:
+                loader = importlib.machinery.SourceFileLoader(
+                    "christwatch_core", path)
+                spec = importlib.util.spec_from_loader(loader.name, loader)
+                mod = importlib.util.module_from_spec(spec)
+                loader.exec_module(mod)
+            except (OSError, SyntaxError, ImportError):
+                continue
+            if hasattr(mod, "qr_matrix"):
+                _QR_SOURCE.append(mod.qr_matrix)
+                break
+        else:
+            _QR_SOURCE.append(None)
+    try:
+        return _QR_SOURCE[0](text) if _QR_SOURCE[0] else None
+    except ValueError:
+        return None
+
+
 def read_json_output(out):
     """
     First JSON object in a command's output, whatever else it printed.
@@ -1410,6 +1446,10 @@ class PhonesDialog(Adw.Dialog):
         self.proc = None
         self.deadline = 0
         self.timer = 0
+        self.reader = None
+        self.url = ""
+        self._fix_link = ""
+        self._said = []
 
         head = Adw.HeaderBar()
         self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
@@ -1550,7 +1590,7 @@ class PhonesDialog(Adw.Dialog):
         back.add_css_class("pill")
         back.connect("clicked",
                      lambda *_: self.stack.set_visible_child_name("list"))
-        go = Gtk.Button(label="Show me the page")
+        go = Gtk.Button(label="Show the code to scan")
         go.add_css_class("pill")
         go.add_css_class("suggested-action")
         go.connect("clicked", lambda *_: self._begin())
@@ -1579,17 +1619,34 @@ class PhonesDialog(Adw.Dialog):
                       margin_top=24, margin_bottom=20,
                       margin_start=18, margin_end=18,
                       valign=Gtk.Align.CENTER)
-        t = Gtk.Label(label="Open this on the phone")
-        t.add_css_class("title-2")
-        box.append(t)
+        self.l_title = Gtk.Label(label="Point the phone's camera at this")
+        self.l_title.add_css_class("title-2")
+        box.append(self.l_title)
+
+        # Always black on white, whatever the theme: an inverted code is one
+        # some phone cameras will not read.
+        self._qr = None
+        self.qr = Gtk.DrawingArea(content_width=232, content_height=232,
+                                  halign=Gtk.Align.CENTER)
+        self.qr.set_draw_func(self._draw_qr)
+        box.append(self.qr)
+
+        self.l_steps = Gtk.Label(wrap=True, justify=Gtk.Justification.CENTER)
+        box.append(self.l_steps)
         self.l_url = Gtk.Label(selectable=True, wrap=True,
                                wrap_mode=Pango.WrapMode.CHAR)
-        self.l_url.add_css_class("title-3")
         self.l_url.add_css_class("monospace")
         box.append(self.l_url)
         self.l_note = Gtk.Label(wrap=True, justify=Gtk.Justification.CENTER)
         self.l_note.add_css_class("dim-label")
         box.append(self.l_note)
+        # Shown only when the bot is missing the permission a phone needs:
+        # the fix is one click in Discord, so offer the click.
+        self.b_fix = Gtk.Button(label="Give it that permission",
+                                halign=Gtk.Align.CENTER, visible=False)
+        self.b_fix.add_css_class("pill")
+        self.b_fix.connect("clicked", self._fix_permission)
+        box.append(self.b_fix)
         done = Gtk.Button(label="Done", halign=Gtk.Align.CENTER, margin_top=10)
         done.add_css_class("pill")
         done.add_css_class("suggested-action")
@@ -1607,8 +1664,15 @@ class PhonesDialog(Adw.Dialog):
             if self.e_pass.get_text() != self.e_pass2.get_text():
                 self.window.toast("Those passwords do not match")
                 return
-        self.l_url.set_label("…")
+        self._show_qr(None)
+        self.l_title.set_label("Point the phone's camera at this")
+        self.l_steps.set_label("")
+        self.l_url.set_label("")
         self.l_note.set_label("Starting…")
+        self.b_fix.set_visible(False)
+        self._fix_link = ""
+        self._said = []
+        self._ios = ios
         self.stack.set_visible_child_name("serve")
 
         argv = ["phone"]
@@ -1640,6 +1704,7 @@ class PhonesDialog(Adw.Dialog):
                 pipe.close(None)
         self.e_pass.set_text("")
         self.e_pass2.set_text("")
+        self.url = ""
         self.reader = Gio.DataInputStream.new(self.proc.get_stdout_pipe())
         self.reader.read_line_async(GLib.PRIORITY_DEFAULT, None, self._line)
         self.deadline = time.time() + 10 * 60
@@ -1650,16 +1715,82 @@ class PhonesDialog(Adw.Dialog):
             raw, _len = stream.read_line_finish_utf8(res)
         except GLib.Error:
             return
+        if stream is not self.reader:
+            return                  # an earlier attempt, closed since
         if raw is None:
+            self._ended()
             return
         text = raw.strip()
+        if text:
+            self._said.append(text)
         if text.startswith("http://"):
+            self.url = text
+            self._show_qr(qr_modules(text))
+            self.l_steps.set_label(
+                "Open the camera, tap the link it finds, and follow the "
+                "page. It walks you through the rest."
+                if self._qr else "Type this into the phone's browser:")
             self.l_url.set_label(text)
+        elif text.startswith("https://discord.com/"):
+            self._fix_link = text
+        elif "Manage Webhooks" in text:
+            self._failed("Your Discord bot needs one more permission before "
+                         "a phone can post in your channel. Give it that, "
+                         "then press Done and try again.")
         elif "Could not" in text or "could not" in text:
-            self.l_url.set_label("that did not work")
-            self.l_note.set_label(text)
-            self.deadline = 0
+            self._failed(text)
         stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self._line)
+
+    def _failed(self, why):
+        self._show_qr(None)
+        self.l_title.set_label("That did not work")
+        self.l_steps.set_label(why)
+        self.l_url.set_label("")
+        self.l_note.set_label("")
+        self.deadline = 0
+        if self.timer:
+            GLib.source_remove(self.timer)
+            self.timer = 0
+
+    def _ended(self):
+        """The helper has stopped. Before a page was up, that is a failure."""
+        if self.url or self.deadline == 0:
+            if self._fix_link:
+                self.b_fix.set_visible(True)
+            return
+        if not self._said:
+            self._failed("Nothing was set up. The password prompt was "
+                         "probably closed - press Done and try again.")
+        else:
+            self._failed(self._said[-1])
+        if self._fix_link:
+            self.b_fix.set_visible(True)
+
+    def _fix_permission(self, *_):
+        if self._fix_link:
+            open_url(self._fix_link, self.window)
+
+    def _show_qr(self, modules):
+        self._qr = modules
+        self.qr.set_visible(modules is not None)
+        self.qr.queue_draw()
+
+    def _draw_qr(self, _area, cr, w, h):
+        if not self._qr:
+            return
+        n = len(self._qr) + 8                  # four modules of quiet zone
+        cell = max(1, min(w, h) // n)
+        x0, y0 = (w - cell * n) // 2, (h - cell * n) // 2
+        cr.set_source_rgb(1, 1, 1)
+        cr.rectangle(x0, y0, cell * n, cell * n)
+        cr.fill()
+        cr.set_source_rgb(0, 0, 0)
+        for y, line in enumerate(self._qr):
+            for x, dark in enumerate(line):
+                if dark:
+                    cr.rectangle(x0 + (x + 4) * cell, y0 + (y + 4) * cell,
+                                 cell, cell)
+        cr.fill()
 
     def _tick(self):
         left = int(self.deadline - time.time())
@@ -1668,7 +1799,7 @@ class PhonesDialog(Adw.Dialog):
                                   "start again.")
             self.timer = 0
             return False
-        if self.l_url.get_label().startswith("http"):
+        if self.url:
             self.l_note.set_label(
                 "Same wifi as this laptop. %d:%02d left."
                 % (left // 60, left % 60))
