@@ -1,5 +1,5 @@
 Name:           christwatch
-Version:        1.9.0
+Version:        1.9.1
 Release:        1%{?dist}
 Summary:        Accountability-gated content blocker
 
@@ -67,6 +67,10 @@ cd %{_builddir}/%{name}-%{version} && python3 selftest.py
 %{_datadir}/%{name}/
 
 %changelog
+* Wed Sep 23 2026 William Mezitis <wmezitis@gmail.com> - 1.9.1-1
+- Take down the heartbeat lines 1.8 left in the lobby, a few per
+  tick, once. Only this machine's own; never alerts or other members'.
+
 * Wed Sep 23 2026 William Mezitis <wmezitis@gmail.com> - 1.9.0-1
 - Set up a phone by scanning a QR code: in the app and in the
   terminal. The phone page walks through Android's install prompts,

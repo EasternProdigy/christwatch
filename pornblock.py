@@ -53,7 +53,7 @@ import urllib.request
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-VERSION = "1.9.0"
+VERSION = "1.9.1"
 HOMEPAGE = "https://github.com/EasternProdigy/christwatch"
 PROG = "pornblock"
 
@@ -1310,6 +1310,11 @@ class DiscordCourier:
                               "allowed_mentions": {"parse": [], "users": ids[:50]}})
             last = str((res or {}).get("id") or last)
         return last
+
+    def delete(self, message_id: str, channel: str = "") -> None:
+        """Take down one of our own messages. A bot may always do that."""
+        cid = str(channel or "").strip() or self._channel()
+        self._call("DELETE", "/channels/%s/messages/%s" % (cid, message_id))
 
     def edit(self, message_id: str, text: str, channel: str = "") -> str:
         """Rewrite one of our own messages. Nobody is notified of an edit."""
@@ -4822,6 +4827,39 @@ def post_group_beat(cfg: dict, st: dict, post, force: bool = False) -> bool:
     return True
 
 
+def sweep_old_beats(cfg: dict, st: dict, post, per_tick: int = 10) -> int:
+    """
+    Take down the heartbeats this machine posted before they were edited in
+    place - a new line every half hour, left behind in the lobby.
+
+    Only our own lines, only heartbeats: other members' lines are theirs, and
+    alerts were said to people and stay said. A few per tick so Discord's
+    rate limit is never an issue; done for good once none are left.
+    """
+    grp = st.setdefault("group", {})
+    keep = str(grp.get("beat_id") or "")
+    if grp.get("swept") or not keep or not hasattr(post, "delete"):
+        return 0
+    me, gone = group_me(cfg), 0
+    for _a, body, mid in post.marked(group_lobby(cfg), now() - 30 * 86400,
+                                     GROUP_MARKER, pages=10):
+        if (str(body.get("m") or "") != me or mid == keep
+                or str(body.get("s") or "") == "LEFT"):
+            continue
+        if gone >= per_tick:
+            return gone                           # the rest next tick
+        try:
+            post.delete(mid, channel=group_lobby(cfg))
+        except MailError as exc:
+            log("could not take down an old heartbeat: %s" % exc)
+            return gone
+        gone += 1
+    grp["swept"] = True
+    if gone:
+        log("took down %d old heartbeat line(s)" % gone)
+    return gone
+
+
 def read_group_beats(cfg: dict, st: dict, post) -> list:
     """Take in everyone else's lines and remember where each of them got to."""
     if not group_on(cfg):
@@ -5031,6 +5069,7 @@ def tick_group(cfg: dict, st: dict, post) -> list:
         moves += read_group_beats(cfg, st, post)
         moves += group_silence(cfg, st, post)
         post_group_beat(cfg, st, post)
+        sweep_old_beats(cfg, st, post)
     except Exception as exc:
         log("group tick failed: %r" % exc)
     return moves

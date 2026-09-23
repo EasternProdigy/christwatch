@@ -1665,6 +1665,9 @@ class Lobby(pb.DiscordCourier):
         if method == "PATCH":
             self.edited.append((path, (body or {}).get("content", "")))
             return {"id": path.rsplit("/", 1)[1]}
+        if method == "DELETE":
+            self.deleted = getattr(self, "deleted", []) + [path.rsplit("/", 1)[1]]
+            return {}
         if "/messages?" in path:
             return list(self.messages)
         if "/messages/" in path:
@@ -1731,6 +1734,25 @@ pb.post_group_beat(GRP_CFG, _STG, _LG, force=True)
 check("if somebody deletes it, a fresh one is posted - never a missed beat",
       pb.post_group_beat(GRP_CFG, _STG, _LG, force=True)
       and len(_LG.posted) == 2 and _STG["group"]["beat_id"] == "2")
+
+# The lines 1.8 left behind, one every half hour, are taken down - ours only.
+_mine = []
+for _i in range(13):
+    _m = beat_msg(ME, "Will", ago=_i * 1800)
+    _m["id"] = str(700 + _i)
+    _mine.append(_m)
+_theirs = beat_msg(SAM, "Sam")
+_STS = pb.deep_merge(pb.DEFAULT_STATE, {"group": {"beat_id": "700"}})
+_LS = Lobby(GRP_CFG, _mine + [_theirs])
+_first = pb.sweep_old_beats(GRP_CFG, _STS, _LS)
+_LS.messages = [m for m in _LS.messages if m["id"] not in _LS.deleted]
+_second = pb.sweep_old_beats(GRP_CFG, _STS, _LS)
+check("old heartbeat lines are taken down a few at a time",
+      _first == 10 and _second == 2 and _STS["group"].get("swept"))
+check("...never the current one, and never anybody else's",
+      "700" not in _LS.deleted and _theirs["id"] not in _LS.deleted)
+check("and once it is done it stays done",
+      pb.sweep_old_beats(GRP_CFG, _STS, _LS) == 0)
 
 # The others see an edit by re-reading the line by id.
 _STE = pb.deep_merge(pb.DEFAULT_STATE, {})
