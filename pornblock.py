@@ -143,7 +143,7 @@ FILTERS = {
     },
     "cleanbrowsing_adult": {
         "label": "CleanBrowsing Adult Filter",
-        "ipv4": ["185.228.133.11", "185.228.134.11"],
+        "ipv4": ["185.228.168.10", "185.228.169.11"],
         "ipv6": ["2a0d:2a00:1::1", "2a0d:2a00:2::1"],
         "dot_name": "adult-filter-dns.cleanbrowsing.org",
         "doh_url": "https://doh.cleanbrowsing.org/doh/adult-filter/",
