@@ -740,7 +740,7 @@ Edit `/etc/pornblock/config.json`, then `sudo systemctl restart pornblock`.
 | `passphrase_recovery` | `true` | Unanimous approval can stand in for it |
 | `request_ttl_hours` | `168` | An unapproved request expires after this |
 | `filter` | `cloudflare_family` | or `cleanbrowsing_adult` |
-| `youtube_restrict` | `moderate` | or `strict` |
+| `youtube_restrict` | `moderate` | `strict`, or `off` to leave YouTube unrestricted (Google and Bing SafeSearch stay on) |
 | `loop_seconds` | `45` | How often everything is re-applied |
 | `blocklist_refresh_hours` | `24` | How often the list is re-downloaded |
 | `app_name` | `ChristWatch` | Name on the desktop icon |

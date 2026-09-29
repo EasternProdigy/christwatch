@@ -264,7 +264,7 @@ DEFAULT_CONFIG = {
     # means the honest unlock path is closed for good.
     "passphrase_recovery": True,
     "filter": "cloudflare_family",
-    "youtube_restrict": "moderate",   # moderate | strict
+    "youtube_restrict": "moderate",   # moderate | strict | off
     "loop_seconds": 45,
     "imap_poll_seconds": 60,
     # Pulling code from a repo and running it as root is, honestly, a way
@@ -2563,7 +2563,8 @@ def _safesearch_hosts_lines(cfg: dict, ips: dict) -> list:
     lines = ["# --- forced SafeSearch / YouTube Restricted (%s) ---" % mode]
     for tld in GOOGLE_TLDS:
         lines.append("%s google.%s www.google.%s" % (g, tld, tld))
-    lines.append("%s %s" % (y, " ".join(YOUTUBE_HOSTS)))
+    if mode != "off":
+        lines.append("%s %s" % (y, " ".join(YOUTUBE_HOSTS)))
     lines.append("%s %s" % (b, " ".join(BING_HOSTS)))
     lines.append("# --- end SafeSearch ---")
     return lines
@@ -3002,7 +3003,7 @@ def firefox_policy(cfg: dict) -> str:
 def chromium_policy(cfg: dict) -> str:
     f = FILTERS[cfg["filter"]]
     enf = cfg["enforce"]
-    yt = 2 if (cfg.get("youtube_restrict") or "moderate").lower() == "strict" else 1
+    yt = {"strict": 2, "off": 0}.get((cfg.get("youtube_restrict") or "moderate").lower(), 1)
     pol = {
         "DnsOverHttpsMode": "secure",
         "DnsOverHttpsTemplates": f["doh_url"],
